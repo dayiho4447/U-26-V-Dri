@@ -1,0 +1,7 @@
+.env
+*.img
+*.qcow2
+seed.img
+seed/
+drime-serve.log
+serial.log
