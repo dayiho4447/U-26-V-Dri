@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# drimeblock
+
+set -Eeuo pipefail
+
+REMOTE="${DRIME_REMOTE:-drime:liveblock}"
+CACHE="${DRIME_CACHE:-/var/lib/drimelive}"
+RUNDIR="${DRIME_RUNDIR:-/run/drimelive}"
+SOCK="${DRIME_SOCK:-${RUNDIR}/nbd.sock}"
+
+SIZE="${DRIME_SIZE:-20G}"
+CHUNK="${DRIME_CHUNK:-4M}"
+SYNC="${DRIME_SYNC:-writeback}"
+
+MEM="${DRIME_MEM:-512}"
+
+log() {
+    printf '\033[1;34m[drimeblock]\033[0m %s\n' "$*"
+}
+
+die() {
+    printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2
+    exit 1
+}
+
+require_root() {
+    [[ $EUID -eq 0 ]] || die "run as root"
+}
+
+cmd_serve() {
+    require_root
+
+    mkdir -p "$CACHE" "$RUNDIR"
+
+    log "starting DrimeLiveBlock NBD server"
+    log "remote: ${REMOTE}"
+    log "cache:  ${CACHE}"
+    log "socket: ${SOCK}"
+    log "size:   ${SIZE}"
+    log "chunk:  ${CHUNK}"
+    log "sync:   ${SYNC}"
+
+    exec nbdkit \
+        --foreground \
+        --unix "$SOCK" \
+        python ./drime_nbd.py \
+        remote="$REMOTE" \
+        cache="$CACHE" \
+        size="$SIZE" \
+        chunk="$CHUNK" \
+        sync="$SYNC"
+}
+
+cmd_seed() {
+    require_root
+
+    local SEED_DIR="${CACHE}/seed"
+    local SEED_IMG="${CACHE}/seed.img"
+
+    mkdir -p "$SEED_DIR"
+
+    cat > "${SEED_DIR}/meta-data" <<EOF
+instance-id: ${INSTANCE_ID:-drime-live-vm}
+local-hostname: drime-live
+EOF
+
+    ROOT_PASSWORD="${ROOT_PASSWORD:-root}" \
+    NETBIRD_SETUP_KEY="${NETBIRD_SETUP_KEY:-}" \
+    SEED_DIR="${SEED_DIR}" \
+    python3 - <<'PY'
+import os
+import base64
+import pathlib
+
+seed_dir = os.environ["SEED_DIR"]
+root_password = os.environ.get("ROOT_PASSWORD", "root")
+netbird_key = os.environ.get("NETBIRD_SETUP_KEY", "")
+
+root_b64 = base64.b64encode(root_password.encode()).decode()
+key_b64 = base64.b64encode(netbird_key.encode()).decode()
+
+user_data = f'''#cloud-config
+hostname: drime-live
+manage_etc_hosts: true
+ssh_pwauth: true
+disable_root: false
+
+package_update: true
+
+packages:
+  - curl
+  - ca-certificates
+  - jq
+  - openssh-server
+  - coreutils
+
+write_files:
+  - path: /etc/drime-live/identity
+    permissions: '0644'
+    content: |
+      STORAGE=drime
+      MODE=liveblock
+      PRESENTATION=100_percent_drime
+      PORT_FORWARD=0
+      OS=ubuntu-26.04-lts-server
+      SSH_ROOT_PASSWORD_LOGIN=true
+      NETBIRD=installed_inside_vm
+
+  - path: /etc/drime-live/root-password.b64
+    permissions: '0600'
+    content: |
+      {root_b64}
+
+  - path: /etc/drime-live/netbird-setup-key.b64
+    permissions: '0600'
+    content: |
+      {key_b64}
+
+  - path: /etc/ssh/sshd_config.d/10-drime.conf
+    permissions: '0644'
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+      KbdInteractiveAuthentication yes
+
+  - path: /etc/motd
+    permissions: '0644'
+    content: |
+      Drime Live Storage
+      Ubuntu 26.04 LTS Server
+      0 port forward
+      SSH root password login enabled
+      Access only through NetBird
+
+  - path: /usr/local/sbin/drime-netbird-setup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -x
+      export DEBIAN_FRONTEND=noninteractive
+
+      ROOT_PASSWORD=$(base64 -d /etc/drime-live/root-password.b64 2>/dev/null || true)
+      NETBIRD_SETUP_KEY=$(base64 -d /etc/drime-live/netbird-setup-key.b64 2>/dev/null || true)
+
+      if [ -n "$ROOT_PASSWORD" ]; then
+        echo "root:$ROOT_PASSWORD" | chpasswd
+        passwd -u root || true
+      fi
+
+      mkdir -p /etc/ssh/sshd_config.d
+
+      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+      sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+      sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config || true
+
+      systemctl unmask ssh || true
+      systemctl enable ssh || true
+      systemctl restart ssh || systemctl restart sshd || true
+
+      curl -fsSL https://pkgs.netbird.io/install.sh -o /tmp/netbird-install.sh
+      sh /tmp/netbird-install.sh || true
+
+      systemctl enable netbird || true
+
+      if [ -n "$NETBIRD_SETUP_KEY" ]; then
+        i=0
+        while [ $i -lt 30 ]; do
+          curl -fsS --max-time 5 https://pkgs.netbird.io >/dev/null 2>&1 && break
+          i=$((i+1))
+          sleep 2
+        done
+
+        netbird up --setup-key "$NETBIRD_SETUP_KEY" --hostname drime-live || true
+      fi
+
+      shred -u /etc/drime-live/root-password.b64 2>/dev/null || rm -f /etc/drime-live/root-password.b64
+      shred -u /etc/drime-live/netbird-setup-key.b64 2>/dev/null || rm -f /etc/drime-live/netbird-setup-key.b64
+
+runcmd:
+  - mkdir -p /etc/drime-live
+  - /usr/local/sbin/drime-netbird-setup.sh
+  - systemctl restart ssh || systemctl restart sshd || true
+'''
+
+pathlib.Path(seed_dir, "user-data").write_text(user_data)
+PY
+
+    if command -v cloud-localds >/dev/null 2>&1; then
+        cloud-localds "$SEED_IMG" "${SEED_DIR}/user-data" "${SEED_DIR}/meta-data"
+    else
+        genisoimage \
+            -output "$SEED_IMG" \
+            -volid cidata \
+            -joliet \
+            -rock \
+            "${SEED_DIR}/user-data" \
+            "${SEED_DIR}/meta-data"
+    fi
+
+    log "seed image created: $SEED_IMG"
+    log "Ubuntu 26.04 LTS server seed"
+    log "SSH root password login enabled"
+    log "NetBird install + connect included"
+    log "0% port forward"
+}
+
+cmd_write_cloud() {
+    require_root
+
+    local CLOUD_IMG="${CLOUD_IMG:-}"
+
+    [[ -n "$CLOUD_IMG" ]] || die "usage: CLOUD_IMG=/path/to/ubuntu-26.04.img drimeblock write-cloud"
+    [[ -f "$CLOUD_IMG" ]] || die "cloud image not found: $CLOUD_IMG"
+    [[ -S "$SOCK" ]] || die "NBD socket not found: $SOCK"
+
+    log "writing Ubuntu cloud image to Drime live storage"
+    log "source: $CLOUD_IMG"
+    log "target: nbd:unix:${SOCK}"
+
+    qemu-img convert \
+        -p \
+        -O raw \
+        "$CLOUD_IMG" \
+        "nbd:unix:${SOCK}" || \
+    qemu-img convert \
+        -p \
+        -O raw \
+        "$CLOUD_IMG" \
+        "nbd:unix:${SOCK}:exportname=drime"
+
+    log "cloud image written to Drime live storage"
+}
+
+cmd_qemu() {
+    require_root
+
+    [[ -S "$SOCK" ]] || die "NBD socket not found: $SOCK"
+
+    local ACCEL="-enable-kvm"
+
+    if [[ ! -e /dev/kvm ]]; then
+        ACCEL="-machine accel=tcg"
+    fi
+
+    log "booting Drime Live Storage VM"
+    log "0% port forward"
+    log "serial console only"
+
+    exec qemu-system-x86_64 \
+        $ACCEL \
+        -m "$MEM" \
+        -drive file=nbd:unix:${SOCK},if=none,id=drime0,format=raw,cache=writeback \
+        -device virtio-blk-pci,drive=drime0,serial=DRIME_LIVE_0001 \
+        -netdev user,id=n0 \
+        -device virtio-net-pci,netdev=n0 \
+        -nographic
+}
+
+cmd_qemu_seed() {
+    require_root
+
+    [[ -S "$SOCK" ]] || die "NBD socket not found: $SOCK"
+
+    local SEED_IMG="${CACHE}/seed.img"
+
+    [[ -f "$SEED_IMG" ]] || die "seed.img not found. Run: drimeblock seed"
+
+    local ACCEL="-enable-kvm"
+
+    if [[ ! -e /dev/kvm ]]; then
+        ACCEL="-machine accel=tcg"
+    fi
+
+    log "booting Drime Live Storage VM with seed"
+    log "0% port forward"
+    log "serial console only"
+
+    exec qemu-system-x86_64 \
+        $ACCEL \
+        -m "$MEM" \
+        -drive file=nbd:unix:${SOCK},if=none,id=drime0,format=raw,cache=writeback \
+        -device virtio-blk-pci,drive=drime0,serial=DRIME_LIVE_0001 \
+        -cdrom "$SEED_IMG" \
+        -boot order=c \
+        -netdev user,id=n0 \
+        -device virtio-net-pci,netdev=n0 \
+        -nographic
+}
+
+cmd_cloud() {
+    require_root
+
+    cmd_seed
+    cmd_write_cloud
+    cmd_qemu_seed
+}
+
+cmd_sync() {
+    require_root
+
+    mkdir -p "$CACHE"
+
+    REMOTE="$REMOTE" \
+    CACHE="$CACHE" \
+    SIZE="$SIZE" \
+    CHUNK="$CHUNK" \
+    SYNC="$SYNC" \
+    python3 - <<'PY'
+import os
+from drime_store import DrimeStore
+
+s = DrimeStore(
+    remote=os.environ["REMOTE"],
+    cache=os.environ["CACHE"],
+    size=os.environ["SIZE"],
+    chunk_size=os.environ["CHUNK"],
+    sync_mode=os.environ["SYNC"]
+)
+
+s.fsck()
+s.flush()
+print("sync complete")
+PY
+}
+
+usage() {
+    cat <<EOF
+DrimeLiveBlock
+
+Rules:
+  0% port forward
+  NetBird installed inside VM only
+  NetBird configuration uses setup key
+  Drime is live storage
+
+Usage:
+
+  drimeblock serve
+  drimeblock seed
+  CLOUD_IMG=/path/to/ubuntu-26.04.img drimeblock write-cloud
+  drimeblock qemu
+  drimeblock qemu-seed
+  CLOUD_IMG=/path/to/ubuntu-26.04.img drimeblock cloud
+  drimeblock sync
+
+Environment:
+
+  DRIME_REMOTE     default: drime:liveblock
+  DRIME_CACHE      default: /var/lib/drimelive
+  DRIME_RUNDIR     default: /run/drimelive
+  DRIME_SOCK       default: /run/drimelive/nbd.sock
+  DRIME_SIZE       default: 20G
+  DRIME_CHUNK      default: 4M
+  DRIME_SYNC       default: writeback
+  DRIME_MEM        default: 512
+  CLOUD_IMG        cloud image path for write-cloud/cloud
+  ROOT_PASSWORD    VM root password
+  NETBIRD_SETUP_KEY
+                   NetBird setup key
+
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        serve)
+            cmd_serve
+            ;;
+        seed)
+            cmd_seed
+            ;;
+        write-cloud)
+            cmd_write_cloud
+            ;;
+        qemu)
+            cmd_qemu
+            ;;
+        qemu-seed)
+            cmd_qemu_seed
+            ;;
+        cloud)
+            cmd_cloud
+            ;;
+        sync)
+            cmd_sync
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
