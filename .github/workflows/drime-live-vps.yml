@@ -564,6 +564,14 @@ jobs:
         #!/usr/bin/env python3
         # drime_nbd.py
 
+        import os
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+
+        sys.path.insert(0, os.getcwd())
+        sys.path.insert(0, script_dir)
+
         import nbdkit
         from drime_store import DrimeStore
 
@@ -841,7 +849,7 @@ jobs:
             log "chunk:  ${CHUNK}"
             log "sync:   ${SYNC}"
 
-            exec nbdkit \
+            exec env PYTHONPATH="$(pwd)" nbdkit \
                 --foreground \
                 --unix "$SOCK" \
                 python ./drime_nbd.py \
@@ -1135,7 +1143,7 @@ jobs:
 
     - name: Start DrimeLiveBlock storage server
       run: |
-        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && PYTHONPATH=\"$GITHUB_WORKSPACE\" DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
 
         for i in $(seq 1 60); do
           if [ -S /run/drimelive/nbd.sock ]; then
