@@ -26,6 +26,7 @@ jobs:
         sudo apt-get install -y \
           python3 \
           rclone \
+          curl \
           qemu-utils \
           qemu-system-x86 \
           nbdkit \
@@ -34,6 +35,11 @@ jobs:
           genisoimage \
           wget \
           ca-certificates
+
+    - name: Install latest rclone
+      run: |
+        curl -fsSL https://rclone.org/install.sh | sudo bash
+        rclone version
 
     - name: Create drime_store.py
       run: |
@@ -1013,7 +1019,7 @@ jobs:
 
         chmod +x drimeblock
 
-    - name: Configure Drime rclone
+    - name: Configure Drime remote automatically
       env:
         DRIME_API_TOKEN: ${{ secrets.DRIME_API_TOKEN }}
       run: |
@@ -1023,18 +1029,100 @@ jobs:
         fi
 
         mkdir -p ~/.config/rclone
-
-        printf '[drime]\ntype = drime\naccess_token = %s\n' "$DRIME_API_TOKEN" \
-          > ~/.config/rclone/rclone.conf
-
+        rm -f ~/.config/rclone/rclone.conf
+        touch ~/.config/rclone/rclone.conf
         chmod 600 ~/.config/rclone/rclone.conf
+
+        ok=false
+
+        test_remote() {
+          rclone mkdir drime:liveblock >/dev/null 2>&1
+        }
+
+        echo "Trying native drime backend"
+        rclone config delete drime >/dev/null 2>&1 || true
+
+        if rclone config create drime drime access_token="$DRIME_API_TOKEN" >/dev/null 2>&1; then
+          if test_remote; then
+            ok=true
+            echo "Native drime backend works"
+          fi
+        fi
+
+        if [ "$ok" != "true" ]; then
+          echo "Trying WebDAV Nextcloud style"
+
+          USER_ID=$(printf '%s' "$DRIME_API_TOKEN" | cut -d'|' -f1)
+
+          if [ -z "$USER_ID" ]; then
+            USER_ID="drime"
+          fi
+
+          PASS=$(rclone obscure "$DRIME_API_TOKEN")
+
+          for URL in \
+            "https://drime.cloud/remote.php/dav/files/${USER_ID}/" \
+            "https://drime.cloud/remote.php/webdav/"
+          do
+            rclone config delete drime >/dev/null 2>&1 || true
+
+            if rclone config create drime webdav \
+              url="$URL" \
+              vendor=nextcloud \
+              user="$USER_ID" \
+              pass="$PASS" >/dev/null 2>&1; then
+
+              if test_remote; then
+                ok=true
+                echo "WebDAV works: $URL"
+                break
+              fi
+            fi
+          done
+        fi
+
+        if [ "$ok" != "true" ]; then
+          echo "Trying S3 compatible endpoints"
+
+          for PROVIDER in Other Cloudflare; do
+            for ENDPOINT in \
+              "https://s3.drimecloud.com" \
+              "https://s3.drime.cloud"
+            do
+              rclone config delete drime >/dev/null 2>&1 || true
+
+              if rclone config create drime s3 \
+                provider="$PROVIDER" \
+                access_key_id="$DRIME_API_TOKEN" \
+                secret_access_key="$DRIME_API_TOKEN" \
+                endpoint="$ENDPOINT" \
+                no_check_bucket=true >/dev/null 2>&1; then
+
+                if test_remote; then
+                  ok=true
+                  echo "S3 works: $ENDPOINT provider=$PROVIDER"
+                  break 2
+                fi
+              fi
+            done
+          done
+        fi
+
+        if [ "$ok" != "true" ]; then
+          echo "ERROR: Could not configure Drime automatically"
+          echo "rclone version:"
+          rclone version
+          echo "Available backends:"
+          rclone help backends || true
+          exit 1
+        fi
 
         sudo mkdir -p /root/.config/rclone
         sudo cp ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
         sudo chmod 600 /root/.config/rclone/rclone.conf
 
         sudo rclone mkdir drime:liveblock || true
-        sudo rclone lsd drime:
+        sudo rclone lsd drime: || true
 
     - name: Check if OS already exists in Drime
       id: os
