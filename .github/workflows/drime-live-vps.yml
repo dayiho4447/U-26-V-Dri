@@ -1,0 +1,147 @@
+name: Drime Live Ubuntu VPS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: drime-live-vm
+  cancel-in-progress: false
+
+jobs:
+  drime-live-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            python3 \
+            rclone \
+            qemu-utils \
+            qemu-system-x86 \
+            nbdkit \
+            nbdkit-plugin-python \
+            cloud-image-utils \
+            genisoimage \
+            wget \
+            ca-certificates
+
+      - name: Configure Drime rclone
+        env:
+          DRIME_API_TOKEN: ${{ secrets.DRIME_API_TOKEN }}
+        run: |
+          if [ -z "$DRIME_API_TOKEN" ]; then
+            echo "ERROR: Add GitHub secret DRIME_API_TOKEN"
+            exit 1
+          fi
+
+          mkdir -p ~/.config/rclone
+
+          printf '[drime]\ntype = drime\naccess_token = %s\n' "$DRIME_API_TOKEN" \
+            > ~/.config/rclone/rclone.conf
+
+          chmod 600 ~/.config/rclone/rclone.conf
+
+          sudo mkdir -p /root/.config/rclone
+          sudo cp ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
+          sudo chmod 600 /root/.config/rclone/rclone.conf
+
+          sudo rclone mkdir drime:liveblock || true
+          sudo rclone lsd drime:
+
+      - name: Make drimeblock executable
+        run: |
+          chmod +x drimeblock
+
+      - name: Check if OS already exists in Drime
+        id: os
+        run: |
+          if sudo rclone lsf drime:liveblock/ 2>/dev/null | grep -q '^installed.marker$'; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start DrimeLiveBlock storage server
+        run: |
+          sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
+
+          for i in $(seq 1 60); do
+            if [ -S /run/drimelive/nbd.sock ]; then
+              echo "DrimeLiveBlock socket ready"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ ! -S /run/drimelive/nbd.sock ]; then
+            echo "ERROR: DrimeLiveBlock socket did not appear"
+            sudo cat /var/log/drimelive-serve.log || true
+            exit 1
+          fi
+
+      - name: Create cloud-init seed
+        env:
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+          NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+        run: |
+          if [ -z "$ROOT_PASSWORD" ]; then
+            echo "ERROR: Add GitHub secret ROOT_PASSWORD"
+            exit 1
+          fi
+
+          if [ -z "$NETBIRD_SETUP_KEY" ]; then
+            echo "ERROR: Add GitHub secret NETBIRD_SETUP_KEY"
+            exit 1
+          fi
+
+          sudo -E ./drimeblock seed
+
+      - name: Download Ubuntu 26.04 LTS cloud image
+        if: steps.os.outputs.exists != 'true'
+        run: |
+          wget -O ubuntu-26.04.img \
+            https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img
+
+      - name: Write Ubuntu 26.04 to Drime live storage
+        if: steps.os.outputs.exists != 'true'
+        run: |
+          sudo CLOUD_IMG=./ubuntu-26.04.img ./drimeblock write-cloud
+          echo "installed $(date -Is)" | sudo rclone rcat drime:liveblock/installed.marker
+
+      - name: Connection info
+        run: |
+          echo "=========================================="
+          echo "Drime Live Ubuntu VPS"
+          echo "=========================================="
+          echo ""
+          echo "OS: Ubuntu 26.04 LTS Server"
+          echo "Storage: Drime live block storage"
+          echo "Port forwarding: 0%"
+          echo "SSH: root password login enabled"
+          echo "NetBird: installed inside VM"
+          echo ""
+          echo "VM hostname: drime-live"
+          echo "SSH user: root"
+          echo "SSH password: from GitHub secret ROOT_PASSWORD"
+          echo ""
+          echo "Get the VM NetBird IP from your NetBird dashboard."
+          echo "Look for peer: drime-live"
+          echo ""
+          echo "Then connect:"
+          echo "  ssh root@NETBIRD_IP"
+          echo ""
+          echo "=========================================="
+
+      - name: Boot VM from Drime live storage
+        run: |
+          sudo ./drimeblock qemu-seed
