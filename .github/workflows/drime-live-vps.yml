@@ -2,9 +2,7 @@ name: Drime Live Ubuntu VPS Auto
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
   workflow_dispatch:
 
 concurrency:
@@ -23,18 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y \
-          python3 \
-          rclone \
-          curl \
-          qemu-utils \
-          qemu-system-x86 \
-          nbdkit \
-          nbdkit-plugin-python \
-          cloud-image-utils \
-          genisoimage \
-          wget \
-          ca-certificates
+        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python cloud-image-utils genisoimage wget ca-certificates
 
     - name: Install latest rclone
       run: |
@@ -45,516 +32,215 @@ jobs:
       run: |
         cat > drime_store.py <<'PYEOF'
         #!/usr/bin/env python3
-        # drime_store.py
-
-        import os
-        import re
-        import sys
-        import json
-        import time
-        import uuid
-        import gzip
-        import sqlite3
-        import hashlib
-        import threading
-        import subprocess
+        import os, re, json, time, uuid, gzip, sqlite3, hashlib, threading, subprocess, shutil
         from pathlib import Path
 
-
         def parse_size(v):
-            if isinstance(v, int):
-                return int(v)
-
+            if isinstance(v, int): return int(v)
             s = str(v).strip().upper()
             m = re.match(r'^([0-9]*\.?[0-9]+)([KMGTP]?I?B?)$', s)
+            if not m: raise ValueError("bad size")
+            num = float(m.group(1)); unit = m.group(2); mult = 1
+            if unit.startswith("K"): mult = 1024
+            elif unit.startswith("M"): mult = 1024**2
+            elif unit.startswith("G"): mult = 1024**3
+            elif unit.startswith("T"): mult = 1024**4
+            elif unit.startswith("P"): mult = 1024**5
+            return int(num*mult)
 
-            if not m:
-                raise ValueError(f"bad size: {v}")
-
-            num = float(m.group(1))
-            unit = m.group(2)
-
-            mult = 1
-
-            if unit.startswith("K"):
-                mult = 1024
-            elif unit.startswith("M"):
-                mult = 1024 ** 2
-            elif unit.startswith("G"):
-                mult = 1024 ** 3
-            elif unit.startswith("T"):
-                mult = 1024 ** 4
-            elif unit.startswith("P"):
-                mult = 1024 ** 5
-
-            return int(num * mult)
-
-
-        def sha256_file(path):
-            h = hashlib.sha256()
-
-            with open(path, "rb") as f:
-                while True:
-                    b = f.read(1024 * 1024)
-                    if not b:
-                        break
-                    h.update(b)
-
-            return h.hexdigest()
-
-
-        def run_rclone(args, check=True):
-            cmd = ["rclone"] + args
-
-            p = subprocess.run(
-                cmd,
-                text=True,
-                capture_output=True
-            )
-
+        def run_rclone(args, check=True, extra=None):
+            cmd = ["rclone"] + args + (extra or [])
+            p = subprocess.run(cmd, text=True, capture_output=True)
             if check and p.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    p.returncode,
-                    cmd,
-                    output=p.stdout,
-                    stderr=p.stderr
-                )
-
+                raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
             return p
 
-
         class DrimeStore:
-            def __init__(
-                self,
-                remote,
-                cache,
-                size="20G",
-                chunk_size="4M",
-                sync_mode="writeback"
-            ):
+            def __init__(self, remote, cache, size="20G", chunk_size="4M", sync_mode="writeback"):
                 self.remote = remote.strip().rstrip("/")
                 self.cache = Path(cache).expanduser().resolve()
-
                 self.chunks_dir = self.cache / "chunks"
                 self.tmp_dir = self.cache / "tmp"
                 self.db_path = self.cache / "meta.db"
-
                 self.chunks_dir.mkdir(parents=True, exist_ok=True)
                 self.tmp_dir.mkdir(parents=True, exist_ok=True)
-
                 self.size = parse_size(size)
                 self.chunk_size = parse_size(chunk_size)
                 self.sync_mode = sync_mode
-
                 self.lock = threading.RLock()
-
-                self.db = sqlite3.connect(
-                    str(self.db_path),
-                    check_same_thread=False
-                )
-
+                self.remote_ids = set()
+                self.db = sqlite3.connect(str(self.db_path), check_same_thread=False)
                 self.db.execute("PRAGMA journal_mode=WAL")
-
-                self.db.execute("""
-                    CREATE TABLE IF NOT EXISTS meta (
-                        k TEXT PRIMARY KEY,
-                        v TEXT
-                    )
-                """)
-
-                self.db.execute("""
-                    CREATE TABLE IF NOT EXISTS chunks (
-                        id INTEGER PRIMARY KEY,
-                        sha256 TEXT,
-                        uploaded INTEGER DEFAULT 0,
-                        dirty INTEGER DEFAULT 0,
-                        gen INTEGER DEFAULT 0,
-                        updated REAL
-                    )
-                """)
-
+                self.db.execute("PRAGMA synchronous=NORMAL")
+                self.db.execute("PRAGMA busy_timeout=10000")
+                self.db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY, sha256 TEXT, uploaded INTEGER DEFAULT 0, dirty INTEGER DEFAULT 0, gen INTEGER DEFAULT 0, updated REAL, zero INTEGER DEFAULT 0)")
                 self.db.commit()
-
                 self.dirty = set()
                 self._load_dirty()
 
             def _load_dirty(self):
-                cur = self.db.execute("""
-                    SELECT id FROM chunks
-                    WHERE dirty = 1 OR uploaded = 0
-                """)
-
-                for row in cur.fetchall():
-                    self.dirty.add(int(row[0]))
+                self.dirty = set(r[0] for r in self.db.execute("SELECT id FROM chunks WHERE dirty = 1 OR uploaded = 0"))
 
             def set_meta(self, k, v):
-                self.db.execute("""
-                    INSERT INTO meta(k, v)
-                    VALUES(?, ?)
-                    ON CONFLICT(k) DO UPDATE SET v = excluded.v
-                """, (k, str(v)))
-
+                self.db.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
                 self.db.commit()
 
-            def get_meta(self, k):
-                cur = self.db.execute("""
-                    SELECT v FROM meta WHERE k = ?
-                """, (k,))
-
-                row = cur.fetchone()
-
-                if row is None:
-                    return None
-
-                return row[0]
-
-            @property
-            def chunk_count(self):
-                return (self.size + self.chunk_size - 1) // self.chunk_size
-
             def chunk_len(self, cid):
-                start = cid * self.chunk_size
-                return min(self.chunk_size, self.size - start)
+                start = cid*self.chunk_size
+                return min(self.chunk_size, self.size-start)
 
             def chunk_path(self, cid):
-                return self.chunks_dir / f"{cid:08d}.part"
+                return self.chunks_dir / ("%08d.part" % cid)
 
             def _atomic_write(self, path, data):
-                tmp = self.tmp_dir / f"{path.name}.{uuid.uuid4().hex}"
-
+                tmp = self.tmp_dir / ("%s.%s" % (path.name, uuid.uuid4().hex))
                 with open(tmp, "wb") as f:
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-
+                    f.write(data); f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, path)
-
-            def init(self):
-                with self.lock:
-                    self.set_meta("size", self.size)
-                    self.set_meta("chunk_size", self.chunk_size)
-                    self.set_meta("created", time.time())
-                    self.upload_manifest()
 
             def fsck(self):
                 with self.lock:
                     self.set_meta("size", self.size)
                     self.set_meta("chunk_size", self.chunk_size)
-
-                    cur = self.db.execute("SELECT COUNT(*) FROM chunks")
-                    count = cur.fetchone()[0]
-
-                    if count == 0:
-                        self.load_remote_manifest()
-
-                    cur = self.db.execute("""
-                        SELECT id FROM chunks
-                        WHERE dirty = 1 OR uploaded = 0
-                    """)
-
-                    for row in cur.fetchall():
-                        cid = int(row[0])
-                        p = self.chunk_path(cid)
-
-                        if p.exists():
-                            self.sync_chunk(cid)
-
+                    self.load_remote_manifest()
                     self.upload_manifest()
 
             def load_remote_manifest(self):
-                tmp = self.tmp_dir / f"manifest.{uuid.uuid4().hex}.gz"
-
+                self.remote_ids = set()
+                tmp = self.tmp_dir / ("manifest_%s.gz" % uuid.uuid4().hex)
                 try:
-                    run_rclone([
-                        "copyto",
-                        f"{self.remote}/manifest.json.gz",
-                        str(tmp)
-                    ])
-
+                    run_rclone(["copyto", self.remote + "/manifest.json.gz", str(tmp)], extra=["--retries", "1", "--low-level-retries", "1"])
                     with gzip.open(tmp, "rt") as f:
                         m = json.load(f)
-
-                    if int(m.get("size", 0)) != self.size:
-                        raise ValueError("remote manifest size mismatch")
-
-                    if int(m.get("chunk_size", 0)) != self.chunk_size:
-                        raise ValueError("remote manifest chunk_size mismatch")
-
+                    if int(m.get("size", 0)) != self.size: raise ValueError("size mismatch")
+                    if int(m.get("chunk_size", 0)) != self.chunk_size: raise ValueError("chunk mismatch")
                     for c in m.get("chunks", []):
-                        self.db.execute("""
-                            INSERT INTO chunks(
-                                id,
-                                sha256,
-                                uploaded,
-                                dirty,
-                                gen,
-                                updated
-                            )
-                            VALUES(?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(id) DO UPDATE SET
-                                sha256 = excluded.sha256,
-                                uploaded = 1,
-                                dirty = 0,
-                                gen = excluded.gen,
-                                updated = excluded.updated
-                        """, (
-                            int(c["id"]),
-                            c.get("sha256", ""),
-                            1,
-                            0,
-                            int(c.get("gen", 0)),
-                            float(c.get("updated", time.time()))
-                        ))
-
+                        rid = int(c["id"])
+                        self.remote_ids.add(rid)
+                        self.db.execute("INSERT INTO chunks(id, sha256, uploaded, dirty, gen, updated, zero) VALUES(?, ?, 1, 0, ?, ?, 0) ON CONFLICT(id) DO NOTHING", (rid, c.get("sha256", ""), int(c.get("gen", 0)), float(c.get("updated", 0))))
                     self.db.commit()
-
-                except subprocess.CalledProcessError:
-                    pass
-
-                finally:
-                    try:
-                        tmp.unlink()
-                    except Exception:
-                        pass
-
-            def upload_manifest(self):
-                cur = self.db.execute("""
-                    SELECT id, sha256, uploaded, dirty, gen, updated
-                    FROM chunks
-                    ORDER BY id
-                """)
-
-                chunks = []
-
-                for row in cur.fetchall():
-                    chunks.append({
-                        "id": int(row[0]),
-                        "sha256": row[1],
-                        "uploaded": int(row[2]),
-                        "dirty": int(row[3]),
-                        "gen": int(row[4]),
-                        "updated": float(row[5]) if row[5] else 0.0
-                    })
-
-                manifest = {
-                    "version": 1,
-                    "remote": self.remote,
-                    "size": self.size,
-                    "chunk_size": self.chunk_size,
-                    "generated": time.time(),
-                    "chunks": chunks
-                }
-
-                tmp = self.tmp_dir / f"manifest.{uuid.uuid4().hex}.gz"
-
-                with gzip.open(tmp, "wt") as f:
-                    json.dump(manifest, f)
-
-                run_rclone([
-                    "copyto",
-                    str(tmp),
-                    f"{self.remote}/manifest.json.gz"
-                ])
-
-                try:
-                    tmp.unlink()
                 except Exception:
                     pass
+                finally:
+                    try: tmp.unlink()
+                    except Exception: pass
+
+            def upload_manifest(self):
+                cur = self.db.execute("SELECT id, sha256, gen, updated FROM chunks WHERE uploaded = 1 AND zero = 0 ORDER BY id")
+                chunks = [{"id": int(r[0]), "sha256": r[1], "gen": int(r[2]), "updated": float(r[3]) if r[3] else 0.0} for r in cur.fetchall()]
+                manifest = {"version": 2, "remote": self.remote, "size": self.size, "chunk_size": self.chunk_size, "generated": time.time(), "chunks": chunks}
+                tmp = self.tmp_dir / ("manifest_%s.gz" % uuid.uuid4().hex)
+                with gzip.open(tmp, "wt") as f:
+                    json.dump(manifest, f)
+                run_rclone(["copyto", str(tmp), self.remote + "/manifest.json.gz"], extra=["--retries", "2", "--low-level-retries", "2"])
+                try: tmp.unlink()
+                except Exception: pass
 
             def read_chunk(self, cid):
                 with self.lock:
                     p = self.chunk_path(cid)
-
                     if p.exists():
                         return p.read_bytes()
-
-                    tmp = self.tmp_dir / f"{cid:08d}.{uuid.uuid4().hex}.gz"
-
+                    if cid not in self.remote_ids:
+                        return b"\x00" * self.chunk_len(cid)
+                    tmp = self.tmp_dir / ("%08d_%s.gz" % (cid, uuid.uuid4().hex))
                     try:
-                        run_rclone([
-                            "copyto",
-                            f"{self.remote}/chunks/{cid:08d}.gz",
-                            str(tmp)
-                        ])
-
+                        run_rclone(["copyto", self.remote + "/chunks/%08d.gz" % cid, str(tmp)], extra=["--retries", "1", "--low-level-retries", "1"])
                         with gzip.open(tmp, "rb") as f:
                             data = f.read()
-
                         expected = self.chunk_len(cid)
-
                         if len(data) < expected:
-                            data += b"\x00" * (expected - len(data))
-
+                            data = data + b"\x00" * (expected - len(data))
                         self._atomic_write(p, data)
-
                         return data
-
                     except subprocess.CalledProcessError as e:
                         err = (e.stderr or "").lower()
-
-                        if (
-                            "not found" in err or
-                            "object not found" in err or
-                            "doesn't exist" in err or
-                            "file not found" in err
-                        ):
+                        if any(s in err for s in ["not found", "object not found", "doesn't exist", "file not found", "no such"]):
+                            self.remote_ids.discard(cid)
                             return b"\x00" * self.chunk_len(cid)
-
                         raise
-
                     finally:
-                        try:
-                            tmp.unlink()
-                        except Exception:
-                            pass
+                        try: tmp.unlink()
+                        except Exception: pass
 
             def write_chunk(self, cid, data, offset_in_chunk):
                 with self.lock:
                     p = self.chunk_path(cid)
-
-                    if p.exists():
-                        chunk = bytearray(p.read_bytes())
-                    else:
-                        chunk = bytearray(self.read_chunk(cid))
-
+                    chunk = bytearray(p.read_bytes()) if p.exists() else bytearray(self.read_chunk(cid))
                     expected = self.chunk_len(cid)
-
                     if len(chunk) < expected:
                         chunk.extend(b"\x00" * (expected - len(chunk)))
-
                     chunk[offset_in_chunk:offset_in_chunk + len(data)] = data
-
                     final = bytes(chunk)
-
                     self._atomic_write(p, final)
-
                     sha = hashlib.sha256(final).hexdigest()
-
-                    self.db.execute("""
-                        INSERT INTO chunks(
-                            id,
-                            sha256,
-                            uploaded,
-                            dirty,
-                            gen,
-                            updated
-                        )
-                        VALUES(?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(id) DO UPDATE SET
-                            sha256 = excluded.sha256,
-                            uploaded = 0,
-                            dirty = 1,
-                            gen = gen + 1,
-                            updated = excluded.updated
-                    """, (
-                        cid,
-                        sha,
-                        0,
-                        1,
-                        0,
-                        time.time()
-                    ))
-
+                    self.db.execute("INSERT INTO chunks(id, sha256, uploaded, dirty, gen, updated, zero) VALUES(?, ?, 0, 1, 0, ?, 0) ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256, uploaded=0, dirty=1, gen=gen+1, updated=excluded.updated, zero=0", (cid, sha, time.time()))
                     self.db.commit()
-
                     self.dirty.add(cid)
-
-                    if self.sync_mode == "writethrough":
-                        self.sync_chunk(cid)
-
-            def sync_chunk(self, cid):
-                with self.lock:
-                    p = self.chunk_path(cid)
-
-                    if not p.exists():
-                        return
-
-                    data = p.read_bytes()
-                    sha = hashlib.sha256(data).hexdigest()
-
-                    gztmp = self.tmp_dir / f"{cid:08d}.{uuid.uuid4().hex}.gz"
-
-                    with gzip.open(gztmp, "wb") as f:
-                        f.write(data)
-
-                    run_rclone([
-                        "copyto",
-                        str(gztmp),
-                        f"{self.remote}/chunks/{cid:08d}.gz"
-                    ])
-
-                    try:
-                        gztmp.unlink()
-                    except Exception:
-                        pass
-
-                    self.db.execute("""
-                        UPDATE chunks
-                        SET
-                            uploaded = 1,
-                            dirty = 0,
-                            sha256 = ?,
-                            updated = ?
-                        WHERE id = ?
-                    """, (
-                        sha,
-                        time.time(),
-                        cid
-                    ))
-
-                    self.db.commit()
-
-                    self.dirty.discard(cid)
 
             def flush(self):
                 with self.lock:
-                    for cid in sorted(self.dirty):
-                        self.sync_chunk(cid)
-
+                    rows = self.db.execute("SELECT id, gen FROM chunks WHERE dirty = 1").fetchall()
+                    if not rows:
+                        self.upload_manifest()
+                        return
+                    stage = self.tmp_dir / ("stage_" + uuid.uuid4().hex)
+                    stage.mkdir(parents=True, exist_ok=True)
+                    plan = []
+                    try:
+                        for cid, gen in rows:
+                            p = self.chunk_path(cid)
+                            if not p.exists():
+                                continue
+                            data = p.read_bytes()
+                            expected = self.chunk_len(cid)
+                            if len(data) < expected:
+                                data = data + b"\x00" * (expected - len(data))
+                            sha = hashlib.sha256(data).hexdigest()
+                            is_zero = (data == b"\x00" * expected)
+                            remote_present = cid in self.remote_ids
+                            if is_zero and not remote_present:
+                                plan.append({"id": cid, "gen": gen, "sha": sha, "kind": "skip"})
+                                continue
+                            with gzip.open(stage / ("%08d.gz" % cid), "wb") as f:
+                                f.write(data)
+                            plan.append({"id": cid, "gen": gen, "sha": sha, "kind": "upload"})
+                        if any(x["kind"] == "upload" for x in plan):
+                            run_rclone(["copy", str(stage), self.remote + "/chunks/", "--transfers", "8", "--no-update-modtime", "--stats", "5s"], extra=["--retries", "2", "--low-level-retries", "2"])
+                        now = time.time()
+                        for x in plan:
+                            self.db.execute("UPDATE chunks SET uploaded=1, dirty=0, sha256=?, updated=?, zero=? WHERE id=? AND gen=?", (x["sha"], now, 1 if x["kind"] == "skip" else 0, x["id"], x["gen"]))
+                            if x["kind"] == "upload":
+                                self.remote_ids.add(x["id"])
+                            else:
+                                self.remote_ids.discard(x["id"])
+                        self.db.commit()
+                    finally:
+                        shutil.rmtree(stage, ignore_errors=True)
                     self.upload_manifest()
+                    self._load_dirty()
 
             def read(self, offset, length):
-                out = bytearray(length)
-                pos = 0
-
+                out = bytearray(length); pos = 0
                 while pos < length:
                     off = offset + pos
                     cid = off // self.chunk_size
                     coff = off % self.chunk_size
-
-                    n = min(
-                        self.chunk_size - coff,
-                        length - pos
-                    )
-
+                    n = min(self.chunk_size - coff, length - pos)
                     chunk = self.read_chunk(cid)
-
-                    out[pos:pos + n] = chunk[coff:coff + n]
-
+                    out[pos:pos+n] = chunk[coff:coff+n]
                     pos += n
-
                 return bytes(out)
 
             def write(self, data, offset):
-                pos = 0
-                total = len(data)
-
+                pos = 0; total = len(data)
                 while pos < total:
                     off = offset + pos
                     cid = off // self.chunk_size
                     coff = off % self.chunk_size
-
-                    n = min(
-                        self.chunk_size - coff,
-                        total - pos
-                    )
-
-                    self.write_chunk(
-                        cid,
-                        data[pos:pos + n],
-                        coff
-                    )
-
+                    n = min(self.chunk_size - coff, total - pos)
+                    self.write_chunk(cid, data[pos:pos+n], coff)
                     pos += n
         PYEOF
 
@@ -562,86 +248,52 @@ jobs:
       run: |
         cat > drime_nbd.py <<'PYEOF'
         #!/usr/bin/env python3
-        # drime_nbd.py
-
-        import os
-        import sys
-
-        script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-
+        import os, sys
         sys.path.insert(0, os.getcwd())
-        sys.path.insert(0, script_dir)
-
         import nbdkit
         from drime_store import DrimeStore
 
         API_VERSION = 2
-
         CFG = {}
         STORE = None
 
+        def thread_model():
+            return nbdkit.THREAD_MODEL_PARALLEL
 
         def config(key, value):
-            global CFG
             CFG[key] = value
-
 
         def config_complete():
             global STORE
-
             remote = CFG.get("remote")
-            cache = CFG.get("cache", "/var/lib/drimelive")
-            size = CFG.get("size", "20G")
-            chunk = CFG.get("chunk", "4M")
-            sync = CFG.get("sync", "writeback")
-
-            if not remote:
-                raise ValueError("remote is required")
-
-            STORE = DrimeStore(
-                remote=remote,
-                cache=cache,
-                size=size,
-                chunk_size=chunk,
-                sync_mode=sync
-            )
-
+            if not remote: raise ValueError("remote required")
+            STORE = DrimeStore(remote=remote, cache=CFG.get("cache", "/var/lib/drimelive"), size=CFG.get("size", "20G"), chunk_size=CFG.get("chunk", "4M"), sync_mode=CFG.get("sync", "writeback"))
             STORE.fsck()
-
 
         def open(readonly):
             return STORE
 
-
         def close(h):
-            try:
-                h.flush()
-            except Exception:
-                pass
-
+            try: h.flush()
+            except Exception: pass
 
         def get_size(h):
             return h.size
 
-
         def can_write(h):
             return True
 
-
         def can_flush(h):
             return True
-
 
         def pread(h, buf, offset, flags):
             data = h.read(offset, len(buf))
             buf[:len(data)] = data
             return buf
 
-
         def pwrite(h, buf, offset, flags):
             h.write(bytes(buf), offset)
             return len(buf)
-
 
         def flush(h):
             h.flush()
@@ -651,155 +303,84 @@ jobs:
       run: |
         cat > drime_seed.py <<'PYEOF'
         #!/usr/bin/env python3
-        # drime_seed.py
-
-        import os
-        import base64
-        import pathlib
-        import shutil
-        import subprocess
+        import os, base64, pathlib, shutil, subprocess
 
         cache = os.environ.get("CACHE", "/var/lib/drimelive")
         root_password = os.environ.get("ROOT_PASSWORD", "root")
         netbird_key = os.environ.get("NETBIRD_SETUP_KEY", "")
         instance_id = os.environ.get("INSTANCE_ID", "drime-live-vm")
 
+        def shq(s):
+            return "'" + s.replace("'", "'\\''") + "'"
+
+        script = "\n".join([
+            "#!/bin/sh",
+            "export DEBIAN_FRONTEND=noninteractive",
+            "echo root:" + shq(root_password) + " | chpasswd",
+            "passwd -u root >/dev/null 2>&1 || true",
+            "mkdir -p /etc/ssh/sshd_config.d",
+            "cat > /etc/ssh/sshd_config.d/10-drime.conf <<'SSHEOF'",
+            "PermitRootLogin yes",
+            "PasswordAuthentication yes",
+            "KbdInteractiveAuthentication yes",
+            "SSHEOF",
+            "systemctl unmask ssh >/dev/null 2>&1 || true",
+            "systemctl enable ssh >/dev/null 2>&1 || true",
+            "( curl -fsSL https://pkgs.netbird.io/install.sh | sh ) >/dev/null 2>&1 || true",
+            "systemctl enable netbird >/dev/null 2>&1 || true",
+            "systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true",
+            "if [ -n " + shq(netbird_key) + " ]; then",
+            "  for i in $(seq 1 30); do curl -fsS --max-time 5 https://pkgs.netbird.io >/dev/null 2>&1 && break; sleep 2; done",
+            "  netbird up --setup-key " + shq(netbird_key) + " --hostname drime-live >/dev/null 2>&1 || true",
+            "fi",
+            "mkdir -p /etc/drime-live",
+            "cat > /etc/drime-live/identity <<'IDEOF'",
+            "STORAGE=drime",
+            "MODE=liveblock",
+            "PRESENTATION=100_percent_drime",
+            "PORT_FORWARD=0",
+            "OS=ubuntu-26.04-lts-server",
+            "SSH_ROOT_PASSWORD_LOGIN=true",
+            "NETBIRD=installed_inside_vm",
+            "IDEOF",
+            "cat > /etc/motd <<'MOTDEOF'",
+            "Drime Live Storage - Ubuntu 26.04 LTS - 0 port forward - SSH root pw - NetBird inside",
+            "MOTDEOF",
+            "",
+        ]) + "\n"
+
+        b64 = base64.b64encode(script.encode()).decode()
+
+        ud = "\n".join([
+            "#cloud-config",
+            "hostname: drime-live",
+            "manage_etc_hosts: true",
+            "ssh_pwauth: true",
+            "disable_root: false",
+            "package_update: true",
+            "packages:",
+            "  - curl",
+            "  - ca-certificates",
+            "  - jq",
+            "  - openssh-server",
+            "  - coreutils",
+            "runcmd:",
+            "  - sh -c 'echo " + b64 + " | base64 -d | sh'",
+            "",
+        ])
+
+        md = "instance-id: %s\nlocal-hostname: drime-live\n" % instance_id
+
         seed_dir = pathlib.Path(cache) / "seed"
         seed_img = pathlib.Path(cache) / "seed.img"
-
         seed_dir.mkdir(parents=True, exist_ok=True)
-
-        root_b64 = base64.b64encode(root_password.encode()).decode()
-        key_b64 = base64.b64encode(netbird_key.encode()).decode()
-
-        meta_data = f"""instance-id: {instance_id}
-        local-hostname: drime-live
-        """
-
-        (seed_dir / "meta-data").write_text(meta_data)
-
-        user_data = f'''#cloud-config
-        hostname: drime-live
-        manage_etc_hosts: true
-        ssh_pwauth: true
-        disable_root: false
-
-        package_update: true
-
-        packages:
-          - curl
-          - ca-certificates
-          - jq
-          - openssh-server
-          - coreutils
-
-        write_files:
-          - path: /etc/drime-live/identity
-            permissions: '0644'
-            content: |
-              STORAGE=drime
-              MODE=liveblock
-              PRESENTATION=100_percent_drime
-              PORT_FORWARD=0
-              OS=ubuntu-26.04-lts-server
-              SSH_ROOT_PASSWORD_LOGIN=true
-              NETBIRD=installed_inside_vm
-
-          - path: /etc/drime-live/root-password.b64
-            permissions: '0600'
-            content: |
-              {root_b64}
-
-          - path: /etc/drime-live/netbird-setup-key.b64
-            permissions: '0600'
-            content: |
-              {key_b64}
-
-          - path: /etc/ssh/sshd_config.d/10-drime.conf
-            permissions: '0644'
-            content: |
-              PermitRootLogin yes
-              PasswordAuthentication yes
-              KbdInteractiveAuthentication yes
-
-          - path: /etc/motd
-            permissions: '0644'
-            content: |
-              Drime Live Storage
-              Ubuntu 26.04 LTS Server
-              0 port forward
-              SSH root password login enabled
-              Access only through NetBird
-
-          - path: /usr/local/sbin/drime-netbird-setup.sh
-            permissions: '0755'
-            content: |
-              #!/bin/sh
-              set -x
-              export DEBIAN_FRONTEND=noninteractive
-
-              ROOT_PASSWORD=$(base64 -d /etc/drime-live/root-password.b64 2>/dev/null || true)
-              NETBIRD_SETUP_KEY=$(base64 -d /etc/drime-live/netbird-setup-key.b64 2>/dev/null || true)
-
-              if [ -n "$ROOT_PASSWORD" ]; then
-                echo "root:$ROOT_PASSWORD" | chpasswd
-                passwd -u root || true
-              fi
-
-              mkdir -p /etc/ssh/sshd_config.d
-
-              sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-              sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-              sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config || true
-
-              systemctl unmask ssh || true
-              systemctl enable ssh || true
-              systemctl restart ssh || systemctl restart sshd || true
-
-              curl -fsSL https://pkgs.netbird.io/install.sh -o /tmp/netbird-install.sh
-              sh /tmp/netbird-install.sh || true
-
-              systemctl enable netbird || true
-
-              if [ -n "$NETBIRD_SETUP_KEY" ]; then
-                i=0
-                while [ $i -lt 30 ]; do
-                  curl -fsS --max-time 5 https://pkgs.netbird.io >/dev/null 2>&1 && break
-                  i=$((i+1))
-                  sleep 2
-                done
-
-                netbird up --setup-key "$NETBIRD_SETUP_KEY" --hostname drime-live || true
-              fi
-
-              shred -u /etc/drime-live/root-password.b64 2>/dev/null || rm -f /etc/drime-live/root-password.b64
-              shred -u /etc/drime-live/netbird-setup-key.b64 2>/dev/null || rm -f /etc/drime-live/netbird-setup-key.b64
-
-        runcmd:
-          - mkdir -p /etc/drime-live
-          - /usr/local/sbin/drime-netbird-setup.sh
-          - systemctl restart ssh || systemctl restart sshd || true
-        '''
-
-        (seed_dir / "user-data").write_text(user_data)
+        (seed_dir / "user-data").write_text(ud)
+        (seed_dir / "meta-data").write_text(md)
 
         if shutil.which("cloud-localds"):
-            subprocess.run([
-                "cloud-localds",
-                str(seed_img),
-                str(seed_dir / "user-data"),
-                str(seed_dir / "meta-data")
-            ], check=True)
+            subprocess.run(["cloud-localds", str(seed_img), str(seed_dir / "user-data"), str(seed_dir / "meta-data")], check=True)
         else:
-            subprocess.run([
-                "genisoimage",
-                "-output", str(seed_img),
-                "-volid", "cidata",
-                "-joliet",
-                "-rock",
-                str(seed_dir / "user-data"),
-                str(seed_dir / "meta-data")
-            ], check=True)
+            subprocess.run(["genisoimage", "-output", str(seed_img), "-volid", "cidata", "-joliet", "-rock", str(seed_dir / "user-data"), str(seed_dir / "meta-data")], check=True)
 
         print("seed created:", seed_img)
         PYEOF
@@ -808,408 +389,188 @@ jobs:
       run: |
         cat > drimeblock <<'SHEOF'
         #!/usr/bin/env bash
-        # drimeblock
-
         set -Eeuo pipefail
-
         REMOTE="${DRIME_REMOTE:-drime:liveblock}"
         CACHE="${DRIME_CACHE:-/var/lib/drimelive}"
         RUNDIR="${DRIME_RUNDIR:-/run/drimelive}"
         SOCK="${DRIME_SOCK:-${RUNDIR}/nbd.sock}"
-
         SIZE="${DRIME_SIZE:-20G}"
         CHUNK="${DRIME_CHUNK:-4M}"
         SYNC="${DRIME_SYNC:-writeback}"
+        MEM="${DRIME_MEM:-768}"
+        log(){ printf '\033[1;34m[drimeblock]\033[0m %s\n' "$*"; }
+        die(){ printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
+        require_root(){ [[ $EUID -eq 0 ]] || die "run as root"; }
 
-        MEM="${DRIME_MEM:-512}"
-
-        log() {
-            printf '\033[1;34m[drimeblock]\033[0m %s\n' "$*"
+        wait_sock(){
+          for i in $(seq 1 90); do
+            [ -S "$SOCK" ] && { echo "socket ready"; return 0; }
+            sleep 1
+          done
+          echo "ERROR socket missing"; sudo cat /var/log/drimelive-serve.log 2>/dev/null || true; exit 1
         }
 
-        die() {
-            printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2
-            exit 1
+        cmd_serve(){
+          require_root
+          mkdir -p "$CACHE" "$RUNDIR"
+          log "serve remote=$REMOTE cache=$CACHE size=$SIZE chunk=$CHUNK"
+          exec env PYTHONPATH="$(pwd)" nbdkit --foreground --unix "$SOCK" python ./drime_nbd.py remote="$REMOTE" cache="$CACHE" size="$SIZE" chunk="$CHUNK" sync="$SYNC"
         }
 
-        require_root() {
-            [[ $EUID -eq 0 ]] || die "run as root"
+        cmd_seed(){
+          require_root
+          ROOT_PASSWORD="${ROOT_PASSWORD:-root}" NETBIRD_SETUP_KEY="${NETBIRD_SETUP_KEY:-}" CACHE="$CACHE" INSTANCE_ID="${INSTANCE_ID:-drime-live-vm}" python3 drime_seed.py
         }
 
-        cmd_serve() {
-            require_root
-
-            mkdir -p "$CACHE" "$RUNDIR"
-
-            log "starting DrimeLiveBlock NBD server"
-            log "remote: ${REMOTE}"
-            log "cache:  ${CACHE}"
-            log "socket: ${SOCK}"
-            log "size:   ${SIZE}"
-            log "chunk:  ${CHUNK}"
-            log "sync:   ${SYNC}"
-
-            exec env PYTHONPATH="$(pwd)" nbdkit \
-                --foreground \
-                --unix "$SOCK" \
-                python ./drime_nbd.py \
-                remote="$REMOTE" \
-                cache="$CACHE" \
-                size="$SIZE" \
-                chunk="$CHUNK" \
-                sync="$SYNC"
+        cmd_write_cloud(){
+          require_root
+          local CLOUD_IMG="${CLOUD_IMG:-}"
+          [ -n "$CLOUD_IMG" ] || die "set CLOUD_IMG"
+          [ -f "$CLOUD_IMG" ] || die "image not found: $CLOUD_IMG"
+          [ -S "$SOCK" ] || die "socket missing"
+          log "writing image to Drime live storage"
+          qemu-img convert -p -O raw "$CLOUD_IMG" "nbd:unix:${SOCK}" || qemu-img convert -p -O raw "$CLOUD_IMG" "nbd:unix:${SOCK}:exportname=drime"
+          log "write done"
         }
 
-        cmd_seed() {
-            require_root
-
-            ROOT_PASSWORD="${ROOT_PASSWORD:-root}" \
-            NETBIRD_SETUP_KEY="${NETBIRD_SETUP_KEY:-}" \
-            CACHE="$CACHE" \
-            INSTANCE_ID="${INSTANCE_ID:-drime-live-vm}" \
-            python3 drime_seed.py
+        cmd_sync(){
+          require_root
+          mkdir -p "$CACHE"
+          env PYTHONPATH="$(pwd)" REMOTE="$REMOTE" CACHE="$CACHE" SIZE="$SIZE" CHUNK="$CHUNK" SYNC="$SYNC" python3 -c 'import os; from drime_store import DrimeStore; s=DrimeStore(remote=os.environ["REMOTE"], cache=os.environ["CACHE"], size=os.environ["SIZE"], chunk_size=os.environ["CHUNK"], sync_mode=os.environ["SYNC"]); s.fsck(); s.flush(); print("sync complete")'
         }
 
-        cmd_write_cloud() {
-            require_root
-
-            local CLOUD_IMG="${CLOUD_IMG:-}"
-
-            [[ -n "$CLOUD_IMG" ]] || die "usage: CLOUD_IMG=/path/to/ubuntu-26.04.img drimeblock write-cloud"
-            [[ -f "$CLOUD_IMG" ]] || die "cloud image not found: $CLOUD_IMG"
-            [[ -S "$SOCK" ]] || die "NBD socket not found: $SOCK"
-
-            log "writing Ubuntu cloud image to Drime live storage"
-            log "source: $CLOUD_IMG"
-            log "target: nbd:unix:${SOCK}"
-
-            qemu-img convert \
-                -p \
-                -O raw \
-                "$CLOUD_IMG" \
-                "nbd:unix:${SOCK}" || \
-            qemu-img convert \
-                -p \
-                -O raw \
-                "$CLOUD_IMG" \
-                "nbd:unix:${SOCK}:exportname=drime"
-
-            log "cloud image written to Drime live storage"
+        cmd_flushloop(){
+          require_root
+          mkdir -p "$CACHE"
+          log "flush loop every 45s"
+          exec env PYTHONPATH="$(pwd)" REMOTE="$REMOTE" CACHE="$CACHE" SIZE="$SIZE" CHUNK="$CHUNK" SYNC="$SYNC" python3 -c 'import os,time; from drime_store import DrimeStore; s=DrimeStore(remote=os.environ["REMOTE"], cache=os.environ["CACHE"], size=os.environ["SIZE"], chunk_size=os.environ["CHUNK"], sync_mode=os.environ["SYNC"]); s.fsck()
+        while True:
+            try: s.flush()
+            except Exception as e: print("flush err:",e,flush=True)
+            time.sleep(45)'
         }
 
-        cmd_qemu() {
-            require_root
-
-            [[ -S "$SOCK" ]] || die "NBD socket not found: $SOCK"
-
-            local ACCEL="-enable-kvm"
-
-            if [[ ! -e /dev/kvm ]]; then
-                ACCEL="-machine accel=tcg"
-            fi
-
-            log "booting Drime Live Storage VM"
-            log "0% port forward"
-            log "serial console only"
-
-            exec qemu-system-x86_64 \
-                $ACCEL \
-                -m "$MEM" \
-                -drive file=nbd:unix:${SOCK},if=none,id=drime0,format=raw,cache=writeback \
-                -device virtio-blk-pci,drive=drime0,serial=DRIME_LIVE_0001 \
-                -netdev user,id=n0 \
-                -device virtio-net-pci,netdev=n0 \
-                -nographic
+        qemu_args(){
+          local ACCEL="-enable-kvm"; [ -e /dev/kvm ] || ACCEL="-machine accel=tcg"
+          echo "$ACCEL"
         }
 
-        cmd_qemu_seed() {
-            require_root
-
-            [[ -S "$SOCK" ]] || die "NBD socket not found: $SOCK"
-
-            local SEED_IMG="${CACHE}/seed.img"
-
-            [[ -f "$SEED_IMG" ]] || die "seed.img not found. Run: drimeblock seed"
-
-            local ACCEL="-enable-kvm"
-
-            if [[ ! -e /dev/kvm ]]; then
-                ACCEL="-machine accel=tcg"
-            fi
-
-            log "booting Drime Live Storage VM with seed"
-            log "0% port forward"
-            log "serial console only"
-
-            exec qemu-system-x86_64 \
-                $ACCEL \
-                -m "$MEM" \
-                -drive file=nbd:unix:${SOCK},if=none,id=drime0,format=raw,cache=writeback \
-                -device virtio-blk-pci,drive=drime0,serial=DRIME_LIVE_0001 \
-                -cdrom "$SEED_IMG" \
-                -boot order=c \
-                -netdev user,id=n0 \
-                -device virtio-net-pci,netdev=n0 \
-                -nographic
+        cmd_qemu_seed(){
+          require_root
+          [ -S "$SOCK" ] || die "socket missing"
+          local SEED_IMG="${CACHE}/seed.img"; [ -f "$SEED_IMG" ] || die "seed missing"
+          local ACCEL; ACCEL="$(qemu_args)"
+          log "boot VM (0 port forward, serial only)"
+          exec qemu-system-x86_64 $ACCEL -m "$MEM" -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback -device virtio-blk-pci,drive=d0,serial=DRIME_LIVE_0001 -cdrom "$SEED_IMG" -boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -nographic
         }
 
-        cmd_cloud() {
-            require_root
-
-            cmd_seed
-            cmd_write_cloud
-            cmd_qemu_seed
-        }
-
-        cmd_sync() {
-            require_root
-
-            mkdir -p "$CACHE"
-
-            REMOTE="$REMOTE" \
-            CACHE="$CACHE" \
-            SIZE="$SIZE" \
-            CHUNK="$CHUNK" \
-            SYNC="$SYNC" \
-            python3 -c 'import os; from drime_store import DrimeStore; s=DrimeStore(remote=os.environ["REMOTE"], cache=os.environ["CACHE"], size=os.environ["SIZE"], chunk_size=os.environ["CHUNK"], sync_mode=os.environ["SYNC"]); s.fsck(); s.flush(); print("sync complete")'
-        }
-
-        usage() {
-            cat <<EOF
-        DrimeLiveBlock Auto
-
-        Usage:
-          drimeblock serve
-          drimeblock seed
-          CLOUD_IMG=/path/to/ubuntu-26.04.img drimeblock write-cloud
-          drimeblock qemu
-          drimeblock qemu-seed
-          drimeblock cloud
-          drimeblock sync
-        EOF
-        }
-
-        main() {
-            local cmd="${1:-}"
-            shift || true
-
-            case "$cmd" in
-                serve)
-                    cmd_serve
-                    ;;
-                seed)
-                    cmd_seed
-                    ;;
-                write-cloud)
-                    cmd_write_cloud
-                    ;;
-                qemu)
-                    cmd_qemu
-                    ;;
-                qemu-seed)
-                    cmd_qemu_seed
-                    ;;
-                cloud)
-                    cmd_cloud
-                    ;;
-                sync)
-                    cmd_sync
-                    ;;
-                *)
-                    usage
-                    exit 1
-                    ;;
-            esac
-        }
-
-        main "$@"
+        case "${1:-}" in
+          serve) cmd_serve;;
+          seed) cmd_seed;;
+          write-cloud) cmd_write_cloud;;
+          sync) cmd_sync;;
+          flushloop) cmd_flushloop;;
+          qemu-seed) cmd_qemu_seed;;
+          *) echo "usage: serve|seed|write-cloud|sync|flushloop|qemu-seed"; exit 1;;
+        esac
         SHEOF
-
         chmod +x drimeblock
 
     - name: Configure Drime remote automatically
       env:
         DRIME_API_TOKEN: ${{ secrets.DRIME_API_TOKEN }}
       run: |
-        if [ -z "$DRIME_API_TOKEN" ]; then
-          echo "ERROR: Add GitHub secret DRIME_API_TOKEN"
-          exit 1
-        fi
-
+        [ -n "$DRIME_API_TOKEN" ] || { echo "ERROR add secret DRIME_API_TOKEN"; exit 1; }
         mkdir -p ~/.config/rclone
         rm -f ~/.config/rclone/rclone.conf
         touch ~/.config/rclone/rclone.conf
         chmod 600 ~/.config/rclone/rclone.conf
-
         ok=false
-
-        test_remote() {
-          rclone mkdir drime:liveblock >/dev/null 2>&1
-        }
-
-        echo "Trying native drime backend"
+        test_remote(){ rclone mkdir drime:liveblock >/dev/null 2>&1; }
         rclone config delete drime >/dev/null 2>&1 || true
-
-        if rclone config create drime drime access_token="$DRIME_API_TOKEN" >/dev/null 2>&1; then
-          if test_remote; then
-            ok=true
-            echo "Native drime backend works"
-          fi
-        fi
-
-        if [ "$ok" != "true" ]; then
-          echo "Trying WebDAV Nextcloud style"
-
-          USER_ID=$(printf '%s' "$DRIME_API_TOKEN" | cut -d'|' -f1)
-
-          if [ -z "$USER_ID" ]; then
-            USER_ID="drime"
-          fi
-
+        if rclone config create drime drime access_token="$DRIME_API_TOKEN" >/dev/null 2>&1 && test_remote; then ok=true; echo "native drime ok"; fi
+        if [ "$ok" != true ]; then
+          UID1=$(printf '%s' "$DRIME_API_TOKEN" | cut -d'|' -f1); [ -z "$UID1" ] && UID1=drime
           PASS=$(rclone obscure "$DRIME_API_TOKEN")
-
-          for URL in \
-            "https://drime.cloud/remote.php/dav/files/${USER_ID}/" \
-            "https://drime.cloud/remote.php/webdav/"
-          do
+          for URL in "https://drime.cloud/remote.php/dav/files/${UID1}/" "https://drime.cloud/remote.php/webdav/"; do
             rclone config delete drime >/dev/null 2>&1 || true
-
-            if rclone config create drime webdav \
-              url="$URL" \
-              vendor=nextcloud \
-              user="$USER_ID" \
-              pass="$PASS" >/dev/null 2>&1; then
-
-              if test_remote; then
-                ok=true
-                echo "WebDAV works: $URL"
-                break
-              fi
-            fi
+            if rclone config create drime webdav url="$URL" vendor=nextcloud user="$UID1" pass="$PASS" >/dev/null 2>&1 && test_remote; then ok=true; echo "webdav ok $URL"; break; fi
           done
         fi
-
-        if [ "$ok" != "true" ]; then
-          echo "Trying S3 compatible endpoints"
-
-          for PROVIDER in Other Cloudflare; do
-            for ENDPOINT in \
-              "https://s3.drimecloud.com" \
-              "https://s3.drime.cloud"
-            do
-              rclone config delete drime >/dev/null 2>&1 || true
-
-              if rclone config create drime s3 \
-                provider="$PROVIDER" \
-                access_key_id="$DRIME_API_TOKEN" \
-                secret_access_key="$DRIME_API_TOKEN" \
-                endpoint="$ENDPOINT" \
-                no_check_bucket=true >/dev/null 2>&1; then
-
-                if test_remote; then
-                  ok=true
-                  echo "S3 works: $ENDPOINT provider=$PROVIDER"
-                  break 2
-                fi
-              fi
-            done
-          done
-        fi
-
-        if [ "$ok" != "true" ]; then
-          echo "ERROR: Could not configure Drime automatically"
-          echo "rclone version:"
-          rclone version
-          echo "Available backends:"
-          rclone help backends || true
-          exit 1
-        fi
-
+        [ "$ok" = true ] || { echo "ERROR drime config failed"; rclone help backends || true; exit 1; }
         sudo mkdir -p /root/.config/rclone
         sudo cp ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
         sudo chmod 600 /root/.config/rclone/rclone.conf
-
-        sudo rclone mkdir drime:liveblock || true
         sudo rclone lsd drime: || true
 
     - name: Check if OS already exists in Drime
       id: os
       run: |
-        if sudo rclone lsf drime:liveblock/ 2>/dev/null | grep -q '^installed.marker$'; then
-          echo "exists=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "exists=false" >> "$GITHUB_OUTPUT"
-        fi
+        if sudo rclone lsf drime:liveblock/ 2>/dev/null | grep -q '^installed.marker$'; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+
+    - name: Purge stale liveblock on fresh install
+      if: steps.os.outputs.exists != 'true'
+      run: |
+        echo "fresh install: purge drime:liveblock"
+        sudo rclone purge drime:liveblock || true
 
     - name: Start DrimeLiveBlock storage server
       run: |
+        sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && PYTHONPATH=\"$GITHUB_WORKSPACE\" DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
-
-        for i in $(seq 1 60); do
-          if [ -S /run/drimelive/nbd.sock ]; then
-            echo "DrimeLiveBlock socket ready"
-            break
-          fi
-          sleep 1
-        done
-
-        if [ ! -S /run/drimelive/nbd.sock ]; then
-          echo "ERROR: DrimeLiveBlock socket did not appear"
-          sudo cat /var/log/drimelive-serve.log || true
-          exit 1
-        fi
+        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && { echo ready; break; }; sleep 1; done
+        [ -S /run/drimelive/nbd.sock ] || { echo "ERROR socket"; sudo cat /var/log/drimelive-serve.log || true; exit 1; }
 
     - name: Create cloud-init seed
       env:
         ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
         NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
       run: |
-        if [ -z "$ROOT_PASSWORD" ]; then
-          echo "ERROR: Add GitHub secret ROOT_PASSWORD"
-          exit 1
-        fi
-
-        if [ -z "$NETBIRD_SETUP_KEY" ]; then
-          echo "ERROR: Add GitHub secret NETBIRD_SETUP_KEY"
-          exit 1
-        fi
-
+        [ -n "$ROOT_PASSWORD" ] || { echo "ERROR add secret ROOT_PASSWORD"; exit 1; }
+        [ -n "$NETBIRD_SETUP_KEY" ] || { echo "ERROR add secret NETBIRD_SETUP_KEY"; exit 1; }
         sudo -E bash -c "cd \"$GITHUB_WORKSPACE\" && ./drimeblock seed"
 
     - name: Download Ubuntu 26.04 LTS cloud image
       if: steps.os.outputs.exists != 'true'
       run: |
-        wget -O ubuntu-26.04.img \
-          https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img
+        wget -O ubuntu-26.04.img https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img
 
     - name: Write Ubuntu 26.04 to Drime live storage
       if: steps.os.outputs.exists != 'true'
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && CLOUD_IMG=./ubuntu-26.04.img ./drimeblock write-cloud"
+
+    - name: Persist install to Drime and restart server
+      if: steps.os.outputs.exists != 'true'
+      run: |
+        echo "stop install server"
+        sudo pkill -f 'drime_nbd.py' || true
+        sleep 3
+        sudo rm -f /run/drimelive/nbd.sock
+        echo "batched upload to Drime"
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && PYTHONPATH=\"$GITHUB_WORKSPACE\" DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback ./drimeblock sync"
+        echo "restart server"
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && PYTHONPATH=\"$GITHUB_WORKSPACE\" DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
+        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && { echo ready; break; }; sleep 1; done
+        [ -S /run/drimelive/nbd.sock ] || { echo "ERROR socket"; sudo cat /var/log/drimelive-serve.log || true; exit 1; }
         echo "installed $(date -Is)" | sudo rclone rcat drime:liveblock/installed.marker
+
+    - name: Start runtime flush loop
+      run: |
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && PYTHONPATH=\"$GITHUB_WORKSPACE\" DRIME_REMOTE=drime:liveblock DRIME_SIZE=20G DRIME_CHUNK=4M DRIME_SYNC=writeback nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
+        sleep 2
+        echo "flush loop started"
 
     - name: Connection info
       run: |
         echo "=========================================="
         echo "Drime Live Ubuntu VPS"
-        echo "=========================================="
-        echo ""
         echo "OS: Ubuntu 26.04 LTS Server"
         echo "Storage: Drime live block storage"
-        echo "Port forwarding: 0%"
-        echo "SSH: root password login enabled"
-        echo "NetBird: installed inside VM"
-        echo ""
-        echo "VM hostname: drime-live"
-        echo "SSH user: root"
-        echo "SSH password: from GitHub secret ROOT_PASSWORD"
-        echo ""
-        echo "Get the VM NetBird IP from your NetBird dashboard."
-        echo "Look for peer: drime-live"
-        echo ""
-        echo "Then connect:"
-        echo "  ssh root@NETBIRD_IP"
-        echo ""
+        echo "Port forward: 0%  |  SSH root pw: yes"
+        echo "NetBird: inside VM  |  hostname: drime-live"
+        echo "SSH: ssh root@<NetBird IP of peer drime-live>"
+        echo "Password = your ROOT_PASSWORD secret"
         echo "=========================================="
 
     - name: Boot VM from Drime live storage
