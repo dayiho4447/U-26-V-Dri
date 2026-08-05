@@ -1,4 +1,4 @@
-name: Drime Live VM (multi-Drime, master-ready, unlimited)
+name: Drime Live VM (multi-Drime up to 1000, master-ready, unlimited)
 
 on:
   push:
@@ -339,40 +339,36 @@ jobs:
         SHEOF
         chmod +x drimeblock
 
-    - name: Configure Drime accounts (name == Secret)
+    # Reads ALL secrets at once -> supports DRIME .. DRIME1000 (no fixed list)
+    - name: Configure Drime accounts (name == Secret, up to 1000)
       env:
-        DRIME: ${{ secrets.DRIME }}
-        DRIME1: ${{ secrets.DRIME1 }}
-        DRIME2: ${{ secrets.DRIME2 }}
-        DRIME3: ${{ secrets.DRIME3 }}
-        DRIME4: ${{ secrets.DRIME4 }}
-        DRIME5: ${{ secrets.DRIME5 }}
-        DRIME6: ${{ secrets.DRIME6 }}
-        DRIME7: ${{ secrets.DRIME7 }}
-        DRIME8: ${{ secrets.DRIME8 }}
-        DRIME9: ${{ secrets.DRIME9 }}
-        DRIME10: ${{ secrets.DRIME10 }}
+        ALL_SECRETS: ${{ toJson(secrets) }}
       run: |
         sudo mkdir -p /run/drimelive
-        : > /run/drimelive/accounts.txt
-        ok=0
-        while read -r name size _; do
-          [ -z "$name" ] && continue; case "$name" in \#*) continue;; esac
-          VAL="${!name}"
-          if [ -z "$VAL" ]; then echo "WARN: no Secret named $name -> skipped"; continue; fi
-          rclone config delete "$name" >/dev/null 2>&1 || true
-          if rclone config create "$name" drime access_token="$VAL" >/dev/null 2>&1 && rclone mkdir "$name:liveblock" >/dev/null 2>&1; then
-            echo "$name $size" | sudo tee -a /run/drimelive/accounts.txt >/dev/null
-            sudo mkdir -p /root/.config/rclone
-            sudo cp ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf 2>/dev/null || true
-            sudo chmod 600 /root/.config/rclone/rclone.conf 2>/dev/null || true
-            ok=$((ok+1)); echo "account $name OK"
-          else
-            echo "WARN: account $name failed -> skipped"
-          fi
-        done < <(awk '$1 ~ /^DRIME([0-9]+)?$/ {print $1, $2}' drime-storage.conf)
-        [ "$ok" -ge 1 ] || { echo "ERROR: no Drime account configured. Add Secret DRIME."; exit 1; }
-        echo "active accounts: $ok"
+        sudo -E python3 - <<'PY'
+        import os, json, re, subprocess, shutil
+        secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+        accounts = []
+        for line in open("drime-storage.conf"):
+            line = line.split("#",1)[0].strip()
+            m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
+            if m: accounts.append((m.group(1), m.group(2)))
+        ok = 0
+        with open("/run/drimelive/accounts.txt","w") as out:
+            for name,size in accounts:
+                key = secrets.get(name)
+                if not key:
+                    print("WARN no Secret", name, "-> skipped"); continue
+                subprocess.run(["rclone","config","delete",name], capture_output=True)
+                c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
+                m2 = subprocess.run(["rclone","mkdir",name+":liveblock"], capture_output=True)
+                if c.returncode==0 and m2.returncode==0:
+                    out.write("%s %s\n" % (name,size)); ok+=1; print("account",name,"OK")
+                else:
+                    print("WARN account",name,"failed -> skipped")
+        print("active accounts:", ok)
+        if ok==0: raise SystemExit("ERROR: no Drime account configured. Add Secret DRIME.")
+        PY
 
     - name: Check if disk already ingested
       id: os
@@ -445,8 +441,9 @@ jobs:
     - name: Connection info
       run: |
         echo "=========================================="
-        echo "DRIME LIVE VM (multi-Drime, KVM, unlimited)"
+        echo "DRIME LIVE VM (multi-Drime up to 1000, KVM, unlimited)"
         echo "Base account: $(head -1 /run/drimelive/accounts.txt | awk '{print $1}')"
+        echo "Active accounts: $(wc -l < /run/drimelive/accounts.txt)"
         echo "Access: ssh root@<NetBird IP of your image's peer>"
         echo "Deletes: run 'fstrim -av' in the VM to free Drime space"
         echo "=========================================="
