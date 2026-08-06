@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb x11vnc
+        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb x11vnc net-tools
 
     - name: Install latest rclone
       run: |
@@ -36,18 +36,6 @@ jobs:
         sudo apt-get install -y netbird
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
-
-    - name: Start VNC server
-      run: |
-        echo "Starting Xvfb virtual display..."
-        Xvfb :1 -screen 0 1920x1080x24 &
-        sleep 2
-        
-        echo "Starting x11vnc on display :1, port 5900..."
-        x11vnc -display :1 -forever -nopw -rfbport 5900 -shared &
-        sleep 2
-        
-        echo "VNC server running on port 5900"
 
     - name: Create drime_store.py
       run: |
@@ -444,15 +432,42 @@ jobs:
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
 
-    - name: Boot VM with GUI on VNC display
+    - name: Start VNC + Boot VM + Show correct IP
       run: |
         SOCK=/run/drimelive/nbd.sock
         MEM=14488
         ACCEL="-enable-kvm"; [ -e /dev/kvm ] || ACCEL="-machine accel=tcg"
 
         if [ ! -S "$SOCK" ]; then
-          echo "ERROR: NBD socket missing at boot. Aborting."
+          echo "ERROR: NBD socket missing. Aborting."
           sudo cat /var/log/drimelive-serve.log || true
+          exit 1
+        fi
+
+        # Kill any old VNC/Xvfb to start fresh
+        sudo pkill -f Xvfb || true
+        sudo pkill -f x11vnc || true
+        sleep 2
+
+        echo "Starting fresh Xvfb + x11vnc..."
+        sudo Xvfb :1 -screen 0 1920x1080x24 &
+        sleep 2
+        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+        sleep 2
+
+        # Verify VNC port is actually listening
+        if ! sudo ss -tlnp | grep -q ':5900'; then
+          echo "ERROR: x11vnc not listening on port 5900. Log:"
+          sudo cat /tmp/x11vnc.log || true
+          exit 1
+        fi
+        echo "VNC server listening on port 5900"
+
+        # Get NetBird IP dynamically (no hardcoded old IP)
+        NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
+        if [ -z "$NB_IP" ]; then
+          echo "ERROR: Could not get NetBird IP"
+          sudo netbird status
           exit 1
         fi
 
@@ -469,15 +484,26 @@ jobs:
 
         sleep 5
         echo "=========================================="
-        echo "Runner NetBird IP: $(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}')"
-        echo ""
-        echo "Connect via VNC:"
-        echo "  Host: 100.112.165.200 (or check dashboard)"
+        echo "CORRECT CONNECTION INFO:"
+        echo "  Host: $NB_IP"
         echo "  Port: 5900"
         echo "  No password"
         echo ""
-        echo "You will see the VM GUI booting"
+        echo "Open your VNC viewer and connect to:"
+        echo "  $NB_IP:5900"
         echo "=========================================="
+
+        # VNC watchdog: restart x11vnc if it dies
+        (
+          while kill -0 $QPID 2>/dev/null; do
+            sleep 30
+            if ! sudo ss -tlnp | grep -q ':5900'; then
+              echo "[WATCHDOG] x11vnc died, restarting..."
+              sudo pkill -f x11vnc || true
+              sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+            fi
+          done
+        ) &
 
         echo "=== Keeping runner alive ==="
         tail -f /dev/null
