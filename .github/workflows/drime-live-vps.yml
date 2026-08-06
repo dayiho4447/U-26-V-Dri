@@ -463,7 +463,7 @@ jobs:
         fi
         echo "VNC server listening on port 5900"
 
-        # Get NetBird IP dynamically (no hardcoded old IP)
+        # Get NetBird IP dynamically
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         if [ -z "$NB_IP" ]; then
           echo "ERROR: Could not get NetBird IP"
@@ -473,10 +473,11 @@ jobs:
 
         export DISPLAY=:1
 
-        echo "=== BOOTING VM with GUI on VNC display :1 ==="
+        echo "=== BOOTING VM with IDE disk + Standard VGA ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
           -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
-          -device virtio-blk-pci,drive=d0,discard=on \
+          -device ide-hd,drive=d0 \
+          -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
