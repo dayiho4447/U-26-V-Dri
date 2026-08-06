@@ -42,7 +42,7 @@ jobs:
         cat > drime_fast.py <<'PYEOF'
         #!/usr/bin/env python3
         """
-        CUSTOM DRIME LIVE STORAGE ENGINE
+        CUSTOM DRIME LIVE STORAGE ENGINE (PATCHED & BULLETPROOF)
         - Disk stays entirely on Drime (no download)
         - Aggressive parallel read-ahead cache
         - Smart boot-sector prefetching
@@ -50,7 +50,7 @@ jobs:
         """
         import os, re, json, time, uuid, gzip, hashlib, threading, subprocess, shutil, sys
         from pathlib import Path
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
         from collections import OrderedDict
         import nbdkit
 
@@ -65,27 +65,29 @@ jobs:
                 self.chunks_dir.mkdir(parents=True, exist_ok=True)
                 self.tmp_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Parse config
+                # Parse config safely
                 self.chunk_size = self._parse_size(self._get_conf(conf_path, "chunk_size", "4M"))
                 
                 # Load accounts
                 self.accounts = []
                 total = 0
-                for line in open(accounts_path):
-                    line = line.strip()
-                    if not line or line.startswith("#"): continue
-                    parts = line.split()
-                    name, sz = parts[0], self._parse_size(parts[1])
-                    start = total // self.chunk_size
-                    total += sz
-                    end = total // self.chunk_size
-                    self.accounts.append({"name": name, "start": start, "end": end})
+                if accounts_path and os.path.exists(accounts_path):
+                    for line in open(accounts_path):
+                        line = line.strip()
+                        if not line or line.startswith("#"): continue
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            name, sz = parts[0], self._parse_size(parts[1])
+                            start = total // self.chunk_size
+                            total += sz
+                            end = total // self.chunk_size
+                            self.accounts.append({"name": name, "start": start, "end": end})
                 
-                self.size = total
+                self.size = total if total > 0 else 100 * 1024 * 1024 * 1024 # fallback 100G
                 self.lock = threading.RLock()
                 self.remote_ids = set()
                 
-                # SMART CACHE: LRU with prefetch tracking
+                # SMART CACHE
                 self.cache_data = OrderedDict()
                 self.cache_lock = threading.Lock()
                 self.MAX_CACHE_CHUNKS = 256  # 1GB cache
@@ -105,6 +107,7 @@ jobs:
 
             def _parse_size(self, v):
                 if isinstance(v, int): return v
+                if not v: return 4*1024*1024
                 s = str(v).strip().upper()
                 m = re.match(r'^([0-9]*\.?[0-9]+)([KMGTP]?I?B?)$', s)
                 if not m: return 4*1024*1024
@@ -116,12 +119,16 @@ jobs:
                 return int(num * mult)
 
             def _get_conf(self, path, key, default):
-                for line in open(path):
-                    line = line.split("#",1)[0].strip()
-                    if "=" in line:
-                        k, v = line.split("=", 1)
-                        if k.strip() == key:
-                            return v.strip()
+                if not path or not os.path.exists(path): return default
+                try:
+                    for line in open(path):
+                        line = line.split("#",1)[0].strip()
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            if k.strip() == key:
+                                return v.strip()
+                except Exception:
+                    pass
                 return default
 
             def load_manifest(self):
@@ -182,7 +189,6 @@ jobs:
                     if len(data) < exp:
                         data += b"\x00" * (exp - len(data))
                     
-                    # Atomic write
                     p.write_bytes(data)
                     return data
                     
@@ -202,20 +208,15 @@ jobs:
                             continue
                         cid = self.prefetch_queue.pop(0)
                     
-                    # Check if already cached
                     with self.cache_lock:
                         if cid in self.cache_data:
                             continue
                     
-                    # Download
                     data = self._download_chunk(cid)
                     
-                    # Add to cache
                     with self.cache_lock:
                         self.cache_data[cid] = data
                         self.cache_data.move_to_end(cid)
-                        
-                        # Evict old entries
                         while len(self.cache_data) > self.MAX_CACHE_CHUNKS:
                             self.cache_data.popitem(last=False)
 
@@ -224,7 +225,6 @@ jobs:
                 self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
                 self.prefetch_thread.start()
                 
-                # Queue boot-critical chunks (first 256MB)
                 with self.prefetch_lock:
                     for cid in range(64):
                         self.prefetch_queue.append(cid)
@@ -233,24 +233,19 @@ jobs:
 
             def read_chunk(self, cid):
                 """Fast chunk read with intelligent caching"""
-                # Check cache first
                 with self.cache_lock:
                     if cid in self.cache_data:
                         self.cache_data.move_to_end(cid)
                         return self.cache_data[cid]
                 
-                # Cache miss - download immediately
                 data = self._download_chunk(cid)
                 
-                # Add to cache
                 with self.cache_lock:
                     self.cache_data[cid] = data
                     self.cache_data.move_to_end(cid)
-                    
                     while len(self.cache_data) > self.MAX_CACHE_CHUNKS:
                         self.cache_data.popitem(last=False)
                 
-                # Prefetch next chunks (read-ahead)
                 with self.prefetch_lock:
                     for ahead in range(1, 9):
                         next_cid = cid + ahead
@@ -260,27 +255,20 @@ jobs:
                 return data
 
             def read(self, offset, length):
-                """Read data from Drime storage"""
                 out = bytearray(length)
                 pos = 0
-                
                 while pos < length:
                     off = offset + pos
                     cid = off // self.chunk_size
                     coff = off % self.chunk_size
                     n = min(self.chunk_size - coff, length - pos)
-                    
                     chunk = self.read_chunk(cid)
                     out[pos:pos+n] = chunk[coff:coff+n]
                     pos += n
-                
                 return bytes(out)
 
             def write_chunk(self, cid, data, off):
-                """Write chunk back to Drime (live mirror)"""
                 p = self.chunks_dir / f"{cid:08d}.part"
-                
-                # Read existing chunk or create new
                 if p.exists():
                     chunk = bytearray(p.read_bytes())
                 else:
@@ -290,39 +278,31 @@ jobs:
                 if len(chunk) < exp:
                     chunk.extend(b"\x00" * (exp - len(chunk)))
                 
-                # Update chunk
                 chunk[off:off+len(data)] = data
                 final = bytes(chunk)
                 
-                # Atomic write
                 tmp = self.tmp_dir / f"{cid:08d}_{uuid.uuid4().hex}"
                 tmp.write_bytes(final)
                 os.replace(tmp, p)
                 
-                # Update cache
                 with self.cache_lock:
                     self.cache_data[cid] = final
                     self.cache_data.move_to_end(cid)
-                    
                     while len(self.cache_data) > self.MAX_CACHE_CHUNKS:
                         self.cache_data.popitem(last=False)
 
             def write(self, data, offset):
-                """Write data to Drime storage"""
                 pos = 0
                 total = len(data)
-                
                 while pos < total:
                     off = offset + pos
                     cid = off // self.chunk_size
                     coff = off % self.chunk_size
                     n = min(self.chunk_size - coff, total - pos)
-                    
                     self.write_chunk(cid, data[pos:pos+n], coff)
                     pos += n
 
             def flush(self):
-                """Upload dirty chunks to Drime in parallel"""
                 dirty = []
                 for p in self.chunks_dir.glob("*.part"):
                     cid = int(p.stem)
@@ -330,31 +310,25 @@ jobs:
                     sha = hashlib.sha256(data).hexdigest()
                     dirty.append((cid, data, sha))
                 
-                if not dirty:
-                    return
+                if not dirty: return
                 
                 print(f"[DRIME FAST] Flushing {len(dirty)} chunks to Drime...", flush=True)
                 
-                # Group by account
                 by_account = {}
                 for cid, data, sha in dirty:
                     remote = self._account_for(cid)
                     if remote:
                         by_account.setdefault(remote, []).append((cid, data))
                 
-                # Upload in parallel
                 for remote, chunks in by_account.items():
                     stage = self.tmp_dir / f"stage_{uuid.uuid4().hex}"
                     stage.mkdir(exist_ok=True)
-                    
                     for cid, data in chunks:
                         with gzip.open(stage / f"{cid:08d}.gz", "wb") as f:
                             f.write(data)
-                    
                     cmd = ["rclone", "copy", str(stage), f"{remote}:liveblock/chunks/",
                            "--transfers", "8", "--no-update-modtime"]
                     subprocess.run(cmd, capture_output=True)
-                    
                     shutil.rmtree(stage, ignore_errors=True)
                 
                 print(f"[DRIME FAST] Flush complete", flush=True)
@@ -372,8 +346,8 @@ jobs:
         def config_complete():
             global STORE
             STORE = DrimeFastStorage(
-                conf_path=CFG["conf"],
-                accounts_path=CFG["accounts"],
+                conf_path=CFG.get("conf", "drime-storage.conf"),
+                accounts_path=CFG.get("accounts", "/run/drimelive/accounts.txt"),
                 cache=CFG.get("cache", "/var/lib/drimelive")
             )
             STORE.load_manifest()
@@ -426,7 +400,7 @@ jobs:
             ;;
           sync)
             mkdir -p "$CACHE"
-            env PYTHONPATH="$(pwd)" python3 -c 'import sys; sys.path.insert(0, "."); from drime_fast import DrimeFastStorage; s=DrimeFastStorage(conf_path="'$CONF'", accounts_path="'$ACCOUNTS'"); s.flush()'
+            env PYTHONPATH="$(pwd)" python3 -c 'import sys; sys.path.insert(0, "."); from drime_fast import DrimeFastStorage; s=DrimeFastStorage(conf_path="drime-storage.conf", accounts_path="/run/drimelive/accounts.txt"); s.flush()'
             ;;
           *) echo "usage: serve|sync"; exit 1;;
         esac
@@ -480,7 +454,7 @@ jobs:
         
         echo "Ingesting to Drime..."
         cat > /tmp/ingest.py <<'PY'
-        import sys, os, hashlib, time
+        import sys, os
         sys.path.insert(0, ".")
         from drime_fast import DrimeFastStorage
         
@@ -521,9 +495,10 @@ jobs:
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive.log 2>&1 &"
         
-        for i in $(seq 1 30); do
+        for i in $(seq 1 60); do
           if [ -S /run/drimelive/nbd.sock ]; then
             echo "Drime Fast Storage ready!"
+            sudo cat /var/log/drimelive.log || true
             exit 0
           fi
           sleep 1
@@ -559,6 +534,12 @@ jobs:
           CPU="-cpu qemu64"
         fi
         
+        # UEFI firmware
+        CODE=$(ls /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd 2>/dev/null | head -1)
+        VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd 2>/dev/null | head -1)
+        sudo cp "$VARS_SRC" /tmp/OVMF_VARS.fd
+        sudo chmod 666 /tmp/OVMF_VARS.fd
+        
         export DISPLAY=:1
         
         echo "=== BOOTING FROM DRIME (Custom Fast Storage) ==="
@@ -568,16 +549,18 @@ jobs:
           $CPU \
           -smp 4,sockets=1,cores=2,threads=2 \
           -m 16384 \
+          -drive if=pflash,format=raw,readonly=on,file=$CODE \
+          -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
           -drive file=nbd:unix:${SOCK},if=none,id=disk0,format=raw,cache=writeback \
-          -device ide-hd,drive=disk0 \
+          -device nvme,drive=disk0,serial=DRIME0001 \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
         
-        sleep 3
+        sleep 5
         echo "=========================================="
-        echo "VM BOOTED FROM DRIME"
+        echo "VM BOOTED DIRECTLY FROM DRIME"
         echo "VNC: $NB_IP:5900 (no password)"
         echo "=========================================="
         
