@@ -294,6 +294,39 @@ jobs:
         def flush(h): h.flush()
         PYEOF
 
+    - name: Create drimeblock
+      run: |
+        cat > drimeblock <<'SHEOF'
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        CONF="${DRIME_CONF:-drime-storage.conf}"
+        ACCOUNTS="${DRIME_ACCOUNTS:-/run/drimelive/accounts.txt}"
+        CACHE="${DRIME_CACHE:-/var/lib/drimelive}"
+        RUNDIR="${DRIME_RUNDIR:-/run/drimelive}"
+        SOCK="${DRIME_SOCK:-${RUNDIR}/nbd.sock}"
+
+        case "${1:-}" in
+          serve)
+            mkdir -p "$CACHE" "$RUNDIR"
+            exec env PYTHONPATH="$(pwd)" nbdkit --foreground --unix "$SOCK" python ./drime_nbd.py conf="$CONF" accounts="$ACCOUNTS" cache="$CACHE"
+            ;;
+          sync)
+            mkdir -p "$CACHE"
+            env PYTHONPATH="$(pwd)" python3 -c 'import os; from drime_store import DrimeStore; s=DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"]); s.load_remote_manifest(); s.flush()'
+            ;;
+          flushloop)
+            mkdir -p "$CACHE"
+            exec env PYTHONPATH="$(pwd)" python3 -c 'import os,time; from drime_store import DrimeStore; s=DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"]); s.load_remote_manifest(); iv=s.sync_every or 60
+        while True:
+            try: s.flush()
+            except Exception as e: print("flush err:",e,flush=True)
+            time.sleep(iv)'
+            ;;
+          *) echo "usage: serve|sync|flushloop"; exit 1;;
+        esac
+        SHEOF
+        chmod +x drimeblock
+
     - name: Configure Drime accounts
       env:
         ALL_SECRETS: ${{ toJson(secrets) }}
@@ -331,15 +364,25 @@ jobs:
       run: |
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
         IMG=$(sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
-        [ -z "$IMG" ] && exit 1
+        [ -z "$IMG" ] && { echo "ERROR: no base image on Drime"; exit 1; }
         echo "IMG=$IMG" >> "$GITHUB_ENV"
         sudo rclone copyto "$first:liveblock/$IMG" "./$IMG" --progress
 
-    - name: Start storage server
+    - name: Start storage server (auto-check)
       run: |
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
-        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && break; sleep 1; done
+        ok=""
+        for i in $(seq 1 60); do
+          if [ -S /run/drimelive/nbd.sock ]; then ok=1; break; fi
+          sleep 1
+        done
+        if [ -z "$ok" ]; then
+          echo "ERROR: NBD socket never appeared. Server log:"
+          sudo cat /var/log/drimelive-serve.log || true
+          exit 1
+        fi
+        echo "NBD socket ready."
 
     - name: FAST Ingest
       if: steps.os.outputs.exists != 'true'
@@ -356,15 +399,25 @@ jobs:
         sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 /tmp/ingest.py
         sudo rm -f /var/lib/drimelive/local.raw
 
-    - name: Persist ingest + restart server
+    - name: Persist ingest + restart server (auto-check)
       if: steps.os.outputs.exists != 'true'
       run: |
         sudo pkill -f 'drime_nbd.py' || true; sleep 3; sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt ./drimeblock sync"
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
-        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && break; sleep 1; done
+        ok=""
+        for i in $(seq 1 60); do
+          if [ -S /run/drimelive/nbd.sock ]; then ok=1; break; fi
+          sleep 1
+        done
+        if [ -z "$ok" ]; then
+          echo "ERROR: NBD socket never appeared after restart. Server log:"
+          sudo cat /var/log/drimelive-serve.log || true
+          exit 1
+        fi
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
         echo "installed $(date -Is)" | sudo rclone rcat "$first:liveblock/installed.marker"
+        echo "NBD socket ready after restart."
 
     - name: Start flush loop
       run: |
@@ -375,7 +428,13 @@ jobs:
         SOCK=/run/drimelive/nbd.sock
         MEM=14488
         ACCEL="-enable-kvm"; [ -e /dev/kvm ] || ACCEL="-machine accel=tcg"
-        
+
+        if [ ! -S "$SOCK" ]; then
+          echo "ERROR: NBD socket missing at boot. Aborting."
+          sudo cat /var/log/drimelive-serve.log || true
+          exit 1
+        fi
+
         echo "=== BOOTING VM - serial console streams below ==="
         sudo qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
           -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
@@ -384,7 +443,7 @@ jobs:
           -nographic -serial mon:stdio > /tmp/boot.log 2>&1 &
         QPID=$!
         echo "qemu pid=$QPID"
-        
+
         # Stream boot log into workflow logs AND poll NetBird status with your key
         for i in $(seq 1 60); do
           sleep 10
@@ -396,6 +455,6 @@ jobs:
           echo ""
           if ! kill -0 $QPID 2>/dev/null; then echo "VM exited"; break; fi
         done
-        
+
         echo "=== Keeping runner alive ==="
         tail -f /dev/null
