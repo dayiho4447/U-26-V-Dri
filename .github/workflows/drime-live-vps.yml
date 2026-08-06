@@ -7,12 +7,12 @@ on:
 
 concurrency:
   group: drime-live-vm
-  cancel-in-progress: false   # ONE active writer on the disk
+  cancel-in-progress: false
 
 jobs:
   drime-live-vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 0        # no workflow-side timeout (unlimited)
+    timeout-minutes: 0
 
     steps:
     - name: Checkout
@@ -50,6 +50,20 @@ jobs:
             elif unit.startswith("P"): mult = 1024**5
             return int(num*mult)
 
+        def parse_time(v):
+            """Parse time strings like '2s', '60s', '5m', '1h' into seconds"""
+            if isinstance(v, int): return int(v)
+            s = str(v).strip().lower()
+            if s in ("0", "off", "disabled"): return 0
+            m = re.match(r'^([0-9]*\.?[0-9]+)([smh]?)$', s)
+            if not m: raise ValueError("bad time: %s" % v)
+            num = float(m.group(1)); unit = m.group(2)
+            mult = 1
+            if unit == "s": mult = 1
+            elif unit == "m": mult = 60
+            elif unit == "h": mult = 3600
+            return int(num * mult)
+
         def run_rclone(args, check=True, extra=None):
             cmd = ["rclone"] + args + (extra or [])
             p = subprocess.run(cmd, text=True, capture_output=True)
@@ -67,7 +81,7 @@ jobs:
                 self.size = parse_size(st.get("disk_cap", "100G"))
                 self.chunk_size = parse_size(st.get("chunk_size", "4M"))
                 se = st.get("sync_every", "2s")
-                self.sync_every = 0 if se in ("0","off") else parse_size(se)
+                self.sync_every = parse_time(se)
                 self.accounts = []; total = 0
                 for line in open(accounts_path):
                     line = line.strip()
@@ -339,7 +353,6 @@ jobs:
         SHEOF
         chmod +x drimeblock
 
-    # Reads ALL secrets at once -> supports DRIME .. DRIME1000 (no fixed list)
     - name: Configure Drime accounts (name == Secret, up to 1000)
       env:
         ALL_SECRETS: ${{ toJson(secrets) }}
@@ -412,7 +425,6 @@ jobs:
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
         echo "installed $(date -Is) from $IMG" | sudo rclone rcat "$first:liveblock/installed.marker"
 
-    # ---- BRAIN INJECTION (no-op until drime-brain.py = file #3 is added) ----
     - name: Inject master brain if present
       run: |
         if [ -f drime-brain.py ]; then echo "brain present -> brain owns handoff + dashboard"; else echo "no brain yet -> YAML fallback loop active"; fi
