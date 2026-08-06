@@ -130,15 +130,6 @@ jobs:
                 with open(tmp,"wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, path)
 
-            def prewarm_boot_chunks(self, count=64):
-                print(f"[PREWARM] Downloading first {count} chunks for fast boot...", flush=True)
-                for cid in range(count):
-                    try:
-                        self.read_chunk(cid)
-                    except Exception:
-                        pass
-                print(f"[PREWARM] Done. Boot sectors cached locally.", flush=True)
-
             def ingest_from_file(self, path):
                 chunk_size = self.chunk_size
                 zero_chunk = b"\x00" * chunk_size
@@ -296,7 +287,6 @@ jobs:
             global STORE
             STORE = DrimeStore(conf_path=CFG["conf"], accounts_path=CFG["accounts"], cache=CFG.get("cache","/var/lib/drimelive"))
             STORE.load_remote_manifest()
-            STORE.prewarm_boot_chunks(64)
         def open(readonly): return STORE
         def close(h):
             try: h.flush()
