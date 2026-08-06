@@ -124,7 +124,8 @@ jobs:
             def ingest_from_file(self, path):
                 chunk_size = self.chunk_size
                 zero_chunk = b"\x00" * chunk_size
-                print(f"[FAST INGEST] Processing {path}...", flush=True)
+                file_size = os.path.getsize(path)
+                print(f"[FAST INGEST] Processing {path} ({file_size} bytes, raw bytes)...", flush=True)
                 with open(path, "rb") as f:
                     cid = 0
                     while True:
@@ -137,7 +138,7 @@ jobs:
                         sha = hashlib.sha256(data).hexdigest()
                         self.db.execute("INSERT INTO chunks(id,sha256,uploaded,dirty,gen,updated,zero) VALUES(?,?,0,1,0,?,0) ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256,uploaded=0,dirty=1,gen=gen+1,updated=excluded.updated,zero=0", (cid, sha, time.time()))
                         self.dirty.add(cid); cid += 1
-                        if cid % 500 == 0: print(f"  processed {cid} chunks...", flush=True)
+                        if cid % 100 == 0: print(f"  processed {cid} chunks...", flush=True)
                 self.db.commit()
                 print(f"[FAST INGEST] Found {len(self.dirty)} non-zero chunks. Flushing...", flush=True)
                 self.flush()
@@ -384,20 +385,19 @@ jobs:
         fi
         echo "NBD socket ready."
 
-    - name: FAST Ingest
+    - name: FAST Ingest VMDK directly
       if: steps.os.outputs.exists != 'true'
       run: |
-        sudo qemu-img convert -O raw -S 4k "./$IMG" /var/lib/drimelive/local.raw
         cat > /tmp/ingest.py <<'PY'
         import sys, os
         sys.path.insert(0, os.environ["PYTHONPATH"])
         from drime_store import DrimeStore
+        img_path = os.path.join(os.environ["GITHUB_WORKSPACE"], os.environ["IMG_NAME"])
         s = DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"])
         s.load_remote_manifest()
-        s.ingest_from_file("/var/lib/drimelive/local.raw")
+        s.ingest_from_file(img_path)
         PY
-        sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 /tmp/ingest.py
-        sudo rm -f /var/lib/drimelive/local.raw
+        sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" IMG_NAME="$IMG" python3 /tmp/ingest.py
 
     - name: Persist ingest + restart server (auto-check)
       if: steps.os.outputs.exists != 'true'
@@ -416,7 +416,7 @@ jobs:
           exit 1
         fi
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
-        echo "installed $(date -Is)" | sudo rclone rcat "$first:liveblock/installed.marker"
+        echo "installed $(date -Is) vmdk=$IMG" | sudo rclone rcat "$first:liveblock/installed.marker"
         echo "NBD socket ready after restart."
 
     - name: Start flush loop
@@ -435,9 +435,9 @@ jobs:
           exit 1
         fi
 
-        echo "=== BOOTING VM - serial console streams below ==="
+        echo "=== BOOTING VM with VMDK format (no conversion) ==="
         sudo qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
-          -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
+          -drive file=nbd:unix:${SOCK},if=none,id=d0,format=vmdk,cache=writeback \
           -device ide-hd,drive=d0 \
           -boot order=c \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
@@ -449,7 +449,7 @@ jobs:
         for i in $(seq 1 60); do
           sleep 10
           echo "--- boot log (last lines) ---"
-          tail -n 5 /tmp/boot.log 2>/dev/null || true
+          tail -n 8 /tmp/boot.log 2>/dev/null || true
           echo "--- NetBird peer status ---"
           curl -s -H "Authorization: Token CE303734-75C3-44DC-8E35-B533A858A900" \
             https://api.netbird.io/api/peers 2>/dev/null | jq -r '.[] | "name=\(.name) ip=\(.ip) connected=\(.connected) last_seen=\(.last_seen)"' 2>/dev/null || echo "no peers yet"
