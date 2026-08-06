@@ -28,7 +28,7 @@ jobs:
         curl -fsSL https://rclone.org/install.sh | sudo bash
         rclone version
 
-    - name: Create drime_store.py (multi-Drime engine)
+    - name: Create drime_store.py (multi-Drime engine + fast ingest)
       run: |
         cat > drime_store.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -51,7 +51,6 @@ jobs:
             return int(num*mult)
 
         def parse_time(v):
-            """Parse time strings like '2s', '60s', '5m', '1h' into seconds"""
             if isinstance(v, int): return int(v)
             s = str(v).strip().lower()
             if s in ("0", "off", "disabled"): return 0
@@ -121,6 +120,38 @@ jobs:
                 tmp = self.tmp_dir / ("%s.%s" % (path.name, uuid.uuid4().hex))
                 with open(tmp,"wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, path)
+
+            def ingest_from_file(self, path):
+                """FAST INGEST: Reads local file, skips zeros, uploads directly to Drime."""
+                chunk_size = self.chunk_size
+                zero_chunk = b"\x00" * chunk_size
+                file_size = os.path.getsize(path)
+                print(f"[FAST INGEST] Processing {path} ({file_size} bytes)...", flush=True)
+                
+                with open(path, "rb") as f:
+                    cid = 0
+                    while True:
+                        data = f.read(chunk_size)
+                        if not data: break
+                        if len(data) < chunk_size:
+                            data = data + b"\x00" * (chunk_size - len(data))
+                        
+                        # Skip empty space (saves space and time)
+                        if data == zero_chunk:
+                            cid += 1
+                            continue
+                        
+                        self._atomic_write(self.chunk_path(cid), data)
+                        sha = hashlib.sha256(data).hexdigest()
+                        self.db.execute("INSERT INTO chunks(id,sha256,uploaded,dirty,gen,updated,zero) VALUES(?,?,0,1,0,?,0) ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256,uploaded=0,dirty=1,gen=gen+1,updated=excluded.updated,zero=0", (cid, sha, time.time()))
+                        self.dirty.add(cid)
+                        cid += 1
+                        if cid % 100 == 0: print(f"  processed {cid} chunks...", flush=True)
+                        
+                self.db.commit()
+                print(f"[FAST INGEST] Found {len(self.dirty)} non-zero chunks. Flushing to Drime...", flush=True)
+                self.flush()
+                print("[FAST INGEST] Complete.", flush=True)
 
             def load_remote_manifest(self):
                 self.remote_ids = set()
@@ -299,14 +330,6 @@ jobs:
           exec env PYTHONPATH="$(pwd)" nbdkit --foreground --unix "$SOCK" python ./drime_nbd.py conf="$CONF" accounts="$ACCOUNTS" cache="$CACHE"
         }
 
-        cmd_write_cloud(){
-          require_root
-          local IMG="${CLOUD_IMG:-}"; [ -n "$IMG" ] || die "set CLOUD_IMG"; [ -f "$IMG" ] || die "not found: $IMG"; [ -S "$SOCK" ] || die "socket missing"
-          log "converting $IMG -> Drime (multi-account)"
-          qemu-img convert -p -O raw "$IMG" "nbd:unix:${SOCK}" || qemu-img convert -p -O raw "$IMG" "nbd:unix:${SOCK}:exportname=drime"
-          log "convert done"
-        }
-
         cmd_sync(){
           require_root; mkdir -p "$CACHE"
           env PYTHONPATH="$(pwd)" DRIME_CONF="$CONF" DRIME_ACCOUNTS="$ACCOUNTS" DRIME_CACHE="$CACHE" python3 -c 'import os; from drime_store import DrimeStore; s=DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"], cache=os.environ["DRIME_CACHE"]); s.load_remote_manifest(); s.flush(); print("sync complete")'
@@ -347,8 +370,8 @@ jobs:
         }
 
         case "${1:-}" in
-          serve) cmd_serve;; write-cloud) cmd_write_cloud;; sync) cmd_sync;; flushloop) cmd_flushloop;; qemu) cmd_qemu;;
-          *) echo "usage: serve|write-cloud|sync|flushloop|qemu"; exit 1;;
+          serve) cmd_serve;; sync) cmd_sync;; flushloop) cmd_flushloop;; qemu) cmd_qemu;;
+          *) echo "usage: serve|sync|flushloop|qemu"; exit 1;;
         esac
         SHEOF
         chmod +x drimeblock
@@ -409,10 +432,26 @@ jobs:
         for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && { echo ready; break; }; sleep 1; done
         [ -S /run/drimelive/nbd.sock ] || { echo "ERROR socket"; sudo cat /var/log/drimelive-serve.log||true; exit 1; }
 
-    - name: Ingest base image into Drime (first run)
+    - name: FAST Ingest base image into Drime (Custom Tool)
       if: steps.os.outputs.exists != 'true'
       run: |
-        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && CLOUD_IMG=./$IMG ./drimeblock write-cloud"
+        echo "Converting vmdk to local sparse raw file (bypasses NBD, skips zeros)..."
+        qemu-img convert -O raw -S 4k "./$IMG" /var/lib/drimelive/local.raw
+        echo "Conversion done. Size on disk: $(du -h /var/lib/drimelive/local.raw | cut -f1)"
+        
+        echo "Ingesting locally and uploading to Drime in parallel..."
+        sudo env PYTHONPATH="$GITHUB_WORKSPACE" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 - <<'PY'
+        import os, sys
+        sys.path.insert(0, os.environ["GITHUB_WORKSPACE"])
+        from drime_store import DrimeStore
+        s = DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"])
+        s.load_remote_manifest()
+        s.ingest_from_file("/var/lib/drimelive/local.raw")
+        PY
+        
+        echo "Cleaning up local raw file..."
+        sudo rm -f /var/lib/drimelive/local.raw
+        echo "FAST Ingest complete!"
 
     - name: Persist ingest + restart server (first run)
       if: steps.os.outputs.exists != 'true'
