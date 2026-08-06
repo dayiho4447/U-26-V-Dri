@@ -363,11 +363,11 @@ jobs:
         if ok==0: raise SystemExit("ERROR: no Drime account.")
         PY
 
-    - name: Check if disk already ingested
+    - name: Check if disk already ingested (v2 marker)
       id: os
       run: |
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
-        if sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -q '^installed.marker$'; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+        if sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -q '^installed.v2.marker$'; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
 
     - name: Find + download base image
       if: steps.os.outputs.exists != 'true'
@@ -394,19 +394,22 @@ jobs:
         fi
         echo "NBD socket ready."
 
-    - name: FAST Ingest VMDK directly
+    - name: Convert VMDK to RAW then FAST Ingest
       if: steps.os.outputs.exists != 'true'
       run: |
+        echo "Converting VMDK -> RAW (bootable disk)..."
+        sudo qemu-img convert -f vmdk -O raw -S 4k "./$IMG" /var/lib/drimelive/local.raw
+        sudo ls -lh /var/lib/drimelive/local.raw
         cat > /tmp/ingest.py <<'PY'
         import sys, os
         sys.path.insert(0, os.environ["PYTHONPATH"])
         from drime_store import DrimeStore
-        img_path = os.path.join(os.environ["GITHUB_WORKSPACE"], os.environ["IMG_NAME"])
         s = DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"])
         s.load_remote_manifest()
-        s.ingest_from_file(img_path)
+        s.ingest_from_file("/var/lib/drimelive/local.raw")
         PY
-        sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" IMG_NAME="$IMG" python3 /tmp/ingest.py
+        sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 /tmp/ingest.py
+        sudo rm -f /var/lib/drimelive/local.raw
 
     - name: Persist ingest + restart server (auto-check)
       if: steps.os.outputs.exists != 'true'
@@ -425,14 +428,14 @@ jobs:
           exit 1
         fi
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
-        echo "installed $(date -Is) vmdk=$IMG" | sudo rclone rcat "$first:liveblock/installed.marker"
+        echo "installed $(date -Is) raw-converted=$IMG" | sudo rclone rcat "$first:liveblock/installed.v2.marker"
         echo "NBD socket ready after restart."
 
     - name: Start flush loop
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
 
-    - name: Start VNC + Boot VM (KVM/VT-x, NVMe, 2c4t, 16G)
+    - name: Start VNC + Boot VM (UEFI + NVMe + KVM + 2c4t + 16G)
       run: |
         SOCK=/run/drimelive/nbd.sock
 
@@ -442,77 +445,73 @@ jobs:
           exit 1
         fi
 
-        # Check KVM availability
+        # KVM check
         if [ -e /dev/kvm ]; then
-          echo "KVM is available on this runner"
+          echo "KVM available"
           sudo chmod 666 /dev/kvm || true
-          ACCEL="kvm"
-          CPU_OPTS="-cpu host,kvm=on"
+          ACCEL="kvm"; CPU_OPTS="-cpu host,kvm=on"
         else
-          echo "WARNING: KVM not available, falling back to TCG"
-          ACCEL="tcg"
-          CPU_OPTS="-cpu qemu64"
+          echo "WARNING: no KVM, using TCG"
+          ACCEL="tcg"; CPU_OPTS="-cpu qemu64"
         fi
 
-        # Kill old VNC
+        # UEFI firmware (VMware-style for NVMe)
+        CODE=$(ls /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd 2>/dev/null | head -1)
+        VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd 2>/dev/null | head -1)
+        [ -n "$CODE" ] || { echo "ERROR: OVMF not found"; exit 1; }
+        sudo cp "$VARS_SRC" /tmp/OVMF_VARS.fd
+        sudo chmod 666 /tmp/OVMF_VARS.fd
+
+        # VNC
         sudo pkill -f Xvfb || true
         sudo pkill -f x11vnc || true
         sleep 2
-
-        echo "Starting fresh Xvfb + x11vnc..."
         sudo Xvfb :1 -screen 0 1920x1080x24 &
         sleep 2
         sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
         sleep 2
-
         if ! sudo ss -tlnp | grep -q ':5900'; then
-          echo "ERROR: x11vnc not listening. Log:"
-          sudo cat /tmp/x11vnc.log || true
-          exit 1
+          echo "ERROR: x11vnc not listening"; sudo cat /tmp/x11vnc.log || true; exit 1
         fi
-        echo "VNC server listening on port 5900"
+        echo "VNC listening on 5900"
 
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
-        if [ -z "$NB_IP" ]; then
-          echo "ERROR: Could not get NetBird IP"
-          exit 1
-        fi
+        [ -z "$NB_IP" ] && { echo "ERROR: no NetBird IP"; exit 1; }
 
         export DISPLAY=:1
+        : > /tmp/vm-serial.log
 
-        echo "=== BOOTING VM: q35 + KVM/VT-x + NVMe + 2c/4t + 16G ==="
+        echo "=== BOOTING VM: UEFI(OVMF) + NVMe + q35 + KVM + 2c/4t + 16G ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 \
           -enable-kvm \
           -machine q35,accel=$ACCEL \
           $CPU_OPTS \
           -smp 4,sockets=1,cores=2,threads=2 \
           -m 16384 \
+          -drive if=pflash,format=raw,readonly=on,file=$CODE \
+          -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
           -drive file=nbd:unix:${SOCK},if=none,id=drime0,format=raw,cache=writeback \
           -device nvme,drive=drime0,serial=DRIME0001 \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -serial file:/tmp/vm-serial.log \
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
         echo "qemu pid=$QPID"
 
         sleep 5
         echo "=========================================="
-        echo "VM SPECS:"
-        echo "  CPU: 2 cores, 4 threads"
-        echo "  RAM: 16GB"
-        echo "  Disk: NVMe (VMware-compatible VMDK)"
-        echo "  Accel: KVM/VT-x (if available)"
-        echo ""
-        echo "CONNECT VIA VNC:"
-        echo "  $NB_IP:5900 (no password)"
+        echo "VM: UEFI + NVMe, 2c/4t, 16G, KVM"
+        echo "VNC: $NB_IP:5900 (no password)"
         echo "=========================================="
 
-        # VNC watchdog
+        # Watchdog: keep VNC alive + stream serial to workflow logs
         (
           while kill -0 $QPID 2>/dev/null; do
             sleep 30
+            echo "--- serial log tail ---"
+            tail -n 10 /tmp/vm-serial.log 2>/dev/null || true
             if ! sudo ss -tlnp | grep -q ':5900'; then
-              echo "[WATCHDOG] x11vnc died, restarting..."
               sudo pkill -f x11vnc || true
               sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
             fi
