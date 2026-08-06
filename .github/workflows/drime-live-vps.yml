@@ -21,12 +21,27 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq
+        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb
 
     - name: Install latest rclone
       run: |
         curl -fsSL https://rclone.org/install.sh | sudo bash
         rclone version
+
+    - name: Install NetBird on runner
+      run: |
+        curl -fsSL https://pkgs.netbird.io/debian/public.key | sudo gpg --dearmor -o /usr/share/keyrings/netbird-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main" | sudo tee /etc/apt/sources.list.d/netbird.list
+        sudo apt-get update -y
+        sudo apt-get install -y netbird
+        sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
+        sudo netbird status
+
+    - name: Install TurboVNC on runner
+      run: |
+        wget -q https://downloads.sourceforge.net/project/turbovnc/3.1.1/turbovnc_3.1.1_amd64.deb -O /tmp/turbovnc.deb
+        sudo dpkg -i /tmp/turbovnc.deb || sudo apt-get install -f -y
+        echo "TurboVNC installed."
 
     - name: Create drime_store.py
       run: |
@@ -125,7 +140,7 @@ jobs:
                 chunk_size = self.chunk_size
                 zero_chunk = b"\x00" * chunk_size
                 file_size = os.path.getsize(path)
-                print(f"[FAST INGEST] Processing {path} ({file_size} bytes, raw bytes)...", flush=True)
+                print(f"[FAST INGEST] Processing {path} ({file_size} bytes)...", flush=True)
                 with open(path, "rb") as f:
                     cid = 0
                     while True:
@@ -423,7 +438,7 @@ jobs:
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
 
-    - name: Boot VM and watch it in the logs
+    - name: Start TurboVNC and boot VM with GUI
       run: |
         SOCK=/run/drimelive/nbd.sock
         MEM=14488
@@ -435,27 +450,32 @@ jobs:
           exit 1
         fi
 
-        echo "=== BOOTING VM with VMDK format (no conversion) ==="
-        sudo qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
-          -drive file=nbd:unix:${SOCK},if=none,id=d0,format=vmdk,cache=writeback \
-          -device ide-hd,drive=d0 \
-          -boot order=c \
+        # Start TurboVNC server with virtual framebuffer
+        echo "Starting TurboVNC server on display :1..."
+        export DISPLAY=:1
+        /opt/TurboVNC/bin/vncserver :1 -geometry 1920x1080 -depth 24 -rfbport 5901 -SecurityTypes None &
+        sleep 3
+
+        echo "NetBird IP:"
+        sudo netbird status | grep -i "netbird ip" || echo "(check NetBird dashboard)"
+
+        echo "=== BOOTING VM with GUI on TurboVNC display ==="
+        sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
+          -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
+          -device virtio-blk-pci,drive=d0,discard=on \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-          -nographic -serial mon:stdio > /tmp/boot.log 2>&1 &
+          -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
         echo "qemu pid=$QPID"
 
-        # Stream boot log into workflow logs AND poll NetBird status with your key
-        for i in $(seq 1 60); do
-          sleep 10
-          echo "--- boot log (last lines) ---"
-          tail -n 8 /tmp/boot.log 2>/dev/null || true
-          echo "--- NetBird peer status ---"
-          curl -s -H "Authorization: Token CE303734-75C3-44DC-8E35-B533A858A900" \
-            https://api.netbird.io/api/peers 2>/dev/null | jq -r '.[] | "name=\(.name) ip=\(.ip) connected=\(.connected) last_seen=\(.last_seen)"' 2>/dev/null || echo "no peers yet"
-          echo ""
-          if ! kill -0 $QPID 2>/dev/null; then echo "VM exited"; break; fi
-        done
+        echo "=========================================="
+        echo "Connect via VNC:"
+        echo "  Host: <runner NetBird IP>"
+        echo "  Port: 5901"
+        echo "  No password"
+        echo ""
+        echo "Check NetBird dashboard for runner IP"
+        echo "=========================================="
 
         echo "=== Keeping runner alive ==="
         tail -f /dev/null
