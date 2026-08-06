@@ -1,4 +1,4 @@
-name: Drime Live VM (multi-Drime up to 1000, master-ready, unlimited)
+name: Drime Live VM
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
         curl -fsSL https://rclone.org/install.sh | sudo bash
         rclone version
 
-    - name: Create drime_store.py (multi-Drime engine + fast ingest)
+    - name: Create drime_store.py
       run: |
         cat > drime_store.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -108,7 +108,7 @@ jobs:
             def account_for(self, cid):
                 for a in self.accounts:
                     if a["start"] <= cid < a["end"]: return a["name"]
-                raise OutOfCapacity("chunk %d beyond Drime capacity. Add another DRIMEn line + Secret." % cid)
+                raise OutOfCapacity("chunk %d beyond Drime capacity.")
 
             def chunk_len(self, cid):
                 start = cid*self.chunk_size
@@ -122,35 +122,25 @@ jobs:
                 os.replace(tmp, path)
 
             def ingest_from_file(self, path):
-                """FAST INGEST: Reads local file, skips zeros, uploads directly to Drime."""
                 chunk_size = self.chunk_size
                 zero_chunk = b"\x00" * chunk_size
-                file_size = os.path.getsize(path)
-                print(f"[FAST INGEST] Processing {path} ({file_size} bytes)...", flush=True)
-                
+                print(f"[FAST INGEST] Processing {path}...", flush=True)
                 with open(path, "rb") as f:
                     cid = 0
                     while True:
                         data = f.read(chunk_size)
                         if not data: break
-                        if len(data) < chunk_size:
-                            data = data + b"\x00" * (chunk_size - len(data))
-                        
+                        if len(data) < chunk_size: data = data + b"\x00" * (chunk_size - len(data))
                         if data == zero_chunk:
-                            cid += 1
-                            continue
-                        
+                            cid += 1; continue
                         self._atomic_write(self.chunk_path(cid), data)
                         sha = hashlib.sha256(data).hexdigest()
                         self.db.execute("INSERT INTO chunks(id,sha256,uploaded,dirty,gen,updated,zero) VALUES(?,?,0,1,0,?,0) ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256,uploaded=0,dirty=1,gen=gen+1,updated=excluded.updated,zero=0", (cid, sha, time.time()))
-                        self.dirty.add(cid)
-                        cid += 1
-                        if cid % 100 == 0: print(f"  processed {cid} chunks...", flush=True)
-                        
+                        self.dirty.add(cid); cid += 1
+                        if cid % 500 == 0: print(f"  processed {cid} chunks...", flush=True)
                 self.db.commit()
-                print(f"[FAST INGEST] Found {len(self.dirty)} non-zero chunks. Flushing to Drime...", flush=True)
+                print(f"[FAST INGEST] Found {len(self.dirty)} non-zero chunks. Flushing...", flush=True)
                 self.flush()
-                print("[FAST INGEST] Complete.", flush=True)
 
             def load_remote_manifest(self):
                 self.remote_ids = set()
@@ -232,10 +222,8 @@ jobs:
                                 if len(data) < exp: data += b"\x00"*(exp-len(data))
                                 sha = hashlib.sha256(data).hexdigest()
                                 is_zero = (data == b"\x00"*exp); rp = cid in self.remote_ids
-                                if is_zero and rp:
-                                    plan.append({"id":cid,"gen":gen,"sha":sha,"kind":"delete"}); continue
-                                if is_zero and not rp:
-                                    plan.append({"id":cid,"gen":gen,"sha":sha,"kind":"skip"}); continue
+                                if is_zero and rp: plan.append({"id":cid,"gen":gen,"sha":sha,"kind":"delete"}); continue
+                                if is_zero and not rp: plan.append({"id":cid,"gen":gen,"sha":sha,"kind":"skip"}); continue
                                 with gzip.open(stage/("%08d.gz"%cid),"wb") as f: f.write(data)
                                 plan.append({"id":cid,"gen":gen,"sha":sha,"kind":"upload"})
                             if any(x["kind"]=="upload" for x in plan):
@@ -281,10 +269,8 @@ jobs:
         sys.path.insert(0, os.getcwd())
         import nbdkit
         from drime_store import DrimeStore
-
         API_VERSION = 2
         CFG = {}; STORE = None
-
         def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
         def config(key, value): CFG[key] = value
         def config_complete():
@@ -308,80 +294,13 @@ jobs:
         def flush(h): h.flush()
         PYEOF
 
-    - name: Create drimeblock
-      run: |
-        cat > drimeblock <<'SHEOF'
-        #!/usr/bin/env bash
-        set -Eeuo pipefail
-        CONF="${DRIME_CONF:-drime-storage.conf}"
-        ACCOUNTS="${DRIME_ACCOUNTS:-/run/drimelive/accounts.txt}"
-        CACHE="${DRIME_CACHE:-/var/lib/drimelive}"
-        RUNDIR="${DRIME_RUNDIR:-/run/drimelive}"
-        SOCK="${DRIME_SOCK:-${RUNDIR}/nbd.sock}"
-        MEM="${DRIME_MEM:-16384}"
-        log(){ printf '\033[1;34m[drimeblock]\033[0m %s\n' "$*"; }
-        die(){ printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
-        require_root(){ [[ $EUID -eq 0 ]] || die "run as root"; }
-
-        cmd_serve(){
-          require_root; mkdir -p "$CACHE" "$RUNDIR"
-          log "serve conf=$CONF accounts=$ACCOUNTS"
-          exec env PYTHONPATH="$(pwd)" nbdkit --foreground --unix "$SOCK" python ./drime_nbd.py conf="$CONF" accounts="$ACCOUNTS" cache="$CACHE"
-        }
-
-        cmd_sync(){
-          require_root; mkdir -p "$CACHE"
-          env PYTHONPATH="$(pwd)" DRIME_CONF="$CONF" DRIME_ACCOUNTS="$ACCOUNTS" DRIME_CACHE="$CACHE" python3 -c 'import os; from drime_store import DrimeStore; s=DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"], cache=os.environ["DRIME_CACHE"]); s.load_remote_manifest(); s.flush(); print("sync complete")'
-        }
-
-        cmd_flushloop(){
-          require_root; mkdir -p "$CACHE"
-          log "flush loop (interval from conf sync_every)"
-          exec env PYTHONPATH="$(pwd)" DRIME_CONF="$CONF" DRIME_ACCOUNTS="$ACCOUNTS" DRIME_CACHE="$CACHE" python3 -c 'import os,time; from drime_store import DrimeStore; s=DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"], cache=os.environ["DRIME_CACHE"]); s.load_remote_manifest(); iv=s.sync_every or 60
-        while True:
-            try: s.flush()
-            except Exception as e: print("flush err:",e,flush=True)
-            time.sleep(iv)'
-        }
-
-        cmd_qemu(){
-          require_root; [ -S "$SOCK" ] || die "socket missing"
-          local ACCEL="-enable-kvm"; [ -e /dev/kvm ] || ACCEL="-machine accel=tcg"
-          local HOSTMEM; HOSTMEM=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-          local USEMEM; if [ "$HOSTMEM" -ge $((MEM+1500)) ]; then USEMEM=$MEM; else USEMEM=$((HOSTMEM-1500)); [ "$USEMEM" -lt 2048 ] && USEMEM=2048; fi
-          local NCPU; NCPU=$(nproc); local SMP; if [ "$NCPU" -ge 4 ]; then SMP="4,sockets=1,cores=2,threads=2"; else SMP="$NCPU"; fi
-          local LOG=/var/log/vm-serial.log; : > "$LOG"
-          echo "QEMU accel=${ACCEL#-} smp=$SMP mem=${USEMEM}M disk=nbd:unix:$SOCK discard=on"
-          qemu-system-x86_64 $ACCEL -smp $SMP -m $USEMEM \
-            -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
-            -device virtio-blk-pci,drive=d0,serial=DRIME_LIVE_0001,discard=on \
-            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-            -display none -serial file:"$LOG" -monitor none &
-          local QPID=$!; echo "qemu pid=$QPID"
-          local i; for i in $(seq 1 24); do
-            kill -0 "$QPID" 2>/dev/null || { echo "ERROR qemu exited"; tail -n 120 "$LOG"||true; exit 1; }
-            grep -q "end Kernel panic" "$LOG" 2>/dev/null && { echo "ERROR panic"; tail -n 150 "$LOG"||true; kill "$QPID"||true; exit 1; }
-            sleep 5
-          done
-          echo "VM alive; keeping alive. serial tail:"
-          tail -n +1 -f "$LOG" &
-          local TPID=$!; wait "$QPID" || true; kill "$TPID" 2>/dev/null||true
-        }
-
-        case "${1:-}" in
-          serve) cmd_serve;; sync) cmd_sync;; flushloop) cmd_flushloop;; qemu) cmd_qemu;;
-          *) echo "usage: serve|sync|flushloop|qemu"; exit 1;;
-        esac
-        SHEOF
-        chmod +x drimeblock
-
-    - name: Configure Drime accounts (name == Secret, up to 1000)
+    - name: Configure Drime accounts
       env:
         ALL_SECRETS: ${{ toJson(secrets) }}
       run: |
         sudo mkdir -p /run/drimelive
         sudo -E python3 - <<'PY'
-        import os, json, re, subprocess, shutil
+        import os, json, re, subprocess
         secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
         accounts = []
         for line in open("drime-storage.conf"):
@@ -392,17 +311,13 @@ jobs:
         with open("/run/drimelive/accounts.txt","w") as out:
             for name,size in accounts:
                 key = secrets.get(name)
-                if not key:
-                    print("WARN no Secret", name, "-> skipped"); continue
+                if not key: continue
                 subprocess.run(["rclone","config","delete",name], capture_output=True)
                 c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
                 m2 = subprocess.run(["rclone","mkdir",name+":liveblock"], capture_output=True)
                 if c.returncode==0 and m2.returncode==0:
-                    out.write("%s %s\n" % (name,size)); ok+=1; print("account",name,"OK")
-                else:
-                    print("WARN account",name,"failed -> skipped")
-        print("active accounts:", ok)
-        if ok==0: raise SystemExit("ERROR: no Drime account configured. Add Secret DRIME.")
+                    out.write("%s %s\n" % (name,size)); ok+=1
+        if ok==0: raise SystemExit("ERROR: no Drime account.")
         PY
 
     - name: Check if disk already ingested
@@ -411,16 +326,12 @@ jobs:
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
         if sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -q '^installed.marker$'; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
 
-    - name: Find + download base image from Drime (first account)
+    - name: Find + download base image
       if: steps.os.outputs.exists != 'true'
       run: |
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
-        IMG=""
-        for f in base.vmdk base.img base.qcow2; do
-          if sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -qx "$f"; then IMG="$f"; break; fi
-        done
-        [ -z "$IMG" ] && IMG=$(sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
-        [ -z "$IMG" ] && { echo "ERROR: upload base.vmdk to the first Drime (DRIME) folder liveblock"; exit 1; }
+        IMG=$(sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
+        [ -z "$IMG" ] && exit 1
         echo "IMG=$IMG" >> "$GITHUB_ENV"
         sudo rclone copyto "$first:liveblock/$IMG" "./$IMG" --progress
 
@@ -428,17 +339,12 @@ jobs:
       run: |
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
-        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && { echo ready; break; }; sleep 1; done
-        [ -S /run/drimelive/nbd.sock ] || { echo "ERROR socket"; sudo cat /var/log/drimelive-serve.log||true; exit 1; }
+        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && break; sleep 1; done
 
-    - name: FAST Ingest base image into Drime (Custom Tool)
+    - name: FAST Ingest
       if: steps.os.outputs.exists != 'true'
       run: |
-        echo "Converting vmdk to local sparse raw file (bypasses NBD, skips zeros)..."
         sudo qemu-img convert -O raw -S 4k "./$IMG" /var/lib/drimelive/local.raw
-        echo "Conversion done. Size on disk: $(sudo du -h /var/lib/drimelive/local.raw | cut -f1)"
-        
-        echo "Ingesting locally and uploading to Drime in parallel..."
         cat > /tmp/ingest.py <<'PY'
         import sys, os
         sys.path.insert(0, os.environ["PYTHONPATH"])
@@ -447,60 +353,49 @@ jobs:
         s.load_remote_manifest()
         s.ingest_from_file("/var/lib/drimelive/local.raw")
         PY
-        
         sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 /tmp/ingest.py
-        rm -f /tmp/ingest.py
-        
-        echo "Cleaning up local raw file..."
         sudo rm -f /var/lib/drimelive/local.raw
-        echo "FAST Ingest complete!"
 
-    - name: Persist ingest + restart server (first run)
+    - name: Persist ingest + restart server
       if: steps.os.outputs.exists != 'true'
       run: |
         sudo pkill -f 'drime_nbd.py' || true; sleep 3; sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt ./drimeblock sync"
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
-        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && { echo ready; break; }; sleep 1; done
-        [ -S /run/drimelive/nbd.sock ] || { echo "ERROR socket"; exit 1; }
+        for i in $(seq 1 90); do [ -S /run/drimelive/nbd.sock ] && break; sleep 1; done
         first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
-        echo "installed $(date -Is) from $IMG" | sudo rclone rcat "$first:liveblock/installed.marker"
+        echo "installed $(date -Is)" | sudo rclone rcat "$first:liveblock/installed.marker"
 
-    - name: Inject master brain if present
-      run: |
-        if [ -f drime-brain.py ]; then echo "brain present -> brain owns handoff + dashboard"; else echo "no brain yet -> YAML fallback loop active"; fi
-
-    - name: Start flush loop (live mirror)
+    - name: Start flush loop
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
-        sleep 2; echo "flush loop started"
 
-    - name: 5h self-trigger (unlimited uptime; disabled once brain exists)
-      env:
-        WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
+    - name: Boot VM and watch it in the logs
       run: |
-        if [ -f drime-brain.py ]; then echo "brain present -> YAML loop disabled"; else
-        ( sleep 18000
-          for i in 1 2 3; do
-            curl -s -X POST -H "Authorization: token $WORKFLOW_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/drime-live-vps.yml/dispatches" \
-              -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" && break
-            sleep 20
-          done
-        ) &
-        echo "5h self-trigger armed"
-        fi
-
-    - name: Connection info
-      run: |
-        echo "=========================================="
-        echo "DRIME LIVE VM (multi-Drime up to 1000, KVM, unlimited)"
-        echo "Base account: $(head -1 /run/drimelive/accounts.txt | awk '{print $1}')"
-        echo "Active accounts: $(wc -l < /run/drimelive/accounts.txt)"
-        echo "Access: ssh root@<NetBird IP of your image's peer>"
-        echo "Deletes: run 'fstrim -av' in the VM to free Drime space"
-        echo "=========================================="
-
-    - name: Boot VM from Drime
-      run: |
-        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && ./drimeblock qemu"
+        SOCK=/run/drimelive/nbd.sock
+        MEM=14488
+        ACCEL="-enable-kvm"; [ -e /dev/kvm ] || ACCEL="-machine accel=tcg"
+        
+        echo "=== BOOTING VM - serial console streams below ==="
+        sudo qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
+          -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
+          -device virtio-blk-pci,drive=d0,discard=on \
+          -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -nographic -serial mon:stdio > /tmp/boot.log 2>&1 &
+        QPID=$!
+        echo "qemu pid=$QPID"
+        
+        # Stream boot log into workflow logs AND poll NetBird status with your key
+        for i in $(seq 1 60); do
+          sleep 10
+          echo "--- boot log (last lines) ---"
+          tail -n 5 /tmp/boot.log 2>/dev/null || true
+          echo "--- NetBird peer status ---"
+          curl -s -H "Authorization: Token CE303734-75C3-44DC-8E35-B533A858A900" \
+            https://api.netbird.io/api/peers 2>/dev/null | jq -r '.[] | "name=\(.name) ip=\(.ip) connected=\(.connected) last_seen=\(.last_seen)"' 2>/dev/null || echo "no peers yet"
+          echo ""
+          if ! kill -0 $QPID 2>/dev/null; then echo "VM exited"; break; fi
+        done
+        
+        echo "=== Keeping runner alive ==="
+        tail -f /dev/null
