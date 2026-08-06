@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb x11vnc net-tools
+        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb x11vnc net-tools ovmf
 
     - name: Install latest rclone
       run: |
@@ -129,6 +129,15 @@ jobs:
                 tmp = self.tmp_dir / ("%s.%s" % (path.name, uuid.uuid4().hex))
                 with open(tmp,"wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, path)
+
+            def prewarm_boot_chunks(self, count=64):
+                print(f"[PREWARM] Downloading first {count} chunks for fast boot...", flush=True)
+                for cid in range(count):
+                    try:
+                        self.read_chunk(cid)
+                    except Exception:
+                        pass
+                print(f"[PREWARM] Done. Boot sectors cached locally.", flush=True)
 
             def ingest_from_file(self, path):
                 chunk_size = self.chunk_size
@@ -287,6 +296,7 @@ jobs:
             global STORE
             STORE = DrimeStore(conf_path=CFG["conf"], accounts_path=CFG["accounts"], cache=CFG.get("cache","/var/lib/drimelive"))
             STORE.load_remote_manifest()
+            STORE.prewarm_boot_chunks(64)
         def open(readonly): return STORE
         def close(h):
             try: h.flush()
@@ -383,7 +393,7 @@ jobs:
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
         ok=""
-        for i in $(seq 1 60); do
+        for i in $(seq 1 90); do
           if [ -S /run/drimelive/nbd.sock ]; then ok=1; break; fi
           sleep 1
         done
@@ -415,7 +425,7 @@ jobs:
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt ./drimeblock sync"
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive-serve.log 2>&1 &"
         ok=""
-        for i in $(seq 1 60); do
+        for i in $(seq 1 90); do
           if [ -S /run/drimelive/nbd.sock ]; then ok=1; break; fi
           sleep 1
         done
@@ -432,11 +442,9 @@ jobs:
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
 
-    - name: Start VNC + Boot VM + Show correct IP
+    - name: Start VNC + Boot VM (KVM/VT-x, NVMe, 2c4t, 16G)
       run: |
         SOCK=/run/drimelive/nbd.sock
-        MEM=14488
-        ACCEL="-enable-kvm"; [ -e /dev/kvm ] || ACCEL="-machine accel=tcg"
 
         if [ ! -S "$SOCK" ]; then
           echo "ERROR: NBD socket missing. Aborting."
@@ -444,7 +452,19 @@ jobs:
           exit 1
         fi
 
-        # Kill any old VNC/Xvfb to start fresh
+        # Check KVM availability
+        if [ -e /dev/kvm ]; then
+          echo "KVM is available on this runner"
+          sudo chmod 666 /dev/kvm || true
+          ACCEL="kvm"
+          CPU_OPTS="-cpu host,kvm=on"
+        else
+          echo "WARNING: KVM not available, falling back to TCG"
+          ACCEL="tcg"
+          CPU_OPTS="-cpu qemu64"
+        fi
+
+        # Kill old VNC
         sudo pkill -f Xvfb || true
         sudo pkill -f x11vnc || true
         sleep 2
@@ -455,28 +475,30 @@ jobs:
         sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
         sleep 2
 
-        # Verify VNC port is actually listening
         if ! sudo ss -tlnp | grep -q ':5900'; then
-          echo "ERROR: x11vnc not listening on port 5900. Log:"
+          echo "ERROR: x11vnc not listening. Log:"
           sudo cat /tmp/x11vnc.log || true
           exit 1
         fi
         echo "VNC server listening on port 5900"
 
-        # Get NetBird IP dynamically
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         if [ -z "$NB_IP" ]; then
           echo "ERROR: Could not get NetBird IP"
-          sudo netbird status
           exit 1
         fi
 
         export DISPLAY=:1
 
-        echo "=== BOOTING VM with IDE disk + Standard VGA ==="
-        sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
-          -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
-          -device ide-hd,drive=d0 \
+        echo "=== BOOTING VM: q35 + KVM/VT-x + NVMe + 2c/4t + 16G ==="
+        sudo -E DISPLAY=:1 qemu-system-x86_64 \
+          -enable-kvm \
+          -machine q35,accel=$ACCEL \
+          $CPU_OPTS \
+          -smp 4,sockets=1,cores=2,threads=2 \
+          -m 16384 \
+          -drive file=nbd:unix:${SOCK},if=none,id=drime0,format=raw,cache=writeback \
+          -device nvme,drive=drime0,serial=DRIME0001 \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -display sdl > /tmp/vm.log 2>&1 &
@@ -485,16 +507,17 @@ jobs:
 
         sleep 5
         echo "=========================================="
-        echo "CORRECT CONNECTION INFO:"
-        echo "  Host: $NB_IP"
-        echo "  Port: 5900"
-        echo "  No password"
+        echo "VM SPECS:"
+        echo "  CPU: 2 cores, 4 threads"
+        echo "  RAM: 16GB"
+        echo "  Disk: NVMe (VMware-compatible VMDK)"
+        echo "  Accel: KVM/VT-x (if available)"
         echo ""
-        echo "Open your VNC viewer and connect to:"
-        echo "  $NB_IP:5900"
+        echo "CONNECT VIA VNC:"
+        echo "  $NB_IP:5900 (no password)"
         echo "=========================================="
 
-        # VNC watchdog: restart x11vnc if it dies
+        # VNC watchdog
         (
           while kill -0 $QPID 2>/dev/null; do
             sleep 30
@@ -506,5 +529,4 @@ jobs:
           done
         ) &
 
-        echo "=== Keeping runner alive ==="
         tail -f /dev/null
