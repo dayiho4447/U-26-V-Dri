@@ -436,8 +436,8 @@ jobs:
       if: steps.os.outputs.exists != 'true'
       run: |
         echo "Converting vmdk to local sparse raw file (bypasses NBD, skips zeros)..."
-        qemu-img convert -O raw -S 4k "./$IMG" /var/lib/drimelive/local.raw
-        echo "Conversion done. Size on disk: $(du -h /var/lib/drimelive/local.raw | cut -f1)"
+        sudo qemu-img convert -O raw -S 4k "./$IMG" /var/lib/drimelive/local.raw
+        echo "Conversion done. Size on disk: $(sudo du -h /var/lib/drimelive/local.raw | cut -f1)"
         
         echo "Ingesting locally and uploading to Drime in parallel..."
         sudo env PYTHONPATH="$GITHUB_WORKSPACE" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 - <<'PY'
