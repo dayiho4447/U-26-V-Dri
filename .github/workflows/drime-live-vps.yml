@@ -438,7 +438,8 @@ jobs:
         echo "=== BOOTING VM - serial console streams below ==="
         sudo qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
           -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
-          -device virtio-blk-pci,drive=d0,discard=on \
+          -device ide-hd,drive=d0 \
+          -boot order=c \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -nographic -serial mon:stdio > /tmp/boot.log 2>&1 &
         QPID=$!
