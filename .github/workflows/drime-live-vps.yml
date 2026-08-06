@@ -136,7 +136,6 @@ jobs:
                         if len(data) < chunk_size:
                             data = data + b"\x00" * (chunk_size - len(data))
                         
-                        # Skip empty space (saves space and time)
                         if data == zero_chunk:
                             cid += 1
                             continue
@@ -440,14 +439,17 @@ jobs:
         echo "Conversion done. Size on disk: $(sudo du -h /var/lib/drimelive/local.raw | cut -f1)"
         
         echo "Ingesting locally and uploading to Drime in parallel..."
-        sudo env PYTHONPATH="$GITHUB_WORKSPACE" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 - <<'PY'
-        import os, sys
-        sys.path.insert(0, os.environ["GITHUB_WORKSPACE"])
+        cat > /tmp/ingest.py <<'PY'
+        import sys, os
+        sys.path.insert(0, os.environ["PYTHONPATH"])
         from drime_store import DrimeStore
         s = DrimeStore(conf_path=os.environ["DRIME_CONF"], accounts_path=os.environ["DRIME_ACCOUNTS"])
         s.load_remote_manifest()
         s.ingest_from_file("/var/lib/drimelive/local.raw")
         PY
+        
+        sudo env PYTHONPATH="$PWD" DRIME_CONF="drime-storage.conf" DRIME_ACCOUNTS="/run/drimelive/accounts.txt" python3 /tmp/ingest.py
+        rm -f /tmp/ingest.py
         
         echo "Cleaning up local raw file..."
         sudo rm -f /var/lib/drimelive/local.raw
