@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb
+        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb x11vnc
 
     - name: Install latest rclone
       run: |
@@ -37,11 +37,17 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Install TurboVNC on runner
+    - name: Start VNC server
       run: |
-        wget -q https://downloads.sourceforge.net/project/turbovnc/3.1.1/turbovnc_3.1.1_amd64.deb -O /tmp/turbovnc.deb
-        sudo dpkg -i /tmp/turbovnc.deb || sudo apt-get install -f -y
-        echo "TurboVNC installed."
+        echo "Starting Xvfb virtual display..."
+        Xvfb :1 -screen 0 1920x1080x24 &
+        sleep 2
+        
+        echo "Starting x11vnc on display :1, port 5900..."
+        x11vnc -display :1 -forever -nopw -rfbport 5900 -shared &
+        sleep 2
+        
+        echo "VNC server running on port 5900"
 
     - name: Create drime_store.py
       run: |
@@ -438,7 +444,7 @@ jobs:
       run: |
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock flushloop > /var/log/drimelive-flush.log 2>&1 &"
 
-    - name: Start TurboVNC and boot VM with GUI
+    - name: Boot VM with GUI on VNC display
       run: |
         SOCK=/run/drimelive/nbd.sock
         MEM=14488
@@ -450,16 +456,9 @@ jobs:
           exit 1
         fi
 
-        # Start TurboVNC server with virtual framebuffer
-        echo "Starting TurboVNC server on display :1..."
         export DISPLAY=:1
-        /opt/TurboVNC/bin/vncserver :1 -geometry 1920x1080 -depth 24 -rfbport 5901 -SecurityTypes None &
-        sleep 3
 
-        echo "NetBird IP:"
-        sudo netbird status | grep -i "netbird ip" || echo "(check NetBird dashboard)"
-
-        echo "=== BOOTING VM with GUI on TurboVNC display ==="
+        echo "=== BOOTING VM with GUI on VNC display :1 ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -smp 4 -m $MEM \
           -drive file=nbd:unix:${SOCK},if=none,id=d0,format=raw,cache=writeback \
           -device virtio-blk-pci,drive=d0,discard=on \
@@ -468,13 +467,16 @@ jobs:
         QPID=$!
         echo "qemu pid=$QPID"
 
+        sleep 5
         echo "=========================================="
+        echo "Runner NetBird IP: $(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}')"
+        echo ""
         echo "Connect via VNC:"
-        echo "  Host: <runner NetBird IP>"
-        echo "  Port: 5901"
+        echo "  Host: 100.112.165.200 (or check dashboard)"
+        echo "  Port: 5900"
         echo "  No password"
         echo ""
-        echo "Check NetBird dashboard for runner IP"
+        echo "You will see the VM GUI booting"
         echo "=========================================="
 
         echo "=== Keeping runner alive ==="
