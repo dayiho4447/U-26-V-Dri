@@ -37,20 +37,10 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Create Realtime Bridge (custom tool between VM and rclone)
+    - name: Create Realtime Bridge
       run: |
         cat > bridge.py <<'PYEOF'
         #!/usr/bin/env python3
-        """
-        DRIME REALTIME BRIDGE
-        Sits between QEMU (VM) and rclone (Drime).
-        - Reads stream from Drime on demand (direct boot, no download)
-        - Every write is committed locally in microseconds
-        - Each changed block is pushed to Drime IMMEDIATELY (write-through)
-          via a 16-worker parallel upload pool (no timer, no waiting)
-        - Force-kill loses only blocks still in-flight (sub-second)
-        - Drime usage grows live as you install
-        """
         import os, re, json, time, uuid, gzip, threading, subprocess, socket, struct, sys, queue
         from pathlib import Path
         from collections import OrderedDict
@@ -79,7 +69,6 @@ jobs:
                 self.size=total or 100*1024**3
                 self.lock=threading.RLock(); self.remote=set()
                 self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=512
-                # realtime write-through
                 self.q=queue.Queue(); self.pending=set(); self.plock=threading.Lock()
                 self.ver={}; self.vlock=threading.Lock()
                 self.manifest_dirty=False
@@ -112,6 +101,8 @@ jobs:
                     subprocess.run(["rclone","copyto",f"{self.accounts[0]['name']}:liveblock/manifest.json.gz",str(t),"--retries","1"],capture_output=True,timeout=30)
                     with gzip.open(t) as f:m=json.load(f)
                     for c in m.get("chunks",[]):self.remote.add(int(c["id"]))
+                    if self.remote:
+                        self.size=max((max(self.remote)+1)*self.chunk_size, self.size)
                 except Exception:pass
                 finally:
                     try:t.unlink()
@@ -182,7 +173,6 @@ jobs:
                     with self.clock:
                         self.cache_data[cid]=final;self.cache_data.move_to_end(cid)
                         while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
-                # bump version + enqueue for IMMEDIATE push
                 with self.vlock:self.ver[cid]=self.ver.get(cid,0)+1
                 with self.plock:
                     if cid not in self.pending:
@@ -195,8 +185,8 @@ jobs:
                         with self.vlock:v0=self.ver.get(cid,0)
                         self._push(cid)
                         with self.vlock:
-                            if self.ver.get(cid,0)!=v0:  # rewritten while uploading
-                                self.q.put(cid)          # push again
+                            if self.ver.get(cid,0)!=v0:
+                                self.q.put(cid)
                     except Exception:pass
                     finally:
                         with self.plock:self.pending.discard(cid)
@@ -303,6 +293,7 @@ jobs:
             os.makedirs("/run/drimelive",exist_ok=True)
             srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
             srv.bind(sp);os.chmod(sp,0o777);srv.listen(16)
+            print(f"[BRIDGE] ready size={eng.size}",flush=True)
             while True:
                 c,_=srv.accept()
                 threading.Thread(target=client,args=(c,eng),daemon=True).start()
@@ -352,10 +343,10 @@ jobs:
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup ./drimeblock serve > /var/log/bridge.log 2>&1 &"
         for i in $(seq 1 60); do
-          [ -S /run/drimelive/nbd.sock ] && exit 0
+          [ -S /run/drimelive/nbd.sock ] && { cat /var/log/bridge.log; exit 0; }
           sleep 1
         done
-        exit 1
+        cat /var/log/bridge.log; exit 1
 
     - name: Start VNC
       run: |
@@ -363,15 +354,25 @@ jobs:
         sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
         sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg; sleep 2
 
-    - name: Boot VM
+    - name: Boot VM (format=vmdk over the bridge)
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
-        export DISPLAY=:1
+        export DISPLAY=:1; : > /tmp/vm-serial.log
+        echo "=== BOOTING (vmdk format, realtime bridge) ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=raw,cache=writeback \
+          -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=vmdk,cache=writeback \
           -device ide-hd,drive=d0 -boot order=c -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -serial file:/tmp/vm-serial.log \
           -display sdl > /tmp/vm.log 2>&1 &
+        QPID=$!
+        sleep 5
+        echo "VNC: $NB_IP:5900"
+        ( while kill -0 $QPID 2>/dev/null; do
+            sleep 30
+            echo "--- serial ---"; sudo tail -n 5 /tmp/vm-serial.log 2>/dev/null || true
+            echo "--- bridge ---"; sudo tail -n 5 /var/log/bridge.log 2>/dev/null || true
+          done ) &
         tail -f /dev/null
