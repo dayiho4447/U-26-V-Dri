@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 nbdkit nbdkit-plugin-python wget ca-certificates jq xvfb x11vnc net-tools ovmf
+        sudo apt-get install -y python3 rclone curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools ovmf
 
     - name: Install latest rclone
       run: |
@@ -37,24 +37,29 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Create Custom Fast Drime Storage Engine
+    - name: Create Custom Drime Engine + Built-in NBD Server
       run: |
         cat > drime_fast.py <<'PYEOF'
         #!/usr/bin/env python3
         """
-        CUSTOM DRIME LIVE STORAGE ENGINE (BULLETPROOF PATCH - 100 ACCOUNTS)
+        CUSTOM DRIME LIVE STORAGE ENGINE
+        - 100-account chunked cloud storage
+        - Built-in pure-Python NBD server (no nbdkit, no silent crashes)
         """
         import os, re, json, time, uuid, gzip, hashlib, threading, subprocess, shutil, sys
+        import socket, struct
         from pathlib import Path
-        from concurrent.futures import ThreadPoolExecutor
         from collections import OrderedDict
-        import nbdkit
 
-        # CRITICAL FIX: nbdkit requires a module-level hook named 'open' which
-        # shadows Python's built-in open(). We save the real one here.
         _file_open = open
 
-        API_VERSION = 2
+        # ---------- NBD protocol constants ----------
+        NBD_OPT_EXPORT_NAME = 1
+        NBD_REP_ERR_UNSUP = 0x80000001
+        NBD_OPT_REPLY_MAGIC = 0x3e889045565a9
+        NBD_REQUEST_MAGIC = 0x25609513
+        NBD_SIMPLE_REPLY_MAGIC = 0x67446ab5
+        NBD_CMD_READ, NBD_CMD_WRITE, NBD_CMD_DISC, NBD_CMD_FLUSH, NBD_CMD_TRIM = 0,1,2,3,4
 
         class DrimeFastStorage:
             def __init__(self, conf_path, accounts_path, cache="/var/lib/drimelive"):
@@ -64,12 +69,11 @@ jobs:
                 self.cache.mkdir(parents=True, exist_ok=True)
                 self.chunks_dir.mkdir(parents=True, exist_ok=True)
                 self.tmp_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 self.chunk_size = self._parse_size(self._get_conf(conf_path, "chunk_size", "4M"))
-                
+
                 self.accounts = []
                 total = 0
-                
                 acct_file = accounts_path or "/run/drimelive/accounts.txt"
                 if os.path.exists(acct_file):
                     with _file_open(acct_file, "r") as f:
@@ -83,22 +87,14 @@ jobs:
                                 total += sz
                                 end = total // self.chunk_size
                                 self.accounts.append({"name": name, "start": start, "end": end})
-                
+
                 self.size = total if total > 0 else 100 * 1024 * 1024 * 1024
                 self.lock = threading.RLock()
                 self.remote_ids = set()
-                
                 self.cache_data = OrderedDict()
                 self.cache_lock = threading.Lock()
                 self.MAX_CACHE_CHUNKS = 256
-                
-                self.prefetch_queue = []
-                self.prefetch_lock = threading.Lock()
-                self.prefetch_thread = None
-                
-                self.executor = ThreadPoolExecutor(max_workers=8)
-                
-                print(f"[DRIME FAST] Storage engine initialized with {len(self.accounts)} accounts", flush=True)
+                print(f"[DRIME] Engine ready: {len(self.accounts)} accounts, size={self.size}", flush=True)
 
             def _parse_size(self, v):
                 if isinstance(v, int): return v
@@ -132,16 +128,16 @@ jobs:
                 if not self.accounts: return
                 tmp = self.tmp_dir / f"manifest_{uuid.uuid4().hex}.gz"
                 try:
-                    cmd = ["rclone", "copyto", f"{self.accounts[0]['name']}:liveblock/manifest.json.gz", str(tmp), 
+                    cmd = ["rclone", "copyto", f"{self.accounts[0]['name']}:liveblock/manifest.json.gz", str(tmp),
                            "--retries", "1", "--low-level-retries", "1"]
                     subprocess.run(cmd, capture_output=True, timeout=30)
                     with gzip.open(tmp, "rt") as f:
                         m = json.load(f)
                     for c in m.get("chunks", []):
                         self.remote_ids.add(int(c["id"]))
-                    print(f"[DRIME FAST] Manifest loaded: {len(self.remote_ids)} chunks", flush=True)
+                    print(f"[DRIME] Manifest loaded: {len(self.remote_ids)} chunks", flush=True)
                 except Exception as e:
-                    print(f"[DRIME FAST] Manifest load skipped: {e}", flush=True)
+                    print(f"[DRIME] Manifest load skipped: {e}", flush=True)
                 finally:
                     try: tmp.unlink()
                     except: pass
@@ -160,88 +156,44 @@ jobs:
                 p = self.chunks_dir / f"{cid:08d}.part"
                 if p.exists():
                     return p.read_bytes()
-                
                 remote = self._account_for(cid)
                 if not remote:
                     return b"\x00" * self._chunk_len(cid)
-                
                 tmp = self.tmp_dir / f"{cid:08d}_{uuid.uuid4().hex}.gz"
                 try:
                     cmd = ["rclone", "copyto", f"{remote}:liveblock/chunks/{cid:08d}.gz", str(tmp),
                            "--retries", "2", "--low-level-retries", "2"]
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                    
                     if result.returncode != 0:
                         err = result.stderr.lower()
                         if any(s in err for s in ["not found", "doesn't exist", "no such"]):
                             return b"\x00" * self._chunk_len(cid)
                         raise Exception(f"Download failed: {result.stderr}")
-                    
                     with gzip.open(tmp, "rb") as f:
                         data = f.read()
-                    
                     exp = self._chunk_len(cid)
                     if len(data) < exp:
                         data += b"\x00" * (exp - len(data))
-                    
                     p.write_bytes(data)
                     return data
-                    
                 except Exception as e:
-                    print(f"[DRIME FAST] Chunk {cid} error: {e}", flush=True)
+                    print(f"[DRIME] Chunk {cid} error: {e}", flush=True)
                     return b"\x00" * self._chunk_len(cid)
                 finally:
                     try: tmp.unlink()
                     except: pass
-
-            def _prefetch_worker(self):
-                while True:
-                    with self.prefetch_lock:
-                        if not self.prefetch_queue:
-                            time.sleep(0.1)
-                            continue
-                        cid = self.prefetch_queue.pop(0)
-                    
-                    with self.cache_lock:
-                        if cid in self.cache_data:
-                            continue
-                    
-                    data = self._download_chunk(cid)
-                    
-                    with self.cache_lock:
-                        self.cache_data[cid] = data
-                        self.cache_data.move_to_end(cid)
-                        while len(self.cache_data) > self.MAX_CACHE_CHUNKS:
-                            self.cache_data.popitem(last=False)
-
-            def start_prefetch(self):
-                self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-                self.prefetch_thread.start()
-                with self.prefetch_lock:
-                    for cid in range(64):
-                        self.prefetch_queue.append(cid)
-                print(f"[DRIME FAST] Prefetch started", flush=True)
 
             def read_chunk(self, cid):
                 with self.cache_lock:
                     if cid in self.cache_data:
                         self.cache_data.move_to_end(cid)
                         return self.cache_data[cid]
-                
                 data = self._download_chunk(cid)
-                
                 with self.cache_lock:
                     self.cache_data[cid] = data
                     self.cache_data.move_to_end(cid)
                     while len(self.cache_data) > self.MAX_CACHE_CHUNKS:
                         self.cache_data.popitem(last=False)
-                
-                with self.prefetch_lock:
-                    for ahead in range(1, 9):
-                        next_cid = cid + ahead
-                        if next_cid not in self.cache_data and next_cid not in self.prefetch_queue:
-                            self.prefetch_queue.append(next_cid)
-                
                 return data
 
             def read(self, offset, length):
@@ -263,18 +215,14 @@ jobs:
                     chunk = bytearray(p.read_bytes())
                 else:
                     chunk = bytearray(self.read_chunk(cid))
-                
                 exp = self._chunk_len(cid)
                 if len(chunk) < exp:
                     chunk.extend(b"\x00" * (exp - len(chunk)))
-                
                 chunk[off:off+len(data)] = data
                 final = bytes(chunk)
-                
                 tmp = self.tmp_dir / f"{cid:08d}_{uuid.uuid4().hex}"
                 tmp.write_bytes(final)
                 os.replace(tmp, p)
-                
                 with self.cache_lock:
                     self.cache_data[cid] = final
                     self.cache_data.move_to_end(cid)
@@ -292,24 +240,22 @@ jobs:
                     self.write_chunk(cid, data[pos:pos+n], coff)
                     pos += n
 
+            def trim(self, offset, length):
+                self.write(b"\x00"*length, offset)
+
             def flush(self):
                 dirty = []
                 for p in self.chunks_dir.glob("*.part"):
                     cid = int(p.stem)
                     data = p.read_bytes()
-                    sha = hashlib.sha256(data).hexdigest()
-                    dirty.append((cid, data, sha))
-                
+                    dirty.append((cid, data))
                 if not dirty: return
-                
-                print(f"[DRIME FAST] Flushing {len(dirty)} chunks...", flush=True)
-                
+                print(f"[DRIME] Flushing {len(dirty)} chunks...", flush=True)
                 by_account = {}
-                for cid, data, sha in dirty:
+                for cid, data in dirty:
                     remote = self._account_for(cid)
                     if remote:
                         by_account.setdefault(remote, []).append((cid, data))
-                
                 for remote, chunks in by_account.items():
                     stage = self.tmp_dir / f"stage_{uuid.uuid4().hex}"
                     stage.mkdir(exist_ok=True)
@@ -320,60 +266,110 @@ jobs:
                            "--transfers", "8", "--no-update-modtime"]
                     subprocess.run(cmd, capture_output=True)
                     shutil.rmtree(stage, ignore_errors=True)
-                
-                print(f"[DRIME FAST] Flush complete", flush=True)
+                print(f"[DRIME] Flush complete", flush=True)
 
-        CFG = {}
-        STORE = None
-
-        def thread_model():
-            return nbdkit.THREAD_MODEL_PARALLEL
-
-        def config(key, value):
-            CFG[key] = value
-
-        def config_complete():
-            global STORE
-            conf_path = CFG.get("conf") or "drime-storage.conf"
-            accounts_path = CFG.get("accounts") or "/run/drimelive/accounts.txt"
-            cache_path = CFG.get("cache") or "/var/lib/drimelive"
-            
-            STORE = DrimeFastStorage(
-                conf_path=conf_path,
-                accounts_path=accounts_path,
-                cache=cache_path
-            )
-            STORE.load_manifest()
-            STORE.start_prefetch()
-
-        # nbdkit hook (this is what shadowed the built-in open)
-        def open(readonly):
-            return STORE
-
-        def close(h):
-            try: h.flush()
-            except: pass
-
-        def get_size(h):
-            return h.size
-
-        def can_write(h):
-            return True
-
-        def can_flush(h):
-            return True
-
-        def pread(h, buf, offset, flags):
-            data = h.read(offset, len(buf))
-            buf[:len(data)] = data
+        # ---------- Built-in NBD server ----------
+        def _recv_exact(conn, n):
+            buf = b""
+            while len(buf) < n:
+                chunk = conn.recv(n - len(buf))
+                if not chunk:
+                    return None
+                buf += chunk
             return buf
 
-        def pwrite(h, buf, offset, flags):
-            h.write(bytes(buf), offset)
-            return len(buf)
+        def _handle_client(conn, store):
+            try:
+                conn.sendall(b"NBDMAGIC" + b"IHAVEOPT" + struct.pack(">H", 0x3))
+                cflags_raw = _recv_exact(conn, 4)
+                if cflags_raw is None: return
+                client_flags = struct.unpack(">I", cflags_raw)[0]
+                no_zeroes = bool(client_flags & (1 << 1))
+                while True:
+                    hdr = _recv_exact(conn, 16)
+                    if hdr is None: return
+                    magic, opt, olen = struct.unpack(">QII", hdr)
+                    data = _recv_exact(conn, olen) if olen else b""
+                    if opt == NBD_OPT_EXPORT_NAME:
+                        tflags = (1 << 0) | (1 << 2) | (1 << 5)
+                        resp = struct.pack(">QI", store.size, tflags)
+                        if not no_zeroes:
+                            resp += b"\x00" * 124
+                        conn.sendall(resp)
+                        break
+                    else:
+                        conn.sendall(struct.pack(">QIII", NBD_OPT_REPLY_MAGIC, opt, NBD_REP_ERR_UNSUP, 0))
+                while True:
+                    req = _recv_exact(conn, 28)
+                    if req is None: return
+                    magic, cmd, handle, offset, length = struct.unpack(">IIQQI", req)
+                    if magic != NBD_REQUEST_MAGIC: return
+                    error = 0
+                    if cmd == NBD_CMD_READ:
+                        try:
+                            payload = store.read(offset, length)
+                        except Exception:
+                            error = 5; payload = b""
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, error, handle) + payload)
+                    elif cmd == NBD_CMD_WRITE:
+                        wdata = _recv_exact(conn, length)
+                        if wdata is None: return
+                        try:
+                            store.write(wdata, offset)
+                        except Exception:
+                            error = 5
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, error, handle))
+                    elif cmd == NBD_CMD_FLUSH:
+                        try:
+                            store.flush()
+                        except Exception:
+                            error = 5
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, error, handle))
+                    elif cmd == NBD_CMD_TRIM:
+                        try:
+                            store.trim(offset, length)
+                        except Exception:
+                            error = 5
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, error, handle))
+                    elif cmd == NBD_CMD_DISC:
+                        return
+                    else:
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 22, handle))
+            except Exception as e:
+                print(f"[NBD] client error: {e}", flush=True)
+            finally:
+                try: conn.close()
+                except Exception: pass
 
-        def flush(h):
-            h.flush()
+        def serve_nbd(sock_path, store):
+            try: os.unlink(sock_path)
+            except OSError: pass
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sock_path)
+            os.chmod(sock_path, 0o777)
+            srv.listen(16)
+            print(f"[NBD] Listening on {sock_path}", flush=True)
+            while True:
+                conn, _ = srv.accept()
+                threading.Thread(target=_handle_client, args=(conn, store), daemon=True).start()
+
+        if __name__ == "__main__":
+            args = sys.argv[1:]
+            cfg = {}
+            for a in args[1:]:
+                if "=" in a:
+                    k, v = a.split("=", 1)
+                    cfg[k] = v
+            store = DrimeFastStorage(
+                conf_path=cfg.get("conf") or "drime-storage.conf",
+                accounts_path=cfg.get("accounts") or "/run/drimelive/accounts.txt",
+                cache=cfg.get("cache") or "/var/lib/drimelive",
+            )
+            store.load_manifest()
+            if args and args[0] == "serve":
+                serve_nbd("/run/drimelive/nbd.sock", store)
+            elif args and args[0] == "sync":
+                store.flush()
         PYEOF
 
     - name: Create drimeblock
@@ -390,11 +386,11 @@ jobs:
         case "${1:-}" in
           serve)
             mkdir -p "$CACHE" "$RUNDIR"
-            exec env PYTHONPATH="$(pwd)" nbdkit --foreground --unix "$SOCK" python ./drime_fast.py conf="$CONF" accounts="$ACCOUNTS" cache="$CACHE"
+            exec env PYTHONPATH="$(pwd)" python3 ./drime_fast.py serve conf="$CONF" accounts="$ACCOUNTS" cache="$CACHE"
             ;;
           sync)
             mkdir -p "$CACHE"
-            env PYTHONPATH="$(pwd)" python3 -c 'import sys; sys.path.insert(0, "."); from drime_fast import DrimeFastStorage; s=DrimeFastStorage(conf_path="drime-storage.conf", accounts_path="/run/drimelive/accounts.txt"); s.flush()'
+            env PYTHONPATH="$(pwd)" python3 ./drime_fast.py sync conf="$CONF" accounts="$ACCOUNTS" cache="$CACHE"
             ;;
           *) echo "usage: serve|sync"; exit 1;;
         esac
@@ -505,6 +501,7 @@ jobs:
         DRIME99: ${{ secrets.DRIME99 }}
       run: |
         sudo mkdir -p /run/drimelive
+        sudo chmod 777 /run/drimelive
         sudo -E python3 - <<'PY'
         import os, re, subprocess
         
@@ -587,20 +584,27 @@ jobs:
         echo "installed $(date -Is)" | sudo rclone rcat "$first:liveblock/installed.marker"
         sudo rm -f /tmp/disk.vmdk /tmp/disk.raw
 
-    - name: Start Drime Fast Storage Server
+    - name: Start Drime Storage Server (built-in NBD)
       run: |
+        sudo mkdir -p /run/drimelive
+        sudo chmod 777 /run/drimelive
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && DRIME_CONF=drime-storage.conf DRIME_ACCOUNTS=/run/drimelive/accounts.txt nohup ./drimeblock serve > /var/log/drimelive.log 2>&1 &"
         
         for i in $(seq 1 60); do
           if [ -S /run/drimelive/nbd.sock ]; then
-            echo "Drime Fast Storage ready!"
+            echo "Drime Fast Storage ready! (took ${i}s)"
             exit 0
+          fi
+          if ! sudo pgrep -f "drime_fast.py serve" > /dev/null; then
+            echo "ERROR: server process died. Log:"
+            sudo cat /var/log/drimelive.log || true
+            exit 1
           fi
           sleep 1
         done
         
-        echo "ERROR: Storage server failed"
+        echo "ERROR: socket never appeared. Log:"
         sudo cat /var/log/drimelive.log || true
         exit 1
 
