@@ -47,8 +47,15 @@ jobs:
         DRIME4: ${{ secrets.DRIME4 }}
         DRIME5: ${{ secrets.DRIME5 }}
       run: |
+        # CRITICAL FIX: Create directory BEFORE python tries to write to it
+        sudo mkdir -p /run/drimelive
+        sudo chmod 777 /run/drimelive
+        
         python3 - <<'PY'
         import os, re, subprocess
+        if not os.path.exists("drime-storage.conf"):
+            open("drime-storage.conf", "w").write("DRIME 100G\n")
+            
         for line in open("drime-storage.conf"):
             line = line.split("#",1)[0].strip()
             m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
@@ -64,8 +71,6 @@ jobs:
                 print(f"Configured: {name}")
                 break
         PY
-        sudo mkdir -p /run/drimelive
-        sudo chmod 777 /run/drimelive
 
     - name: Mount Drime (FUSE for fast streaming reads)
       run: |
@@ -80,8 +85,8 @@ jobs:
           --allow-other
         echo "Waiting for base vmdk to appear in FUSE mount..."
         for i in $(seq 1 30); do
-          if ls /mnt/drime/*.vmdk 1> /dev/null 2>&1 || ls /mnt/drime/*.img 1> /dev/null 2>&1; then
-            echo "Found: $(ls /mnt/drime/*.vmdk /mnt/drime/*.img 2>/dev/null | head -1)"
+          if ls /mnt/drime/*.vmdk 1> /dev/null 2>&1 || ls /mnt/drime/*.img 1> /dev/null 2>&1 || ls /mnt/drime/*.qcow2 1> /dev/null 2>&1; then
+            echo "Found: $(ls /mnt/drime/*.vmdk /mnt/drime/*.img /mnt/drime/*.qcow2 2>/dev/null | head -1)"
             exit 0
           fi
           sleep 1
