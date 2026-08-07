@@ -47,7 +47,6 @@ jobs:
         DRIME4: ${{ secrets.DRIME4 }}
         DRIME5: ${{ secrets.DRIME5 }}
       run: |
-        # CRITICAL FIX: Create directory BEFORE python tries to write to it
         sudo mkdir -p /run/drimelive
         sudo chmod 777 /run/drimelive
         
@@ -72,18 +71,18 @@ jobs:
                 break
         PY
 
-    - name: Mount Drime (FUSE for fast streaming reads)
+    - name: Mount Drime (FUSE)
       run: |
         REMOTE=$(cat /tmp/drime_remote)
         sudo mkdir -p /mnt/drime
         sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
           --vfs-cache-mode full \
-          --vfs-cache-max-size 10G \
+          --vfs-cache-max-size 12G \
           --vfs-read-ahead 128M \
           --buffer-size 256M \
           --daemon \
           --allow-other
-        echo "Waiting for base vmdk to appear in FUSE mount..."
+        echo "Waiting for base vmdk..."
         for i in $(seq 1 30); do
           if ls /mnt/drime/*.vmdk 1> /dev/null 2>&1 || ls /mnt/drime/*.img 1> /dev/null 2>&1 || ls /mnt/drime/*.qcow2 1> /dev/null 2>&1; then
             echo "Found: $(ls /mnt/drime/*.vmdk /mnt/drime/*.img /mnt/drime/*.qcow2 2>/dev/null | head -1)"
@@ -91,7 +90,7 @@ jobs:
           fi
           sleep 1
         done
-        echo "ERROR: vmdk not found in mount"
+        echo "ERROR: vmdk not found"
         ls -la /mnt/drime
         exit 1
 
@@ -99,7 +98,7 @@ jobs:
       run: |
         cat > bridge.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, re, json, time, uuid, gzip, threading, subprocess, socket, struct, sys, queue, glob
+        import os, json, gzip, threading, socket, struct, sys, glob
         from pathlib import Path
         from collections import OrderedDict
 
@@ -108,234 +107,216 @@ jobs:
         R,W,D,F,T = 0,1,2,3,4
 
         class Bridge:
-            def __init__(self, accounts, cache="/var/lib/drimelive"):
-                self.cache=Path(cache); self.chunks=self.cache/"chunks"; self.tmp=self.cache/"tmp"
-                for d in (self.cache,self.chunks,self.tmp): d.mkdir(parents=True,exist_ok=True)
-                self.chunk_size=4*1024*1024
+            def __init__(self, mnt="/mnt/drime", cache="/var/lib/drimelive"):
+                self.mnt = Path(mnt)
+                self.cache = Path(cache)
+                self.tmp = self.cache / "tmp"
+                self.tmp.mkdir(parents=True, exist_ok=True)
+                self.chunk_size = 4 * 1024 * 1024
                 
-                vmdks = glob.glob("/mnt/drime/*.vmdk") + glob.glob("/mnt/drime/*.img") + glob.glob("/mnt/drime/*.qcow2")
-                if not vmdks: raise Exception("No base disk in /mnt/drime")
+                vmdks = glob.glob(str(self.mnt / "*.vmdk")) + glob.glob(str(self.mnt / "*.img")) + glob.glob(str(self.mnt / "*.qcow2"))
+                if not vmdks: raise Exception("No base disk in " + str(self.mnt))
                 self.base_path = vmdks[0]
                 self.base_file = open(self.base_path, "rb")
                 self.size = os.path.getsize(self.base_path)
                 
-                self.accounts=[]
-                if accounts and os.path.exists(accounts):
-                    with open(accounts) as f:
-                        for line in f:
-                            p=line.strip().split()
-                            if len(p)>=1: self.accounts.append(p[0])
-                            
-                self.lock=threading.RLock()
-                self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=1024
-                self.q=queue.Queue(); self.pending=set(); self.plock=threading.Lock()
-                self.ver={}; self.vlock=threading.Lock()
-                self.manifest_dirty=False
-                self.remote_cow=set()
+                self.lock = threading.RLock()
+                self.cache_data = OrderedDict()
+                self.clock = threading.Lock()
+                self.MAXC = 2048  # 8GB RAM cache
                 
+                self.chunks_dir = self.mnt / "chunks"
+                self.chunks_dir.mkdir(exist_ok=True)
+                
+                self.remote_cow = set()
                 self.load_manifest()
                 
-                for i in range(8):
-                    threading.Thread(target=self._uploader,daemon=True).start()
-                threading.Thread(target=self._manifest_loop,daemon=True).start()
                 print(f"[BRIDGE] base={self.base_path} size={self.size} cow_on_drime={len(self.remote_cow)}", flush=True)
 
-            def _clen(self,cid):return min(self.chunk_size,self.size-cid*self.chunk_size)
+            def load_manifest(self):
+                m_path = self.mnt / "manifest.json.gz"
+                if m_path.exists():
+                    try:
+                        with gzip.open(m_path, "rt") as f:
+                            m = json.load(f)
+                        self.remote_cow = set(c["id"] for c in m.get("chunks", []))
+                    except Exception: pass
 
-            def _base_range(self,cid):
-                off=cid*self.chunk_size; n=self._clen(cid)
-                if n<=0: return b""
-                self.base_file.seek(off)
-                data = self.base_file.read(n)
-                if len(data)<n: data+=b"\x00"*(n-len(data))
+            def _clen(self, cid): return min(self.chunk_size, self.size - cid * self.chunk_size)
+
+            # CRITICAL FIX: FUSE short-read loop
+            def _read_exact(self, f, n):
+                data = b""
+                while len(data) < n:
+                    chunk = f.read(n - len(data))
+                    if not chunk: break
+                    data += chunk
                 return data
 
-            def load_manifest(self):
-                if not self.accounts:return
-                t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
-                try:
-                    subprocess.run(["rclone","copyto",f"{self.accounts[0]}:liveblock/manifest.json.gz",str(t),"--retries","1"],capture_output=True,timeout=30)
-                    with gzip.open(t) as f:m=json.load(f)
-                    self.remote_cow = set(c["id"] for c in m.get("chunks",[]))
-                    print(f"[BRIDGE] loaded manifest: {len(self.remote_cow)} existing COW chunks", flush=True)
-                except Exception:pass
-                finally:
-                    try:t.unlink()
-                    except:pass
+            def _base_range(self, cid):
+                off = cid * self.chunk_size
+                n = self._clen(cid)
+                if n <= 0: return b""
+                self.base_file.seek(off)
+                data = self._read_exact(self.base_file, n)
+                if len(data) < n: data += b"\x00" * (n - len(data))
+                return data
 
-            def _dl(self,cid):
-                p=self.chunks/f"{cid:08d}.part"
-                if p.exists():return p.read_bytes()
+            def _dl(self, cid):
+                p = self.tmp / f"{cid:08d}.part"
+                if p.exists(): return p.read_bytes()
                 
-                if cid in self.remote_cow:
-                    t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}.gz"
+                # Read COW chunk directly from FUSE mount (no subprocess!)
+                cow_path = self.chunks_dir / f"{cid:08d}.gz"
+                if cow_path.exists():
                     try:
-                        res=subprocess.run(["rclone","copyto",f"{self.accounts[0]}:liveblock/chunks/{cid:08d}.gz",str(t),"--retries","2"],capture_output=True,text=True,timeout=60)
-                        if res.returncode==0:
-                            with gzip.open(t,"rb") as f:data=f.read()
-                            exp=self._clen(cid)
-                            if len(data)<exp:data+=b"\x00"*(exp-len(data))
-                            p.write_bytes(data)
-                            return data
-                    except Exception:pass
-                    finally:
-                        try:t.unlink()
-                        except:pass
-                        
+                        with gzip.open(cow_path, "rb") as f:
+                            data = self._read_exact(f, self._clen(cid))
+                        exp = self._clen(cid)
+                        if len(data) < exp: data += b"\x00" * (exp - len(data))
+                        p.write_bytes(data)
+                        return data
+                    except Exception: pass
+                    
                 return self._base_range(cid)
 
-            def read_chunk(self,cid):
+            def read_chunk(self, cid):
                 with self.clock:
                     if cid in self.cache_data:
-                        self.cache_data.move_to_end(cid);return self.cache_data[cid]
-                data=self._dl(cid)
+                        self.cache_data.move_to_end(cid)
+                        return self.cache_data[cid]
+                data = self._dl(cid)
                 with self.clock:
-                    self.cache_data[cid]=data;self.cache_data.move_to_end(cid)
-                    while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
+                    self.cache_data[cid] = data
+                    self.cache_data.move_to_end(cid)
+                    while len(self.cache_data) > self.MAXC:
+                        self.cache_data.popitem(last=False)
                 return data
 
-            def read(self,off,length):
-                out=bytearray(length);pos=0
-                while pos<length:
-                    o=off+pos;cid=o//self.chunk_size;co=o%self.chunk_size
-                    n=min(self.chunk_size-co,length-pos)
-                    ch=self.read_chunk(cid);out[pos:pos+n]=ch[co:co+n];pos+=n
+            def read(self, off, length):
+                out = bytearray(length); pos = 0
+                while pos < length:
+                    o = off + pos; cid = o // self.chunk_size; co = o % self.chunk_size
+                    n = min(self.chunk_size - co, length - pos)
+                    ch = self.read_chunk(cid)
+                    out[pos:pos+n] = ch[co:co+n]
+                    pos += n
                 return bytes(out)
 
-            def write(self,data,offset):
-                pos=0;total=len(data)
-                while pos<total:
-                    o=offset+pos;cid=o//self.chunk_size;co=o%self.chunk_size
-                    n=min(self.chunk_size-co,total-pos)
-                    self._write_chunk(cid,data[pos:pos+n],co);pos+=n
+            def write(self, data, offset):
+                pos = 0; total = len(data)
+                while pos < total:
+                    o = offset + pos; cid = o // self.chunk_size; co = o % self.chunk_size
+                    n = min(self.chunk_size - co, total - pos)
+                    self._write_chunk(cid, data[pos:pos+n], co)
+                    pos += n
 
-            def _write_chunk(self,cid,data,off):
+            def _write_chunk(self, cid, data, off):
                 with self.lock:
-                    p=self.chunks/f"{cid:08d}.part"
-                    if p.exists():ch=bytearray(p.read_bytes())
-                    else:ch=bytearray(self.read_chunk(cid))
-                    exp=self._clen(cid)
-                    if len(ch)<exp:ch.extend(b"\x00"*(exp-len(ch)))
-                    ch[off:off+len(data)]=data
-                    final=bytes(ch)
-                    t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}";t.write_bytes(final);os.replace(t,p)
+                    p = self.tmp / f"{cid:08d}.part"
+                    if p.exists(): ch = bytearray(p.read_bytes())
+                    else: ch = bytearray(self.read_chunk(cid))
+                    exp = self._clen(cid)
+                    if len(ch) < exp: ch.extend(b"\x00" * (exp - len(ch)))
+                    ch[off:off+len(data)] = data
+                    final = bytes(ch)
+                    p.write_bytes(final)
+                    
+                    # Write directly to FUSE mount -> rclone uploads it in background automatically!
+                    cow_path = self.chunks_dir / f"{cid:08d}.gz"
+                    with gzip.open(cow_path, "wb") as f:
+                        f.write(final)
+                    
                     with self.clock:
-                        self.cache_data[cid]=final;self.cache_data.move_to_end(cid)
-                        while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
-                with self.vlock:self.ver[cid]=self.ver.get(cid,0)+1
-                with self.plock:
-                    if cid not in self.pending:
-                        self.pending.add(cid);self.q.put(cid)
-
-            def _uploader(self):
-                while True:
-                    cid=self.q.get()
-                    try:
-                        with self.vlock:v0=self.ver.get(cid,0)
-                        self._push(cid)
-                        with self.vlock:
-                            if self.ver.get(cid,0)!=v0:self.q.put(cid)
-                    except Exception:pass
-                    finally:
-                        with self.plock:self.pending.discard(cid)
-                        self.q.task_done()
-                        self.manifest_dirty=True
-
-            def _push(self,cid):
-                p=self.chunks/f"{cid:08d}.part"
-                if not p.exists() or not self.accounts:return
-                t=self.tmp/f"up_{cid:08d}_{uuid.uuid4().hex}.gz"
-                with gzip.open(t,"wb") as f:f.write(p.read_bytes())
-                subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]}:liveblock/chunks/{cid:08d}.gz","--retries","2"],capture_output=True,timeout=120)
-                try:t.unlink()
-                except:pass
-
-            def _manifest_loop(self):
-                while True:
-                    time.sleep(5)
-                    if self.manifest_dirty:
-                        self.manifest_dirty=False
-                        try:self._upload_manifest()
-                        except Exception:pass
-
-            def _upload_manifest(self):
-                cur=sorted(int(p.stem) for p in self.chunks.glob("*.part"))
-                m={"chunks":[{"id":i} for i in cur]}
-                t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
-                with gzip.open(t,"wt") as f:json.dump(m,f)
-                if self.accounts:
-                    subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]}:liveblock/manifest.json.gz"],capture_output=True)
-                try:t.unlink()
-                except:pass
+                        self.cache_data[cid] = final
+                        self.cache_data.move_to_end(cid)
+                        while len(self.cache_data) > self.MAXC:
+                            self.cache_data.popitem(last=False)
 
             def flush(self):
-                self.q.join()
                 self._upload_manifest()
 
-        def recv(conn,n):
-            b=b""
-            while len(b)<n:
-                c=conn.recv(n-len(b))
-                if not c:return None
-                b+=c
+            def _upload_manifest(self):
+                ids = set()
+                for p in self.chunks_dir.glob("*.gz"):
+                    try: ids.add(int(p.stem))
+                    except: pass
+                for p in self.tmp.glob("*.part"):
+                    try: ids.add(int(p.stem))
+                    except: pass
+                    
+                m = {"chunks": [{"id": i} for i in sorted(ids)]}
+                m_path = self.mnt / "manifest.json.gz"
+                with gzip.open(m_path, "wt") as f:
+                    json.dump(m, f)
+
+        def recv(conn, n):
+            b = b""
+            while len(b) < n:
+                c = conn.recv(n - len(b))
+                if not c: return None
+                b += c
             return b
 
-        def client(conn,eng):
+        def client(conn, eng):
             try:
-                conn.sendall(b"NBDMAGIC"+b"IHAVEOPT"+struct.pack(">H",0x3))
-                cf=struct.unpack(">I",recv(conn,4))[0];nz=bool(cf&(1<<1))
+                conn.sendall(b"NBDMAGIC" + b"IHAVEOPT" + struct.pack(">H", 0x3))
+                cf = struct.unpack(">I", recv(conn, 4))[0]
+                nz = bool(cf & (1 << 1))
                 while True:
-                    h=recv(conn,16)
-                    if not h:return
-                    mg,opt,ol=struct.unpack(">QII",h)
-                    d=recv(conn,ol) if ol else b""
-                    if opt==NBD_OPT_EXPORT_NAME:
-                        tf=(1<<0)|(1<<2)|(1<<5)
-                        r=struct.pack(">QI",eng.size,tf)
-                        if not nz:r+=b"\x00"*124
-                        conn.sendall(r);break
-                    else:conn.sendall(struct.pack(">QIII",NBD_OPT_REPLY_MAGIC,opt,NBD_REP_ERR_UNSUP,0))
+                    h = recv(conn, 16)
+                    if not h: return
+                    mg, opt, ol = struct.unpack(">QII", h)
+                    d = recv(conn, ol) if ol else b""
+                    if opt == NBD_OPT_EXPORT_NAME:
+                        tf = (1 << 0) | (1 << 2) | (1 << 5)
+                        r = struct.pack(">QI", eng.size, tf)
+                        if not nz: r += b"\x00" * 124
+                        conn.sendall(r); break
+                    else:
+                        conn.sendall(struct.pack(">QIII", NBD_OPT_REPLY_MAGIC, opt, NBD_REP_ERR_UNSUP, 0))
                 while True:
-                    q=recv(conn,28)
-                    if not q:return
-                    mg,cmd,hd,off,ln=struct.unpack(">IIQQI",q)
-                    if mg!=NBD_REQUEST_MAGIC:return
-                    er=0
-                    if cmd==R:
-                        try:pl=eng.read(off,ln)
-                        except Exception:er=5;pl=b""
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd)+pl)
-                    elif cmd==W:
-                        wd=recv(conn,ln)
-                        if wd is None:return
-                        try:eng.write(wd,off)
-                        except Exception:er=5
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
-                    elif cmd==F:
-                        try:eng.flush()
-                        except Exception:er=5
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
-                    elif cmd==T:
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,30,hd))
-                    elif cmd==D:return
-                    else:conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,22,hd))
-            except Exception:pass
+                    q = recv(conn, 28)
+                    if not q: return
+                    mg, cmd, hd, off, ln = struct.unpack(">IIQQI", q)
+                    if mg != NBD_REQUEST_MAGIC: return
+                    er = 0
+                    if cmd == R:
+                        try: pl = eng.read(off, ln)
+                        except Exception: er = 5; pl = b""
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, er, hd) + pl)
+                    elif cmd == W:
+                        wd = recv(conn, ln)
+                        if wd is None: return
+                        try: eng.write(wd, off)
+                        except Exception: er = 5
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, er, hd))
+                    elif cmd == F:
+                        try: eng.flush()
+                        except Exception: er = 5
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, er, hd))
+                    elif cmd == T:
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 30, hd))
+                    elif cmd == D: return
+                    else:
+                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 22, hd))
+            except Exception: pass
             finally:
-                try:conn.close()
-                except:pass
+                try: conn.close()
+                except: pass
 
-        if __name__=="__main__":
-            eng=Bridge("/run/drimelive/accounts.txt","/var/lib/drimelive")
-            sp="/run/drimelive/nbd.sock"
-            try:os.unlink(sp)
-            except:pass
-            os.makedirs("/run/drimelive",exist_ok=True)
-            srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-            srv.bind(sp);os.chmod(sp,0o777);srv.listen(16)
+        if __name__ == "__main__":
+            eng = Bridge("/mnt/drime", "/var/lib/drimelive")
+            sp = "/run/drimelive/nbd.sock"
+            try: os.unlink(sp)
+            except: pass
+            os.makedirs("/run/drimelive", exist_ok=True)
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sp); os.chmod(sp, 0o777); srv.listen(16)
             print(f"[BRIDGE] listening", flush=True)
             while True:
-                c,_=srv.accept()
-                threading.Thread(target=client,args=(c,eng),daemon=True).start()
+                c, _ = srv.accept()
+                threading.Thread(target=client, args=(c, eng), daemon=True).start()
         PYEOF
 
     - name: Start Realtime Bridge
