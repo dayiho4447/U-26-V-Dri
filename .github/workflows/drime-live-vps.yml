@@ -500,7 +500,7 @@ jobs:
         DRIME99: ${{ secrets.DRIME99 }}
       run: |
         sudo mkdir -p /run/drimelive
-        python3 - <<'PY'
+        sudo -E python3 - <<'PY'
         import os, re, subprocess
         
         accounts = []
@@ -523,17 +523,18 @@ jobs:
         if ok==0: raise SystemExit("ERROR: no Drime account configured.")
         print(f"Configured {ok} Drime accounts successfully.")
         PY
+        sudo chmod 644 /run/drimelive/accounts.txt
 
     - name: Check if disk ingested
       id: os
       run: |
-        first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
+        first=$(sudo head -1 /run/drimelive/accounts.txt | awk '{print $1}')
         if sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -q '^installed.marker$'; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
 
     - name: Download + Convert + Ingest (first run only)
       if: steps.os.outputs.exists != 'true'
       run: |
-        first=$(head -1 /run/drimelive/accounts.txt | awk '{print $1}')
+        first=$(sudo head -1 /run/drimelive/accounts.txt | awk '{print $1}')
         IMG=$(sudo rclone lsf "$first:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
         [ -z "$IMG" ] && { echo "ERROR: no base image"; exit 1; }
         
