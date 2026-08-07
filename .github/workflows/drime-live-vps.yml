@@ -70,6 +70,18 @@ jobs:
         PY
         echo "Using remote: $(cat /tmp/drime_remote)"
 
+    - name: Check what's on Drime
+      run: |
+        REMOTE=$(cat /tmp/drime_remote)
+        echo "=== Listing ${REMOTE}: (root) ==="
+        rclone ls "${REMOTE}:" || echo "(empty or error)"
+        echo ""
+        echo "=== Listing ${REMOTE}:liveblock/ ==="
+        rclone ls "${REMOTE}:liveblock/" || echo "(folder doesn't exist or empty)"
+        echo ""
+        echo "=== Looking for vmdk/img/qcow2 files ==="
+        rclone ls "${REMOTE}:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' || echo "NO DISK IMAGES FOUND"
+
     - name: Mount Drime DIRECT (no download, no chunks)
       run: |
         REMOTE=$(cat /tmp/drime_remote)
@@ -84,13 +96,21 @@ jobs:
           --transfers 8 \
           --checkers 8 \
           --daemon
-        # wait for the vmdk to appear
+        # wait for mount and list contents
+        echo "Waiting for mount to populate..."
         for i in $(seq 1 30); do
+          sleep 1
+          echo "--- Attempt $i ---"
+          ls -lah /mnt/drime/ 2>/dev/null || echo "(mount not ready)"
           IMG=$(ls /mnt/drime 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
           [ -n "$IMG" ] && break
-          sleep 1
         done
-        [ -z "$IMG" ] && { echo "ERROR: no vmdk on Drime"; exit 1; }
+        [ -z "$IMG" ] && { 
+          echo "ERROR: no vmdk/img/qcow2 file found in /mnt/drime"
+          echo "Final contents:"
+          ls -lah /mnt/drime/ 2>/dev/null || echo "(cannot list)"
+          exit 1
+        }
         echo "IMG=$IMG" >> "$GITHUB_ENV"
         echo "Mounted DIRECT: /mnt/drime/$IMG (streamed on demand, no chunks)"
 
