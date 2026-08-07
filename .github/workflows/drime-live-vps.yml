@@ -1,4 +1,4 @@
-name: Drime Realtime Bridge VM
+name: Drime Realtime Bridge VM (COW over base.vmdk)
 
 on:
   push:
@@ -37,10 +37,16 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Create Realtime Bridge
+    - name: Create Realtime COW Bridge
       run: |
         cat > bridge.py <<'PYEOF'
         #!/usr/bin/env python3
+        """
+        REALTIME COW BRIDGE
+        - Reads: pristine base.vmdk byte-ranges from Drime on demand (no download)
+        - Writes: copy-on-write 4MB segments, uploaded to Drime IMMEDIATELY (16 workers)
+        - Survives force-kill; Drime usage grows as you install
+        """
         import os, re, json, time, uuid, gzip, threading, subprocess, socket, struct, sys, queue
         from pathlib import Path
         from collections import OrderedDict
@@ -55,85 +61,94 @@ jobs:
             def __init__(self, conf, accounts, cache="/var/lib/drimelive"):
                 self.cache=Path(cache); self.chunks=self.cache/"chunks"; self.tmp=self.cache/"tmp"
                 for d in (self.cache,self.chunks,self.tmp): d.mkdir(parents=True,exist_ok=True)
-                self.chunk_size=self._size(self._conf(conf,"chunk_size","4M"))
-                self.accounts=[]; total=0
+                self.chunk_size=4*1024*1024
+                self.accounts=[]
                 if accounts and os.path.exists(accounts):
                     with _open(accounts) as f:
                         for line in f:
                             line=line.strip()
                             if not line or line.startswith("#"):continue
                             p=line.split()
-                            if len(p)>=2:
-                                n,s=p[0],self._size(p[1]); st=total//self.chunk_size; total+=s
-                                self.accounts.append({"name":n,"start":st,"end":total//self.chunk_size})
-                self.size=total or 100*1024**3
+                            if len(p)>=2: self.accounts.append(p[0])
                 self.lock=threading.RLock(); self.remote=set()
-                self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=512
+                self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=1024
                 self.q=queue.Queue(); self.pending=set(); self.plock=threading.Lock()
                 self.ver={}; self.vlock=threading.Lock()
                 self.manifest_dirty=False
+                self.pq=queue.Queue(); self.ppend=set()
+                # discover base vmdk + size
+                self.base=None; self.size=0
+                if self.accounts:
+                    a=self.accounts[0]
+                    ls=subprocess.run(["rclone","lsf",f"{a}:liveblock/"],capture_output=True,text=True,timeout=60).stdout
+                    for n in ls.splitlines():
+                        if re.search(r'\.(vmdk|img|qcow2)$',n,re.I): self.base=n; break
+                    if self.base:
+                        sz=subprocess.run(["rclone","size",f"{a}:liveblock/{self.base}","--json"],capture_output=True,text=True,timeout=60).stdout
+                        try: self.size=json.loads(sz)["bytes"]
+                        except Exception: self.size=0
+                print(f"[BRIDGE] base={self.base} size={self.size}",flush=True)
                 for i in range(UPLOADERS):
                     threading.Thread(target=self._uploader,daemon=True).start()
+                threading.Thread(target=self._prefetcher,daemon=True).start()
                 threading.Thread(target=self._manifest_loop,daemon=True).start()
-
-            def _size(self,v):
-                if isinstance(v,int):return v
-                if not v:return 4*1024*1024
-                m=re.match(r'^([0-9.]+)([KMGTP]?)',str(v).strip().upper())
-                if not m:return 4*1024*1024
-                n,u=float(m.group(1)),m.group(2)
-                return int(n*{"":1,"K":1024,"M":1024**2,"G":1024**3,"T":1024**4,"P":1024**5}[u])
-            def _conf(self,path,key,d):
-                if not path or not os.path.exists(path):return d
-                try:
-                    for line in _open(path):
-                        line=line.split("#",1)[0].strip()
-                        if "=" in line:
-                            k,v=line.split("=",1)
-                            if k.strip()==key:return v.strip()
-                except Exception:pass
-                return d
 
             def load_manifest(self):
                 if not self.accounts:return
                 t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
                 try:
-                    subprocess.run(["rclone","copyto",f"{self.accounts[0]['name']}:liveblock/manifest.json.gz",str(t),"--retries","1"],capture_output=True,timeout=30)
+                    subprocess.run(["rclone","copyto",f"{self.accounts[0]}:liveblock/manifest.json.gz",str(t),"--retries","1"],capture_output=True,timeout=30)
                     with gzip.open(t) as f:m=json.load(f)
                     for c in m.get("chunks",[]):self.remote.add(int(c["id"]))
-                    if self.remote:
-                        self.size=max((max(self.remote)+1)*self.chunk_size, self.size)
+                    print(f"[BRIDGE] manifest diffs={len(self.remote)}",flush=True)
                 except Exception:pass
                 finally:
                     try:t.unlink()
                     except:pass
 
-            def _acct(self,cid):
-                for a in self.accounts:
-                    if a["start"]<=cid<a["end"]:return a["name"]
-                return None
             def _clen(self,cid):return min(self.chunk_size,self.size-cid*self.chunk_size)
+
+            def _base_range(self,cid):
+                off=cid*self.chunk_size; n=self._clen(cid)
+                if n<=0: return b""
+                res=subprocess.run(["rclone","cat",f"{self.accounts[0]}:liveblock/{self.base}","--offset",str(off),"--count",str(n)],capture_output=True,timeout=120)
+                data=res.stdout
+                if len(data)<n: data+=b"\x00"*(n-len(data))
+                return data
 
             def _dl(self,cid):
                 p=self.chunks/f"{cid:08d}.part"
                 if p.exists():return p.read_bytes()
-                r=self._acct(cid)
-                if not r:return b"\x00"*self._clen(cid)
-                t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}.gz"
-                try:
-                    res=subprocess.run(["rclone","copyto",f"{r}:liveblock/chunks/{cid:08d}.gz",str(t),"--retries","2"],capture_output=True,text=True,timeout=30)
-                    if res.returncode!=0:
-                        e=res.stderr.lower()
-                        if any(s in e for s in["not found","no such","doesn't exist"]):return b"\x00"*self._clen(cid)
-                        raise Exception(res.stderr)
-                    with gzip.open(t,"rb") as f:data=f.read()
-                    exp=self._clen(cid)
-                    if len(data)<exp:data+=b"\x00"*(exp-len(data))
-                    p.write_bytes(data);return data
-                except Exception:return b"\x00"*self._clen(cid)
-                finally:
-                    try:t.unlink()
-                    except:pass
+                if cid in self.remote:
+                    t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}.gz"
+                    try:
+                        res=subprocess.run(["rclone","copyto",f"{self.accounts[0]}:liveblock/chunks/{cid:08d}.gz",str(t),"--retries","2"],capture_output=True,text=True,timeout=60)
+                        if res.returncode==0:
+                            with gzip.open(t,"rb") as f:data=f.read()
+                            exp=self._clen(cid)
+                            if len(data)<exp:data+=b"\x00"*(exp-len(data))
+                            p.write_bytes(data);return data
+                    except Exception:pass
+                    finally:
+                        try:t.unlink()
+                        except:pass
+                return self._base_range(cid)
+
+            def _prefetcher(self):
+                while True:
+                    cid=self.pq.get()
+                    try:
+                        with self.plock: self.ppend.discard(cid)
+                        p=self.chunks/f"{cid:08d}.part"
+                        if p.exists() or cid*self.chunk_size>=self.size: continue
+                        with self.clock:
+                            if cid in self.cache_data: continue
+                        data=self._dl(cid)
+                        with self.clock:
+                            self.cache_data[cid]=data;self.cache_data.move_to_end(cid)
+                            while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
+                    except Exception:pass
+                    finally:self.pq.task_done()
 
             def read_chunk(self,cid):
                 with self.clock:
@@ -143,6 +158,11 @@ jobs:
                 with self.clock:
                     self.cache_data[cid]=data;self.cache_data.move_to_end(cid)
                     while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
+                with self.plock:
+                    for a in range(1,9):
+                        nx=cid+a
+                        if nx not in self.ppend:
+                            self.ppend.add(nx);self.pq.put(nx)
                 return data
 
             def read(self,off,length):
@@ -185,8 +205,7 @@ jobs:
                         with self.vlock:v0=self.ver.get(cid,0)
                         self._push(cid)
                         with self.vlock:
-                            if self.ver.get(cid,0)!=v0:
-                                self.q.put(cid)
+                            if self.ver.get(cid,0)!=v0:self.q.put(cid)
                     except Exception:pass
                     finally:
                         with self.plock:self.pending.discard(cid)
@@ -195,11 +214,10 @@ jobs:
 
             def _push(self,cid):
                 p=self.chunks/f"{cid:08d}.part"
-                r=self._acct(cid)
-                if not p.exists() or not r:return
+                if not p.exists() or not self.accounts:return
                 t=self.tmp/f"up_{cid:08d}_{uuid.uuid4().hex}.gz"
                 with gzip.open(t,"wb") as f:f.write(p.read_bytes())
-                subprocess.run(["rclone","copyto",str(t),f"{r}:liveblock/chunks/{cid:08d}.gz","--retries","2"],capture_output=True,timeout=60)
+                subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]}:liveblock/chunks/{cid:08d}.gz","--retries","2"],capture_output=True,timeout=120)
                 try:t.unlink()
                 except:pass
                 self.remote.add(cid)
@@ -219,7 +237,7 @@ jobs:
                 t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
                 with gzip.open(t,"wt") as f:json.dump(m,f)
                 if self.accounts:
-                    subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]['name']}:liveblock/manifest.json.gz"],capture_output=True)
+                    subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]}:liveblock/manifest.json.gz"],capture_output=True)
                 try:t.unlink()
                 except:pass
 
@@ -280,12 +298,7 @@ jobs:
                 except:pass
 
         if __name__=="__main__":
-            args=sys.argv[1:];cfg={}
-            for a in args[1:]:
-                if "=" in a:k,v=a.split("=",1);cfg[k]=v
-            eng=Bridge(cfg.get("conf") or "drime-storage.conf",
-                       cfg.get("accounts") or "/run/drimelive/accounts.txt",
-                       cfg.get("cache") or "/var/lib/drimelive")
+            eng=Bridge("drime-storage.conf","/run/drimelive/accounts.txt","/var/lib/drimelive")
             eng.load_manifest()
             sp="/run/drimelive/nbd.sock"
             try:os.unlink(sp)
@@ -293,7 +306,7 @@ jobs:
             os.makedirs("/run/drimelive",exist_ok=True)
             srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
             srv.bind(sp);os.chmod(sp,0o777);srv.listen(16)
-            print(f"[BRIDGE] ready size={eng.size}",flush=True)
+            print(f"[BRIDGE] listening size={eng.size}",flush=True)
             while True:
                 c,_=srv.accept()
                 threading.Thread(target=client,args=(c,eng),daemon=True).start()
@@ -305,7 +318,7 @@ jobs:
         #!/usr/bin/env bash
         set -Eeuo pipefail
         case "${1:-}" in
-          serve) mkdir -p /var/lib/drimelive /run/drimelive; exec python3 ./bridge.py serve conf=drime-storage.conf accounts=/run/drimelive/accounts.txt cache=/var/lib/drimelive;;
+          serve) mkdir -p /var/lib/drimelive /run/drimelive; exec python3 ./bridge.py;;
           *) exit 1;;
         esac
         SHEOF
@@ -342,7 +355,7 @@ jobs:
       run: |
         sudo rm -f /run/drimelive/nbd.sock
         sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup ./drimeblock serve > /var/log/bridge.log 2>&1 &"
-        for i in $(seq 1 60); do
+        for i in $(seq 1 90); do
           [ -S /run/drimelive/nbd.sock ] && { cat /var/log/bridge.log; exit 0; }
           sleep 1
         done
@@ -354,12 +367,12 @@ jobs:
         sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
         sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg; sleep 2
 
-    - name: Boot VM (format=vmdk over the bridge)
+    - name: Boot VM (vmdk over COW bridge)
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
         export DISPLAY=:1; : > /tmp/vm-serial.log
-        echo "=== BOOTING (vmdk format, realtime bridge) ==="
+        echo "=== BOOTING (base.vmdk + realtime COW overlay) ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=vmdk,cache=writeback \
