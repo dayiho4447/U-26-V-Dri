@@ -1,4 +1,4 @@
-name: Drime Direct Boot (Hacker Edition)
+name: Drime Direct VMDK Boot (No Download)
 
 on:
   push:
@@ -21,8 +21,8 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 python3-pip curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools
-        pip3 install requests
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools fuse3
+        sudo modprobe fuse || true
 
     - name: Install latest rclone
       run: |
@@ -60,264 +60,56 @@ jobs:
             c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
             if c.returncode==0:
                 open("/tmp/drime_remote","w").write(name)
+                print(f"Configured: {name}")
                 break
         PY
+        REMOTE=$(cat /tmp/drime_remote)
+        echo "Remote: $REMOTE"
+        echo "=== Files on ${REMOTE}:liveblock/ ==="
+        rclone ls "${REMOTE}:liveblock/" || echo "No files found"
 
-    - name: Create Hacker Boot Engine
-      run: |
-        cat > hacker_boot.py <<'PYEOF'
-        #!/usr/bin/env python3
-        """
-        HACKER MASTER BOOT ENGINE
-        - Direct HTTP range requests to Drime
-        - No FUSE, no mount, no chunks
-        - Sector-aligned cache (8GB)
-        - Parallel pre-fetch
-        - Pure NBD protocol server
-        """
-        import os, sys, re, json, socket, struct, threading, time
-        import requests
-        from collections import OrderedDict
-        from concurrent.futures import ThreadPoolExecutor
-
-        # NBD Protocol
-        NBD_OPT_EXPORT_NAME = 1
-        NBD_REP_ERR_UNSUP = 0x80000001
-        NBD_OPT_REPLY_MAGIC = 0x3e889045565a9
-        NBD_REQUEST_MAGIC = 0x25609513
-        NBD_SIMPLE_REPLY_MAGIC = 0x67446ab5
-        NBD_CMD_READ, NBD_CMD_WRITE, NBD_CMD_DISC, NBD_CMD_FLUSH, NBD_CMD_TRIM = 0,1,2,3,4
-
-        class HackerDisk:
-            def __init__(self, remote, filename):
-                self.remote = remote
-                self.filename = filename
-                self.cache = OrderedDict()
-                self.cache_lock = threading.Lock()
-                self.CACHE_SIZE = 8 * 1024 * 1024 * 1024  # 8GB cache
-                self.BLOCK_SIZE = 1024 * 1024  # 1MB blocks
-                self.executor = ThreadPoolExecutor(max_workers=8)
-                self.prefetch_queue = []
-                self.prefetch_lock = threading.Lock()
-                
-                # Get file size via rclone
-                result = os.popen(f'rclone ls "{remote}:liveblock/{filename}" 2>/dev/null | head -1').read()
-                self.size = int(result.split()[0])
-                print(f"[HACKER] Disk: {filename}, size: {self.size} bytes ({self.size/1024/1024/1024:.2f} GB)", flush=True)
-                
-                # Start prefetch worker
-                threading.Thread(target=self._prefetch_worker, daemon=True).start()
-                
-                # Pre-warm: read first 1MB (MBR + bootloader)
-                print("[HACKER] Pre-warming boot sectors...", flush=True)
-                self.read(0, self.BLOCK_SIZE)
-                print("[HACKER] Ready!", flush=True)
-
-            def _get_url(self):
-                # Get temporary download URL from Drime
-                cmd = f'rclone link "{self.remote}:liveblock/{self.filename}"'
-                url = os.popen(cmd).read().strip()
-                return url
-
-            def _read_range(self, offset, length):
-                """Read byte range directly from Drime via HTTP"""
-                url = self._get_url()
-                headers = {'Range': f'bytes={offset}-{offset+length-1}'}
-                try:
-                    r = requests.get(url, headers=headers, timeout=30)
-                    if r.status_code in [200, 206]:
-                        return r.content
-                    else:
-                        print(f"[HACKER] HTTP {r.status_code} for range {offset}-{offset+length}", flush=True)
-                        return b'\x00' * length
-                except Exception as e:
-                    print(f"[HACKER] Request error: {e}", flush=True)
-                    return b'\x00' * length
-
-            def _prefetch_worker(self):
-                """Background pre-fetch next blocks"""
-                while True:
-                    with self.prefetch_lock:
-                        if not self.prefetch_queue:
-                            time.sleep(0.05)
-                            continue
-                        block_id = self.prefetch_queue.pop(0)
-                    
-                    # Skip if cached
-                    with self.cache_lock:
-                        if block_id in self.cache:
-                            continue
-                    
-                    # Fetch in background
-                    offset = block_id * self.BLOCK_SIZE
-                    if offset >= self.size:
-                        continue
-                    
-                    data = self._read_range(offset, min(self.BLOCK_SIZE, self.size - offset))
-                    
-                    with self.cache_lock:
-                        self.cache[block_id] = data
-                        self.cache.move_to_end(block_id)
-                        # Evict old if over cache size
-                        while len(self.cache) * self.BLOCK_SIZE > self.CACHE_SIZE:
-                            self.cache.popitem(last=False)
-
-            def read(self, offset, length):
-                """Read bytes from disk"""
-                out = bytearray(length)
-                pos = 0
-                
-                while pos < length:
-                    off = offset + pos
-                    block_id = off // self.BLOCK_SIZE
-                    block_off = off % self.BLOCK_SIZE
-                    
-                    # Check cache
-                    with self.cache_lock:
-                        if block_id in self.cache:
-                            block = self.cache[block_id]
-                            self.cache.move_to_end(block_id)
-                        else:
-                            block = None
-                    
-                    # Cache miss - fetch
-                    if block is None:
-                        fetch_off = block_id * self.BLOCK_SIZE
-                        fetch_len = min(self.BLOCK_SIZE, self.size - fetch_off)
-                        block = self._read_range(fetch_off, fetch_len)
-                        
-                        with self.cache_lock:
-                            self.cache[block_id] = block
-                            self.cache.move_to_end(block_id)
-                            while len(self.cache) * self.BLOCK_SIZE > self.CACHE_SIZE:
-                                self.cache.popitem(last=False)
-                    
-                    # Copy data
-                    n = min(self.BLOCK_SIZE - block_off, length - pos)
-                    out[pos:pos+n] = block[block_off:block_off+n]
-                    pos += n
-                    
-                    # Queue next blocks for prefetch
-                    with self.prefetch_lock:
-                        for ahead in range(1, 16):
-                            next_id = block_id + ahead
-                            if next_id not in self.cache and next_id not in self.prefetch_queue:
-                                self.prefetch_queue.append(next_id)
-                
-                return bytes(out)
-
-            def write(self, offset, data):
-                """Writes are discarded (read-only)"""
-                pass
-
-        def recv_exact(conn, n):
-            buf = b""
-            while len(buf) < n:
-                chunk = conn.recv(n - len(buf))
-                if not chunk: return None
-                buf += chunk
-            return buf
-
-        def handle_client(conn, disk):
-            try:
-                # NBD handshake
-                conn.sendall(b"NBDMAGIC" + b"IHAVEOPT" + struct.pack(">H", 0x3))
-                cflags = struct.unpack(">I", recv_exact(conn, 4))[0]
-                no_zeroes = bool(cflags & (1 << 1))
-                
-                while True:
-                    hdr = recv_exact(conn, 16)
-                    magic, opt, olen = struct.unpack(">QII", hdr)
-                    data = recv_exact(conn, olen) if olen else b""
-                    
-                    if opt == NBD_OPT_EXPORT_NAME:
-                        tflags = (1 << 0) | (1 << 2) | (1 << 5)
-                        resp = struct.pack(">QI", disk.size, tflags)
-                        if not no_zeroes:
-                            resp += b"\x00" * 124
-                        conn.sendall(resp)
-                        break
-                    else:
-                        conn.sendall(struct.pack(">QIII", NBD_OPT_REPLY_MAGIC, opt, NBD_REP_ERR_UNSUP, 0))
-                
-                # Command loop
-                while True:
-                    req = recv_exact(conn, 28)
-                    if req is None: return
-                    magic, cmd, handle, offset, length = struct.unpack(">IIQQI", req)
-                    if magic != NBD_REQUEST_MAGIC: return
-                    
-                    error = 0
-                    if cmd == NBD_CMD_READ:
-                        try:
-                            payload = disk.read(offset, length)
-                        except Exception as e:
-                            print(f"[NBD] Read error at {offset}: {e}", flush=True)
-                            error = 5
-                            payload = b""
-                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, error, handle) + payload)
-                    
-                    elif cmd == NBD_CMD_WRITE:
-                        wdata = recv_exact(conn, length)
-                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 30, handle))  # Read-only
-                    
-                    elif cmd == NBD_CMD_FLUSH:
-                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 0, handle))
-                    
-                    elif cmd == NBD_CMD_TRIM:
-                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 30, handle))
-                    
-                    elif cmd == NBD_CMD_DISC:
-                        return
-                    else:
-                        conn.sendall(struct.pack(">IIQ", NBD_SIMPLE_REPLY_MAGIC, 22, handle))
-            
-            except Exception as e:
-                print(f"[NBD] Client error: {e}", flush=True)
-            finally:
-                try: conn.close()
-                except: pass
-
-        if __name__ == "__main__":
-            remote = sys.argv[1]
-            filename = sys.argv[2]
-            sock_path = "/run/drimelive/nbd.sock"
-            
-            disk = HackerDisk(remote, filename)
-            
-            try: os.unlink(sock_path)
-            except: pass
-            os.makedirs("/run/drimelive", exist_ok=True)
-            
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            srv.bind(sock_path)
-            os.chmod(sock_path, 0o777)
-            srv.listen(16)
-            
-            print(f"[HACKER] NBD server listening on {sock_path}", flush=True)
-            
-            while True:
-                conn, _ = srv.accept()
-                threading.Thread(target=handle_client, args=(conn, disk), daemon=True).start()
-        PYEOF
-
-    - name: Start Hacker Boot Server
+    - name: Mount Drime (DIRECT - no download)
       run: |
         REMOTE=$(cat /tmp/drime_remote)
+        sudo mkdir -p /mnt/drime
+        sudo chmod 777 /mnt/drime
+        
+        # Start rclone mount with better settings
+        sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
+          --vfs-cache-mode writes \
+          --cache-dir /tmp/rclone-cache \
+          --vfs-cache-max-size 10G \
+          --buffer-size 512M \
+          --vfs-read-ahead 128M \
+          --allow-other \
+          --daemon \
+          --log-level DEBUG \
+          --log-file /tmp/rclone.log
+        
+        echo "Waiting for mount (up to 60 seconds)..."
+        for i in $(seq 1 60); do
+          if mountpoint -q /mnt/drime; then
+            echo "✓ Mount ready after ${i}s"
+            break
+          fi
+          sleep 1
+          [ $i -eq 60 ] && { echo "Mount timeout"; cat /tmp/rclone.log; exit 1; }
+        done
+        
         # Find vmdk
-        IMG=$(rclone ls "${REMOTE}:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 | awk '{print $2}' || true)
-        [ -z "$IMG" ] && { echo "ERROR: No disk image found"; exit 1; }
-        echo "IMG=$IMG" >> "$GITHUB_ENV"
-        echo "Starting hacker boot server for $IMG..."
-        nohup python3 hacker_boot.py "$REMOTE" "$IMG" > /tmp/hacker.log 2>&1 &
-        sleep 5
-        if [ ! -S /run/drimelive/nbd.sock ]; then
-          echo "ERROR: Server failed to start"
-          cat /tmp/hacker.log
+        sleep 2
+        IMG=$(ls /mnt/drime 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
+        [ -z "$IMG" ] && { 
+          echo "ERROR: No vmdk found"
+          echo "Contents of /mnt/drime:"
+          ls -lah /mnt/drime/
+          echo "Rclone log:"
+          tail -50 /tmp/rclone.log
           exit 1
-        fi
-        echo "Hacker boot server ready!"
-        tail -n 20 /tmp/hacker.log
+        }
+        
+        echo "IMG=$IMG" >> "$GITHUB_ENV"
+        echo "Found: /mnt/drime/$IMG"
 
     - name: Start VNC
       run: |
@@ -328,50 +120,27 @@ jobs:
         sleep 2
         sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg
         sleep 2
-        echo "VNC ready"
 
-    - name: Boot VM
+    - name: Boot VM (DIRECT from mounted vmdk)
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
-        if [ -e /dev/kvm ]; then
-          sudo chmod 666 /dev/kvm
-          ACCEL="-enable-kvm"; CPU="-cpu host"
-        else
-          ACCEL=""; CPU="-cpu qemu64"
-        fi
+        [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
         export DISPLAY=:1
-        : > /tmp/vm-serial.log
 
-        echo "=== HACKER DIRECT BOOT ==="
+        echo "=== DIRECT BOOT: /mnt/drime/$IMG ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 \
-          $ACCEL \
-          -machine pc \
-          $CPU \
-          -smp 4,sockets=1,cores=2,threads=2 \
-          -m 16384 \
-          -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=vmdk \
-          -device ide-hd,drive=d0 \
-          -boot order=c \
+          $ACCEL -machine pc $CPU \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+          -drive file=/mnt/drime/$IMG,format=vmdk,if=none,id=d0,cache=writeback \
+          -device ide-hd,drive=d0 -boot order=c \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-          -serial file:/tmp/vm-serial.log \
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
 
         sleep 5
         echo "=========================================="
-        echo "HACKER DIRECT BOOT (HTTP range requests)"
+        echo "DIRECT BOOT (no download, streamed on-demand)"
         echo "VNC: $NB_IP:5900 (no password)"
         echo "=========================================="
-
-        (
-          while kill -0 $QPID 2>/dev/null; do
-            sleep 30
-            echo "--- serial + hacker log ---"
-            sudo tail -n 5 /tmp/vm-serial.log 2>/dev/null || true
-            echo "---"
-            tail -n 5 /tmp/hacker.log 2>/dev/null || true
-          done
-        ) &
-
         tail -f /dev/null
