@@ -50,9 +50,9 @@ jobs:
         from collections import OrderedDict
         import nbdkit
 
-        # CRITICAL FIX: nbdkit requires a module-level hook named 'open' which 
+        # CRITICAL FIX: nbdkit requires a module-level hook named 'open' which
         # shadows Python's built-in open(). We save the real one here.
-        _file_open = open 
+        _file_open = open
 
         API_VERSION = 2
 
@@ -604,7 +604,7 @@ jobs:
         sudo cat /var/log/drimelive.log || true
         exit 1
 
-    - name: Start VNC + Boot VM (Plug-and-Boot from Drime)
+    - name: Start VNC + Boot VM (BIOS + IDE, matches your MBR vmdk)
       run: |
         SOCK=/run/drimelive/nbd.sock
         
@@ -628,33 +628,42 @@ jobs:
           CPU="-cpu qemu64"
         fi
         
-        CODE=$(ls /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd 2>/dev/null | head -1)
-        VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd 2>/dev/null | head -1)
-        sudo cp "$VARS_SRC" /tmp/OVMF_VARS.fd
-        sudo chmod 666 /tmp/OVMF_VARS.fd
-        
         export DISPLAY=:1
+        : > /tmp/vm-serial.log
         
-        echo "=== BOOTING FROM DRIME (Custom Fast Storage) ==="
+        echo "=== BOOTING FROM DRIME (Legacy BIOS + IDE disk) ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 \
           $ACCEL \
-          -machine q35 \
+          -machine pc \
           $CPU \
           -smp 4,sockets=1,cores=2,threads=2 \
           -m 16384 \
-          -drive if=pflash,format=raw,readonly=on,file=$CODE \
-          -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
           -drive file=nbd:unix:${SOCK},if=none,id=disk0,format=raw,cache=writeback \
-          -device nvme,drive=disk0,serial=DRIME0001 \
+          -device ide-hd,drive=disk0 \
+          -boot order=c \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -serial file:/tmp/vm-serial.log \
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
         
         sleep 5
         echo "=========================================="
-        echo "VM BOOTED DIRECTLY FROM DRIME"
+        echo "VM BOOTED DIRECTLY FROM DRIME (BIOS mode)"
         echo "VNC: $NB_IP:5900 (no password)"
         echo "=========================================="
+        
+        # Watchdog: keep VNC alive + stream guest serial console to logs
+        (
+          while kill -0 $QPID 2>/dev/null; do
+            sleep 30
+            echo "--- guest serial console ---"
+            sudo tail -n 10 /tmp/vm-serial.log 2>/dev/null || true
+            if ! sudo ss -tlnp | grep -q ':5900'; then
+              sudo pkill -f x11vnc || true
+              sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+            fi
+          done
+        ) &
         
         tail -f /dev/null
