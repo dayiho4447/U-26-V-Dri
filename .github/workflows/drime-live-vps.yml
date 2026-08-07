@@ -1,4 +1,4 @@
-name: Drime Direct VMDK Boot (No Download)
+name: Drime Live VM (1s Realtime)
 
 on:
   push:
@@ -21,8 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools fuse3
-        sudo modprobe fuse || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools
 
     - name: Install latest rclone
       run: |
@@ -38,6 +37,256 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
+    - name: Create Live-Sync Engine
+      run: |
+        cat > live_sync.py <<'PYEOF'
+        #!/usr/bin/env python3
+        import os, re, json, time, uuid, gzip, hashlib, threading, subprocess, socket, struct, sys
+        from pathlib import Path
+        from collections import OrderedDict
+        _open = open
+
+        NBD_OPT_EXPORT_NAME=1; NBD_REP_ERR_UNSUP=0x80000001; NBD_OPT_REPLY_MAGIC=0x3e889045565a9
+        NBD_REQUEST_MAGIC=0x25609513; NBD_SIMPLE_REPLY_MAGIC=0x67446ab5
+        R,W,D,F,T = 0,1,2,3,4
+
+        class Engine:
+            def __init__(self, conf, accounts, cache="/var/lib/drimelive", sync_every=1):
+                self.cache=Path(cache); self.chunks=self.cache/"chunks"; self.tmp=self.cache/"tmp"
+                for d in (self.cache,self.chunks,self.tmp): d.mkdir(parents=True,exist_ok=True)
+                self.chunk_size=self._size(self._conf(conf,"chunk_size","4M"))
+                self.accounts=[]; total=0
+                if accounts and os.path.exists(accounts):
+                    with _open(accounts) as f:
+                        for line in f:
+                            line=line.strip()
+                            if not line or line.startswith("#"):continue
+                            p=line.split()
+                            if len(p)>=2:
+                                n,s=p[0],self._size(p[1]); st=total//self.chunk_size; total+=s
+                                self.accounts.append({"name":n,"start":st,"end":total//self.chunk_size})
+                self.size=total or 100*1024**3
+                self.lock=threading.RLock(); self.remote=set()
+                self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=512
+                self.dirty={}; self.sync_every=sync_every
+                threading.Thread(target=self._syncer,daemon=True).start()
+
+            def _size(self,v):
+                if isinstance(v,int):return v
+                if not v:return 4*1024*1024
+                m=re.match(r'^([0-9.]+)([KMGTP]?)',str(v).strip().upper())
+                if not m:return 4*1024*1024
+                n,u=float(m.group(1)),m.group(2)
+                return int(n*{"":1,"K":1024,"M":1024**2,"G":1024**3,"T":1024**4,"P":1024**5}[u])
+            def _conf(self,path,key,d):
+                if not path or not os.path.exists(path):return d
+                try:
+                    for line in _open(path):
+                        line=line.split("#",1)[0].strip()
+                        if "=" in line:
+                            k,v=line.split("=",1)
+                            if k.strip()==key:return v.strip()
+                except Exception:pass
+                return d
+
+            def load_manifest(self):
+                if not self.accounts:return
+                t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
+                try:
+                    subprocess.run(["rclone","copyto",f"{self.accounts[0]['name']}:liveblock/manifest.json.gz",str(t),"--retries","1"],capture_output=True,timeout=30)
+                    with gzip.open(t) as f:m=json.load(f)
+                    for c in m.get("chunks",[]):self.remote.add(int(c["id"]))
+                except Exception:pass
+                finally:
+                    try:t.unlink()
+                    except:pass
+
+            def _acct(self,cid):
+                for a in self.accounts:
+                    if a["start"]<=cid<a["end"]:return a["name"]
+                return None
+            def _clen(self,cid):return min(self.chunk_size,self.size-cid*self.chunk_size)
+
+            def _dl(self,cid):
+                p=self.chunks/f"{cid:08d}.part"
+                if p.exists():return p.read_bytes()
+                r=self._acct(cid)
+                if not r:return b"\x00"*self._clen(cid)
+                t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}.gz"
+                try:
+                    res=subprocess.run(["rclone","copyto",f"{r}:liveblock/chunks/{cid:08d}.gz",str(t),"--retries","2"],capture_output=True,text=True,timeout=30)
+                    if res.returncode!=0:
+                        e=res.stderr.lower()
+                        if any(s in e for s in["not found","no such","doesn't exist"]):return b"\x00"*self._clen(cid)
+                        raise Exception(res.stderr)
+                    with gzip.open(t,"rb") as f:data=f.read()
+                    exp=self._clen(cid)
+                    if len(data)<exp:data+=b"\x00"*(exp-len(data))
+                    p.write_bytes(data);return data
+                except Exception:return b"\x00"*self._clen(cid)
+                finally:
+                    try:t.unlink()
+                    except:pass
+
+            def read_chunk(self,cid):
+                with self.clock:
+                    if cid in self.cache_data:
+                        self.cache_data.move_to_end(cid);return self.cache_data[cid]
+                data=self._dl(cid)
+                with self.clock:
+                    self.cache_data[cid]=data;self.cache_data.move_to_end(cid)
+                    while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
+                return data
+
+            def read(self,off,length):
+                out=bytearray(length);pos=0
+                while pos<length:
+                    o=off+pos;cid=o//self.chunk_size;co=o%self.chunk_size
+                    n=min(self.chunk_size-co,length-pos)
+                    ch=self.read_chunk(cid);out[pos:pos+n]=ch[co:co+n];pos+=n
+                return bytes(out)
+
+            def write(self,data,offset):
+                pos=0;total=len(data)
+                while pos<total:
+                    o=offset+pos;cid=o//self.chunk_size;co=o%self.chunk_size
+                    n=min(self.chunk_size-co,total-pos)
+                    self._write_chunk(cid,data[pos:pos+n],co);pos+=n
+
+            def _write_chunk(self,cid,data,off):
+                with self.lock:
+                    p=self.chunks/f"{cid:08d}.part"
+                    if p.exists():ch=bytearray(p.read_bytes())
+                    else:ch=bytearray(self.read_chunk(cid))
+                    exp=self._clen(cid)
+                    if len(ch)<exp:ch.extend(b"\x00"*(exp-len(ch)))
+                    ch[off:off+len(data)]=data
+                    final=bytes(ch)
+                    t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}";t.write_bytes(final);os.replace(t,p)
+                    self.dirty[cid]=True
+                    with self.clock:
+                        self.cache_data[cid]=final;self.cache_data.move_to_end(cid)
+                        while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
+
+            def _syncer(self):
+                while True:
+                    time.sleep(self.sync_every)
+                    try:self.flush()
+                    except Exception:pass
+
+            def flush(self):
+                with self.lock:
+                    ids=list(self.dirty.keys());self.dirty.clear()
+                if not ids:return
+                by={}
+                for cid in ids:
+                    p=self.chunks/f"{cid:08d}.part"
+                    if not p.exists():continue
+                    r=self._acct(cid)
+                    if r:by.setdefault(r,[]).append((cid,p.read_bytes()))
+                for r,items in by.items():
+                    stage=self.tmp/f"st_{uuid.uuid4().hex}";stage.mkdir(exist_ok=True)
+                    for cid,data in items:
+                        with gzip.open(stage/f"{cid:08d}.gz","wb") as f:f.write(data)
+                    subprocess.run(["rclone","copy",str(stage),f"{r}:liveblock/chunks/","--transfers","8","--no-update-modtime"],capture_output=True)
+                    import shutil;shutil.rmtree(stage,ignore_errors=True)
+                self._upload_manifest()
+
+            def _upload_manifest(self):
+                cur=sorted(int(p.stem) for p in self.chunks.glob("*.part"))
+                rem=sorted(self.remote)
+                allids=sorted(set(cur)|set(rem))
+                m={"chunks":[{"id":i} for i in allids]}
+                t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
+                with gzip.open(t,"wt") as f:json.dump(m,f)
+                if self.accounts:
+                    subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]['name']}:liveblock/manifest.json.gz"],capture_output=True)
+                try:t.unlink()
+                except:pass
+
+        def recv(conn,n):
+            b=b""
+            while len(b)<n:
+                c=conn.recv(n-len(b))
+                if not c:return None
+                b+=c
+            return b
+
+        def client(conn,eng):
+            try:
+                conn.sendall(b"NBDMAGIC"+b"IHAVEOPT"+struct.pack(">H",0x3))
+                cf=struct.unpack(">I",recv(conn,4))[0];nz=bool(cf&(1<<1))
+                while True:
+                    h=recv(conn,16)
+                    if not h:return
+                    mg,opt,ol=struct.unpack(">QII",h)
+                    d=recv(conn,ol) if ol else b""
+                    if opt==NBD_OPT_EXPORT_NAME:
+                        tf=(1<<0)|(1<<2)|(1<<5)
+                        r=struct.pack(">QI",eng.size,tf)
+                        if not nz:r+=b"\x00"*124
+                        conn.sendall(r);break
+                    else:conn.sendall(struct.pack(">QIII",NBD_OPT_REPLY_MAGIC,opt,NBD_REP_ERR_UNSUP,0))
+                while True:
+                    q=recv(conn,28)
+                    if not q:return
+                    mg,cmd,hd,off,ln=struct.unpack(">IIQQI",q)
+                    if mg!=NBD_REQUEST_MAGIC:return
+                    er=0
+                    if cmd==R:
+                        try:pl=eng.read(off,ln)
+                        except Exception:er=5;pl=b""
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd)+pl)
+                    elif cmd==W:
+                        wd=recv(conn,ln)
+                        if wd is None:return
+                        try:eng.write(wd,off)
+                        except Exception:er=5
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
+                    elif cmd==F:
+                        try:eng.flush()
+                        except Exception:er=5
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
+                    elif cmd==T:
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,30,hd))
+                    elif cmd==D:return
+                    else:conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,22,hd))
+            except Exception:pass
+            finally:
+                try:conn.close()
+                except:pass
+
+        if __name__=="__main__":
+            args=sys.argv[1:];cfg={}
+            for a in args[1:]:
+                if "=" in a:k,v=a.split("=",1);cfg[k]=v
+            eng=Engine(cfg.get("conf") or "drime-storage.conf",
+                       cfg.get("accounts") or "/run/drimelive/accounts.txt",
+                       cfg.get("cache") or "/var/lib/drimelive")
+            eng.load_manifest()
+            sp="/run/drimelive/nbd.sock"
+            try:os.unlink(sp)
+            except:pass
+            os.makedirs("/run/drimelive",exist_ok=True)
+            srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            srv.bind(sp);os.chmod(sp,0o777);srv.listen(16)
+            while True:
+                c,_=srv.accept()
+                threading.Thread(target=client,args=(c,eng),daemon=True).start()
+        PYEOF
+
+    - name: Create drimeblock
+      run: |
+        cat > drimeblock <<'SHEOF'
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        case "${1:-}" in
+          serve) mkdir -p /var/lib/drimelive /run/drimelive; exec python3 ./live_sync.py serve conf=drime-storage.conf accounts=/run/drimelive/accounts.txt cache=/var/lib/drimelive;;
+          *) exit 1;;
+        esac
+        SHEOF
+        chmod +x drimeblock
+
     - name: Configure Drime
       env:
         DRIME: ${{ secrets.DRIME }}
@@ -47,100 +296,49 @@ jobs:
         DRIME4: ${{ secrets.DRIME4 }}
         DRIME5: ${{ secrets.DRIME5 }}
       run: |
-        python3 - <<'PY'
-        import os, re, subprocess
+        sudo mkdir -p /run/drimelive; sudo chmod 777 /run/drimelive
+        sudo -E python3 - <<'PY'
+        import os,re,subprocess
         for line in open("drime-storage.conf"):
-            line = line.split("#",1)[0].strip()
-            m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
-            if not m: continue
-            name = m.group(1)
-            key = os.environ.get(name)
-            if not key: continue
-            subprocess.run(["rclone","config","delete",name], capture_output=True)
-            c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
-            if c.returncode==0:
-                open("/tmp/drime_remote","w").write(name)
-                print(f"Configured: {name}")
+            line=line.split("#",1)[0].strip()
+            m=re.match(r'^(DRIME[0-9]*)\s+(\S+)',line)
+            if not m:continue
+            name=m.group(1);key=os.environ.get(name)
+            if not key:continue
+            subprocess.run(["rclone","config","delete",name],capture_output=True)
+            c=subprocess.run(["rclone","config","create",name,"drime","access_token="+key],capture_output=True)
+            m2=subprocess.run(["rclone","mkdir",name+":liveblock"],capture_output=True)
+            if c.returncode==0 and m2.returncode==0:
+                open("/run/drimelive/accounts.txt","w").write(f"{name} {m.group(2)}\n")
                 break
         PY
-        REMOTE=$(cat /tmp/drime_remote)
-        echo "Remote: $REMOTE"
-        echo "=== Files on ${REMOTE}:liveblock/ ==="
-        rclone ls "${REMOTE}:liveblock/" || echo "No files found"
+        sudo chmod 644 /run/drimelive/accounts.txt
 
-    - name: Mount Drime (DIRECT - no download)
+    - name: Start Live-Sync Server
       run: |
-        REMOTE=$(cat /tmp/drime_remote)
-        sudo mkdir -p /mnt/drime
-        sudo chmod 777 /mnt/drime
-        
-        # Start rclone mount with better settings
-        sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
-          --vfs-cache-mode writes \
-          --cache-dir /tmp/rclone-cache \
-          --vfs-cache-max-size 10G \
-          --buffer-size 512M \
-          --vfs-read-ahead 128M \
-          --allow-other \
-          --daemon \
-          --log-level DEBUG \
-          --log-file /tmp/rclone.log
-        
-        echo "Waiting for mount (up to 60 seconds)..."
+        sudo rm -f /run/drimelive/nbd.sock
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup ./drimeblock serve > /var/log/live.log 2>&1 &"
         for i in $(seq 1 60); do
-          if mountpoint -q /mnt/drime; then
-            echo "✓ Mount ready after ${i}s"
-            break
-          fi
+          [ -S /run/drimelive/nbd.sock ] && exit 0
           sleep 1
-          [ $i -eq 60 ] && { echo "Mount timeout"; cat /tmp/rclone.log; exit 1; }
         done
-        
-        # Find vmdk
-        sleep 2
-        IMG=$(ls /mnt/drime 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
-        [ -z "$IMG" ] && { 
-          echo "ERROR: No vmdk found"
-          echo "Contents of /mnt/drime:"
-          ls -lah /mnt/drime/
-          echo "Rclone log:"
-          tail -50 /tmp/rclone.log
-          exit 1
-        }
-        
-        echo "IMG=$IMG" >> "$GITHUB_ENV"
-        echo "Found: /mnt/drime/$IMG"
+        exit 1
 
     - name: Start VNC
       run: |
-        sudo pkill -f Xvfb || true
-        sudo pkill -f x11vnc || true
-        sleep 2
-        sudo Xvfb :1 -screen 0 1920x1080x24 &
-        sleep 2
-        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg
-        sleep 2
+        sudo pkill -f Xvfb||true; sudo pkill -f x11vnc||true; sleep 2
+        sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
+        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg; sleep 2
 
-    - name: Boot VM (DIRECT from mounted vmdk)
+    - name: Boot VM
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
         export DISPLAY=:1
-
-        echo "=== DIRECT BOOT: /mnt/drime/$IMG ==="
-        sudo -E DISPLAY=:1 qemu-system-x86_64 \
-          $ACCEL -machine pc $CPU \
+        sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=/mnt/drime/$IMG,format=vmdk,if=none,id=d0,cache=writeback \
-          -device ide-hd,drive=d0 -boot order=c \
-          -vga std \
+          -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=raw,cache=writeback \
+          -device ide-hd,drive=d0 -boot order=c -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -display sdl > /tmp/vm.log 2>&1 &
-        QPID=$!
-
-        sleep 5
-        echo "=========================================="
-        echo "DIRECT BOOT (no download, streamed on-demand)"
-        echo "VNC: $NB_IP:5900 (no password)"
-        echo "=========================================="
         tail -f /dev/null
