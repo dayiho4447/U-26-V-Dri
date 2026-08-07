@@ -1,4 +1,4 @@
-name: Drime Native Overlay VM
+name: Drime Realtime Write-Through VM
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Configure Drime
+    - name: Configure 100 Drime accounts
       env:
         DRIME: ${{ secrets.DRIME }}
         DRIME1: ${{ secrets.DRIME1 }}
@@ -46,85 +46,435 @@ jobs:
         DRIME3: ${{ secrets.DRIME3 }}
         DRIME4: ${{ secrets.DRIME4 }}
         DRIME5: ${{ secrets.DRIME5 }}
+        DRIME6: ${{ secrets.DRIME6 }}
+        DRIME7: ${{ secrets.DRIME7 }}
+        DRIME8: ${{ secrets.DRIME8 }}
+        DRIME9: ${{ secrets.DRIME9 }}
+        DRIME10: ${{ secrets.DRIME10 }}
+        DRIME11: ${{ secrets.DRIME11 }}
+        DRIME12: ${{ secrets.DRIME12 }}
+        DRIME13: ${{ secrets.DRIME13 }}
+        DRIME14: ${{ secrets.DRIME14 }}
+        DRIME15: ${{ secrets.DRIME15 }}
+        DRIME16: ${{ secrets.DRIME16 }}
+        DRIME17: ${{ secrets.DRIME17 }}
+        DRIME18: ${{ secrets.DRIME18 }}
+        DRIME19: ${{ secrets.DRIME19 }}
+        DRIME20: ${{ secrets.DRIME20 }}
+        DRIME21: ${{ secrets.DRIME21 }}
+        DRIME22: ${{ secrets.DRIME22 }}
+        DRIME23: ${{ secrets.DRIME23 }}
+        DRIME24: ${{ secrets.DRIME24 }}
+        DRIME25: ${{ secrets.DRIME25 }}
+        DRIME26: ${{ secrets.DRIME26 }}
+        DRIME27: ${{ secrets.DRIME27 }}
+        DRIME28: ${{ secrets.DRIME28 }}
+        DRIME29: ${{ secrets.DRIME29 }}
+        DRIME30: ${{ secrets.DRIME30 }}
+        DRIME31: ${{ secrets.DRIME31 }}
+        DRIME32: ${{ secrets.DRIME32 }}
+        DRIME33: ${{ secrets.DRIME33 }}
+        DRIME34: ${{ secrets.DRIME34 }}
+        DRIME35: ${{ secrets.DRIME35 }}
+        DRIME36: ${{ secrets.DRIME36 }}
+        DRIME37: ${{ secrets.DRIME37 }}
+        DRIME38: ${{ secrets.DRIME38 }}
+        DRIME39: ${{ secrets.DRIME39 }}
+        DRIME40: ${{ secrets.DRIME40 }}
+        DRIME41: ${{ secrets.DRIME41 }}
+        DRIME42: ${{ secrets.DRIME42 }}
+        DRIME43: ${{ secrets.DRIME43 }}
+        DRIME44: ${{ secrets.DRIME44 }}
+        DRIME45: ${{ secrets.DRIME45 }}
+        DRIME46: ${{ secrets.DRIME46 }}
+        DRIME47: ${{ secrets.DRIME47 }}
+        DRIME48: ${{ secrets.DRIME48 }}
+        DRIME49: ${{ secrets.DRIME49 }}
+        DRIME50: ${{ secrets.DRIME50 }}
+        DRIME51: ${{ secrets.DRIME51 }}
+        DRIME52: ${{ secrets.DRIME52 }}
+        DRIME53: ${{ secrets.DRIME53 }}
+        DRIME54: ${{ secrets.DRIME54 }}
+        DRIME55: ${{ secrets.DRIME55 }}
+        DRIME56: ${{ secrets.DRIME56 }}
+        DRIME57: ${{ secrets.DRIME57 }}
+        DRIME58: ${{ secrets.DRIME58 }}
+        DRIME59: ${{ secrets.DRIME59 }}
+        DRIME60: ${{ secrets.DRIME60 }}
+        DRIME61: ${{ secrets.DRIME61 }}
+        DRIME62: ${{ secrets.DRIME62 }}
+        DRIME63: ${{ secrets.DRIME63 }}
+        DRIME64: ${{ secrets.DRIME64 }}
+        DRIME65: ${{ secrets.DRIME65 }}
+        DRIME66: ${{ secrets.DRIME66 }}
+        DRIME67: ${{ secrets.DRIME67 }}
+        DRIME68: ${{ secrets.DRIME68 }}
+        DRIME69: ${{ secrets.DRIME69 }}
+        DRIME70: ${{ secrets.DRIME70 }}
+        DRIME71: ${{ secrets.DRIME71 }}
+        DRIME72: ${{ secrets.DRIME72 }}
+        DRIME73: ${{ secrets.DRIME73 }}
+        DRIME74: ${{ secrets.DRIME74 }}
+        DRIME75: ${{ secrets.DRIME75 }}
+        DRIME76: ${{ secrets.DRIME76 }}
+        DRIME77: ${{ secrets.DRIME77 }}
+        DRIME78: ${{ secrets.DRIME78 }}
+        DRIME79: ${{ secrets.DRIME79 }}
+        DRIME80: ${{ secrets.DRIME80 }}
+        DRIME81: ${{ secrets.DRIME81 }}
+        DRIME82: ${{ secrets.DRIME82 }}
+        DRIME83: ${{ secrets.DRIME83 }}
+        DRIME84: ${{ secrets.DRIME84 }}
+        DRIME85: ${{ secrets.DRIME85 }}
+        DRIME86: ${{ secrets.DRIME86 }}
+        DRIME87: ${{ secrets.DRIME87 }}
+        DRIME88: ${{ secrets.DRIME88 }}
+        DRIME89: ${{ secrets.DRIME89 }}
+        DRIME90: ${{ secrets.DRIME90 }}
+        DRIME91: ${{ secrets.DRIME91 }}
+        DRIME92: ${{ secrets.DRIME92 }}
+        DRIME93: ${{ secrets.DRIME93 }}
+        DRIME94: ${{ secrets.DRIME94 }}
+        DRIME95: ${{ secrets.DRIME95 }}
+        DRIME96: ${{ secrets.DRIME96 }}
+        DRIME97: ${{ secrets.DRIME97 }}
+        DRIME98: ${{ secrets.DRIME98 }}
+        DRIME99: ${{ secrets.DRIME99 }}
       run: |
-        sudo mkdir -p /run/drimelive
-        python3 - <<'PY'
+        sudo mkdir -p /run/drimelive; sudo chmod 777 /run/drimelive
+        sudo -E python3 - <<'PY'
         import os, re, subprocess
-        if not os.path.exists("drime-storage.conf"):
-            open("drime-storage.conf", "w").write("DRIME 100G\n")
-        for line in open("drime-storage.conf"):
-            line = line.split("#",1)[0].strip()
-            m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
-            if not m: continue
-            name = m.group(1)
-            key = os.environ.get(name)
-            if not key: continue
-            subprocess.run(["rclone","config","delete",name], capture_output=True)
-            c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
-            if c.returncode==0:
-                open("/tmp/drime_remote","w").write(name)
-                print(f"Configured: {name}")
-                break
+        ok = 0
+        with open("/run/drimelive/accounts.txt","w") as out:
+            for line in open("drime-storage.conf"):
+                line = line.split("#",1)[0].strip()
+                m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
+                if not m: continue
+                name, size = m.group(1), m.group(2)
+                key = os.environ.get(name)
+                if not key: continue
+                subprocess.run(["rclone","config","delete",name], capture_output=True)
+                c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
+                if c.returncode == 0:
+                    out.write(f"{name} {size}\n"); ok += 1
+        if ok == 0: raise SystemExit("ERROR: no Drime account configured")
+        print(f"Configured {ok} accounts")
         PY
+        sudo chmod 644 /run/drimelive/accounts.txt
 
-    - name: Mount Drime (FUSE with auto write-back)
+    - name: Find + Mount Drime (writable for COW uploads)
       run: |
-        REMOTE=$(cat /tmp/drime_remote)
+        REMOTE=""
+        while read -r name size; do
+          if sudo rclone lsf "${name}:liveblock/" 2>/dev/null | grep -qiE '\.(vmdk|img|qcow2)$'; then
+            REMOTE="$name"; break
+          fi
+        done < /run/drimelive/accounts.txt
+        [ -z "$REMOTE" ] && { echo "ERROR: no base vmdk on any account"; exit 1; }
+        echo "$REMOTE" > /tmp/drime_remote
         sudo mkdir -p /mnt/drime
-        # vfs-write-back 10s ensures changes are pushed to Drime in the background automatically
         sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
           --vfs-cache-mode full \
           --vfs-cache-max-size 12G \
           --vfs-read-ahead 128M \
-          --vfs-write-back 10s \
+          --vfs-write-back 2s \
           --buffer-size 256M \
           --daemon \
           --allow-other
-        echo "Waiting for base vmdk..."
         for i in $(seq 1 30); do
-          if ls /mnt/drime/*.vmdk 1> /dev/null 2>&1; then
-            echo "Found: $(ls /mnt/drime/*.vmdk 2>/dev/null | head -1)"
-            exit 0
-          fi
+          ls /mnt/drime/*.vmdk 1>/dev/null 2>&1 && { echo "Mounted $REMOTE"; exit 0; }
           sleep 1
         done
-        echo "ERROR: vmdk not found"
-        exit 1
+        echo "ERROR: vmdk not visible"; exit 1
 
-    - name: Create QCOW2 Overlay
+    - name: Create Realtime Write-Through Bridge
       run: |
-        BASE=$(ls /mnt/drime/*.vmdk | head -1)
-        # Create an overlay that points to the cloud VMDK. 
-        # All writes go to this overlay, keeping the base VMDK pristine.
-        sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /mnt/drime/overlay.qcow2
-        echo "Overlay created. QEMU will boot from this instantly."
+        cat > bridge.py <<'PYEOF'
+        #!/usr/bin/env python3
+        import os, json, gzip, threading, socket, struct, glob, queue, time
+        from pathlib import Path
+        from collections import OrderedDict
 
-    - name: Start VNC
+        NBD_OPT_EXPORT_NAME=1; NBD_REP_ERR_UNSUP=0x80000001; NBD_OPT_REPLY_MAGIC=0x3e889045565a9
+        NBD_REQUEST_MAGIC=0x25609513; NBD_SIMPLE_REPLY_MAGIC=0x67446ab5
+        R,W,D,F,T=0,1,2,3,4
+        UPLOADERS=16   # parallel push workers
+
+        class Bridge:
+            def __init__(self, mnt="/mnt/drime", cache="/var/lib/drimelive"):
+                self.mnt=Path(mnt); self.cache=Path(cache); self.tmp=self.cache/"tmp"
+                self.tmp.mkdir(parents=True,exist_ok=True)
+                self.chunk_size=4*1024*1024
+                vmdks=glob.glob(str(self.mnt/"*.vmdk"))+glob.glob(str(self.mnt/"*.img"))+glob.glob(str(self.mnt/"*.qcow2"))
+                if not vmdks: raise Exception("no base disk in "+str(self.mnt))
+                self.base_path=vmdks[0]
+                self.size=os.path.getsize(self.base_path)
+                # FIX: one file handle PER THREAD (no shared seek corruption)
+                self.tls=threading.local()
+                self.lock=threading.RLock()
+                self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=2048
+                self.chunks_dir=self.mnt/"chunks"
+                self.q=queue.Queue(); self.pending=set(); self.plock=threading.Lock()
+                self.ver={}; self.vlock=threading.Lock()
+                self.manifest_dirty=False
+                self.remote_cow=set()
+                self.load_manifest()
+                for i in range(UPLOADERS):
+                    threading.Thread(target=self._uploader,daemon=True).start()
+                threading.Thread(target=self._manifest_loop,daemon=True).start()
+                print(f"[BRIDGE] base={self.base_path} size={self.size} cow={len(self.remote_cow)} uploaders={UPLOADERS}",flush=True)
+
+            def _base_file(self):
+                f=getattr(self.tls,"f",None)
+                if f is None:
+                    f=open(self.base_path,"rb"); self.tls.f=f
+                return f
+
+            def load_manifest(self):
+                m_path=self.mnt/"manifest.json.gz"
+                if m_path.exists():
+                    try:
+                        with gzip.open(m_path,"rt") as f: m=json.load(f)
+                        self.remote_cow=set(c["id"] for c in m.get("chunks",[]))
+                    except Exception: pass
+
+            def _clen(self,cid): return min(self.chunk_size,self.size-cid*self.chunk_size)
+
+            def _read_exact(self,f,n):
+                data=b""
+                while len(data)<n:
+                    chunk=f.read(n-len(data))
+                    if not chunk: break
+                    data+=chunk
+                return data
+
+            def _base_range(self,cid):
+                off=cid*self.chunk_size; n=self._clen(cid)
+                if n<=0: return b""
+                f=self._base_file()
+                f.seek(off)
+                data=self._read_exact(f,n)
+                if len(data)<n: data+=b"\x00"*(n-len(data))
+                return data
+
+            def _dl(self,cid):
+                p=self.tmp/f"{cid:08d}.part"
+                if p.exists(): return p.read_bytes()
+                cow=self.chunks_dir/f"{cid:08d}.gz"
+                if cow.exists():
+                    try:
+                        with gzip.open(cow,"rb") as f: data=self._read_exact(f,self._clen(cid))
+                        exp=self._clen(cid)
+                        if len(data)<exp: data+=b"\x00"*(exp-len(data))
+                        p.write_bytes(data); return data
+                    except Exception: pass
+                return self._base_range(cid)
+
+            def read_chunk(self,cid):
+                with self.clock:
+                    if cid in self.cache_data:
+                        self.cache_data.move_to_end(cid); return self.cache_data[cid]
+                data=self._dl(cid)
+                with self.clock:
+                    self.cache_data[cid]=data; self.cache_data.move_to_end(cid)
+                    while len(self.cache_data)>self.MAXC: self.cache_data.popitem(last=False)
+                return data
+
+            def read(self,off,length):
+                out=bytearray(length); pos=0
+                while pos<length:
+                    o=off+pos; cid=o//self.chunk_size; co=o%self.chunk_size
+                    n=min(self.chunk_size-co,length-pos)
+                    ch=self.read_chunk(cid); out[pos:pos+n]=ch[co:co+n]; pos+=n
+                return bytes(out)
+
+            def write(self,data,offset):
+                pos=0; total=len(data)
+                while pos<total:
+                    o=offset+pos; cid=o//self.chunk_size; co=o%self.chunk_size
+                    n=min(self.chunk_size-co,total-pos)
+                    self._write_chunk(cid,data[pos:pos+n],co); pos+=n
+
+            def _write_chunk(self,cid,data,off):
+                with self.lock:
+                    p=self.tmp/f"{cid:08d}.part"
+                    if p.exists(): ch=bytearray(p.read_bytes())
+                    else: ch=bytearray(self.read_chunk(cid))
+                    exp=self._clen(cid)
+                    if len(ch)<exp: ch.extend(b"\x00"*(exp-len(ch)))
+                    ch[off:off+len(data)]=data
+                    final=bytes(ch); p.write_bytes(final)
+                    with self.clock:
+                        self.cache_data[cid]=final; self.cache_data.move_to_end(cid)
+                        while len(self.cache_data)>self.MAXC: self.cache_data.popitem(last=False)
+                # REALTIME: queue upload IMMEDIATELY on write (no timer)
+                with self.vlock: self.ver[cid]=self.ver.get(cid,0)+1
+                with self.plock:
+                    if cid not in self.pending:
+                        self.pending.add(cid); self.q.put(cid)
+
+            def _uploader(self):
+                while True:
+                    cid=self.q.get()
+                    try:
+                        with self.vlock: v0=self.ver.get(cid,0)
+                        self._push(cid)
+                        with self.vlock:
+                            if self.ver.get(cid,0)!=v0: self.q.put(cid)
+                    except Exception: pass
+                    finally:
+                        with self.plock: self.pending.discard(cid)
+                        self.q.task_done(); self.manifest_dirty=True
+
+            def _push(self,cid):
+                p=self.tmp/f"{cid:08d}.part"
+                if not p.exists(): return
+                self.chunks_dir.mkdir(exist_ok=True)
+                cow=self.chunks_dir/f"{cid:08d}.gz"
+                with gzip.open(cow,"wb") as f: f.write(p.read_bytes())
+
+            def _manifest_loop(self):
+                while True:
+                    time.sleep(1)
+                    if self.manifest_dirty:
+                        self.manifest_dirty=False
+                        try: self._upload_manifest()
+                        except Exception: pass
+
+            def _upload_manifest(self):
+                ids=set()
+                for p in self.chunks_dir.glob("*.gz"):
+                    try: ids.add(int(p.stem))
+                    except Exception: pass
+                for p in self.tmp.glob("*.part"):
+                    try: ids.add(int(p.stem))
+                    except Exception: pass
+                m={"chunks":[{"id":i} for i in sorted(ids)]}
+                with gzip.open(self.mnt/"manifest.json.gz","wt") as f: json.dump(m,f)
+
+            def flush(self):
+                self.q.join()
+                self._upload_manifest()
+
+        def recv(conn,n):
+            b=b""
+            while len(b)<n:
+                c=conn.recv(n-len(b))
+                if not c: return None
+                b+=c
+            return b
+
+        def client(conn,eng):
+            try:
+                conn.sendall(b"NBDMAGIC"+b"IHAVEOPT"+struct.pack(">H",0x3))
+                cf=struct.unpack(">I",recv(conn,4))[0]; nz=bool(cf&(1<<1))
+                while True:
+                    h=recv(conn,16)
+                    if not h: return
+                    mg,opt,ol=struct.unpack(">QII",h)
+                    d=recv(conn,ol) if ol else b""
+                    if opt==NBD_OPT_EXPORT_NAME:
+                        tf=(1<<0)|(1<<2)|(1<<5)
+                        r=struct.pack(">QI",eng.size,tf)
+                        if not nz: r+=b"\x00"*124
+                        conn.sendall(r); break
+                    else:
+                        conn.sendall(struct.pack(">QIII",NBD_OPT_REPLY_MAGIC,opt,NBD_REP_ERR_UNSUP,0))
+                while True:
+                    q=recv(conn,28)
+                    if not q: return
+                    mg,cmd,hd,off,ln=struct.unpack(">IIQQI",q)
+                    if mg!=NBD_REQUEST_MAGIC: return
+                    er=0
+                    if cmd==R:
+                        try: pl=eng.read(off,ln)
+                        except Exception: er=5; pl=b""
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd)+pl)
+                    elif cmd==W:
+                        wd=recv(conn,ln)
+                        if wd is None: return
+                        try: eng.write(wd,off)
+                        except Exception: er=5
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
+                    elif cmd==F:
+                        try: eng.flush()
+                        except Exception: er=5
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
+                    elif cmd==T:
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,30,hd))
+                    elif cmd==D: return
+                    else:
+                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,22,hd))
+            except Exception: pass
+            finally:
+                try: conn.close()
+                except Exception: pass
+
+        if __name__=="__main__":
+            eng=Bridge("/mnt/drime","/var/lib/drimelive")
+            sp="/run/drimelive/nbd.sock"
+            try: os.unlink(sp)
+            except Exception: pass
+            os.makedirs("/run/drimelive",exist_ok=True)
+            srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            srv.bind(sp); os.chmod(sp,0o777); srv.listen(16)
+            print("[BRIDGE] listening",flush=True)
+            while True:
+                c,_=srv.accept()
+                threading.Thread(target=client,args=(c,eng),daemon=True).start()
+        PYEOF
+
+    - name: Start Realtime Bridge
+      run: |
+        sudo rm -f /run/drimelive/nbd.sock
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup python3 bridge.py > /var/log/bridge.log 2>&1 &"
+        for i in $(seq 1 60); do
+          [ -S /run/drimelive/nbd.sock ] && { cat /var/log/bridge.log; exit 0; }
+          sleep 1
+        done
+        cat /var/log/bridge.log; exit 1
+
+    - name: Start VNC (proven stack)
       run: |
         sudo pkill -f Xvfb||true; sudo pkill -f x11vnc||true; sleep 2
         sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
-        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg; sleep 2
+        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+        sleep 2
+        sudo ss -tlnp | grep 5900 && echo "VNC ready"
 
-    - name: Boot VM (Native QCOW2 Overlay)
+    - name: Boot VM (realtime write-through)
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
-        export DISPLAY=:1; : > /tmp/vm-serial.log
-        
-        echo "=== BOOTING (Native QCOW2 Overlay) ==="
+        export DISPLAY=:1
+        : > /tmp/vm-serial.log
+
+        echo "=== BOOTING VM (2c/4t, 16G, KVM, realtime sync) ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=/mnt/drime/overlay.qcow2,format=qcow2,if=none,id=d0,cache=writeback \
+          -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=vmdk,cache=writeback \
           -device ide-hd,drive=d0 -boot order=c -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial file:/tmp/vm-serial.log \
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
-        
         sleep 5
-        echo "VNC: $NB_IP:5900"
-        ( while kill -0 $QPID 2>/dev/null; do
+
+        echo "=========================================="
+        echo "VNC: $NB_IP:5900 (no password)"
+        echo "Write-through: every block pushed on write"
+        echo "=========================================="
+
+        (
+          while kill -0 $QPID 2>/dev/null; do
             sleep 30
             echo "--- serial ---"; sudo tail -n 5 /tmp/vm-serial.log 2>/dev/null || true
-          done ) &
+            echo "--- bridge ---"; sudo tail -n 5 /var/log/bridge.log 2>/dev/null || true
+            if ! sudo ss -tlnp | grep -q ':5900'; then
+              sudo pkill -f x11vnc || true
+              sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+            fi
+          done
+        ) &
+
         tail -f /dev/null
