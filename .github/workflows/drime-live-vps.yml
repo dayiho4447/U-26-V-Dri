@@ -50,6 +50,10 @@ jobs:
         from collections import OrderedDict
         import nbdkit
 
+        # CRITICAL FIX: nbdkit requires a module-level hook named 'open' which 
+        # shadows Python's built-in open(). We save the real one here.
+        _file_open = open 
+
         API_VERSION = 2
 
         class DrimeFastStorage:
@@ -68,7 +72,7 @@ jobs:
                 
                 acct_file = accounts_path or "/run/drimelive/accounts.txt"
                 if os.path.exists(acct_file):
-                    with open(acct_file, "r") as f:
+                    with _file_open(acct_file, "r") as f:
                         for line in f:
                             line = line.strip()
                             if not line or line.startswith("#"): continue
@@ -113,7 +117,7 @@ jobs:
                 conf_file = path or "drime-storage.conf"
                 if not os.path.exists(conf_file): return default
                 try:
-                    with open(conf_file, "r") as f:
+                    with _file_open(conf_file, "r") as f:
                         for line in f:
                             line = line.split("#",1)[0].strip()
                             if "=" in line:
@@ -342,6 +346,7 @@ jobs:
             STORE.load_manifest()
             STORE.start_prefetch()
 
+        # nbdkit hook (this is what shadowed the built-in open)
         def open(readonly):
             return STORE
 
