@@ -22,7 +22,8 @@ jobs:
       run: |
         sudo apt-get update -y
         sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools fuse3
-        sudo modprobe fuse || true
+        sudo modprobe fuse || echo "fuse module not available"
+        sudo sysctl -w fs.fuse.max_user_background=1024 || true
 
     - name: Install latest rclone
       run: |
@@ -53,7 +54,6 @@ jobs:
       run: |
         python3 - <<'PY'
         import os, re, subprocess
-        # find first account that has a secret
         for line in open("drime-storage.conf"):
             line = line.split("#",1)[0].strip()
             m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
@@ -70,22 +70,25 @@ jobs:
         PY
         echo "Using remote: $(cat /tmp/drime_remote)"
 
-    - name: Check what's on Drime
+    - name: Test rclone connectivity
       run: |
         REMOTE=$(cat /tmp/drime_remote)
-        echo "=== Listing ${REMOTE}: (root) ==="
-        rclone ls "${REMOTE}:" || echo "(empty or error)"
-        echo ""
-        echo "=== Listing ${REMOTE}:liveblock/ ==="
-        rclone ls "${REMOTE}:liveblock/" || echo "(folder doesn't exist or empty)"
-        echo ""
-        echo "=== Looking for vmdk/img/qcow2 files ==="
-        rclone ls "${REMOTE}:liveblock/" 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' || echo "NO DISK IMAGES FOUND"
+        echo "=== Testing rclone ls ==="
+        rclone ls "${REMOTE}:liveblock/" || {
+          echo "rclone ls failed"
+          echo "=== Trying rclone config ==="
+          rclone config show "$REMOTE"
+          exit 1
+        }
 
     - name: Mount Drime DIRECT (no download, no chunks)
       run: |
         REMOTE=$(cat /tmp/drime_remote)
         sudo mkdir -p /mnt/drime
+        sudo chmod 777 /mnt/drime
+        
+        # Try to mount and capture errors
+        echo "Starting rclone mount..."
         sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
           --vfs-cache-mode full \
           --vfs-cache-max-size 12G \
@@ -95,24 +98,48 @@ jobs:
           --buffer-size 256M \
           --transfers 8 \
           --checkers 8 \
-          --daemon
-        # wait for mount and list contents
-        echo "Waiting for mount to populate..."
-        for i in $(seq 1 30); do
-          sleep 1
-          echo "--- Attempt $i ---"
-          ls -lah /mnt/drime/ 2>/dev/null || echo "(mount not ready)"
-          IMG=$(ls /mnt/drime 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
-          [ -n "$IMG" ] && break
-        done
-        [ -z "$IMG" ] && { 
-          echo "ERROR: no vmdk/img/qcow2 file found in /mnt/drime"
-          echo "Final contents:"
-          ls -lah /mnt/drime/ 2>/dev/null || echo "(cannot list)"
+          --allow-other \
+          --uid 0 \
+          --gid 0 \
+          --daemon \
+          --log-file /tmp/rclone-mount.log \
+          -v || {
+            echo "Mount command failed"
+            cat /tmp/rclone-mount.log
+            exit 1
+          }
+        
+        echo "Waiting for mount..."
+        sleep 5
+        
+        # Check if mount succeeded
+        if mountpoint -q /mnt/drime; then
+          echo "Mount successful!"
+        else
+          echo "Mount failed - not a mountpoint"
+          cat /tmp/rclone-mount.log
+          exit 1
+        fi
+        
+        # List contents
+        echo "Contents of /mnt/drime:"
+        ls -lah /mnt/drime/ || {
+          echo "Cannot list mount contents"
+          cat /tmp/rclone-mount.log
           exit 1
         }
+        
+        # Find disk image
+        IMG=$(ls /mnt/drime 2>/dev/null | grep -iE '\.(vmdk|img|qcow2)$' | head -1 || true)
+        if [ -z "$IMG" ]; then
+          echo "ERROR: no vmdk/img/qcow2 file found"
+          echo "Available files:"
+          ls -la /mnt/drime/ || true
+          exit 1
+        fi
+        
         echo "IMG=$IMG" >> "$GITHUB_ENV"
-        echo "Mounted DIRECT: /mnt/drime/$IMG (streamed on demand, no chunks)"
+        echo "SUCCESS: Mounted /mnt/drime/$IMG"
 
     - name: Start VNC
       run: |
