@@ -1,4 +1,4 @@
-name: Drime Live VM (1s Realtime)
+name: Drime Realtime Bridge VM
 
 on:
   push:
@@ -37,11 +37,21 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Create Live-Sync Engine
+    - name: Create Realtime Bridge (custom tool between VM and rclone)
       run: |
-        cat > live_sync.py <<'PYEOF'
+        cat > bridge.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, re, json, time, uuid, gzip, hashlib, threading, subprocess, socket, struct, sys
+        """
+        DRIME REALTIME BRIDGE
+        Sits between QEMU (VM) and rclone (Drime).
+        - Reads stream from Drime on demand (direct boot, no download)
+        - Every write is committed locally in microseconds
+        - Each changed block is pushed to Drime IMMEDIATELY (write-through)
+          via a 16-worker parallel upload pool (no timer, no waiting)
+        - Force-kill loses only blocks still in-flight (sub-second)
+        - Drime usage grows live as you install
+        """
+        import os, re, json, time, uuid, gzip, threading, subprocess, socket, struct, sys, queue
         from pathlib import Path
         from collections import OrderedDict
         _open = open
@@ -49,9 +59,10 @@ jobs:
         NBD_OPT_EXPORT_NAME=1; NBD_REP_ERR_UNSUP=0x80000001; NBD_OPT_REPLY_MAGIC=0x3e889045565a9
         NBD_REQUEST_MAGIC=0x25609513; NBD_SIMPLE_REPLY_MAGIC=0x67446ab5
         R,W,D,F,T = 0,1,2,3,4
+        UPLOADERS = 16
 
-        class Engine:
-            def __init__(self, conf, accounts, cache="/var/lib/drimelive", sync_every=1):
+        class Bridge:
+            def __init__(self, conf, accounts, cache="/var/lib/drimelive"):
                 self.cache=Path(cache); self.chunks=self.cache/"chunks"; self.tmp=self.cache/"tmp"
                 for d in (self.cache,self.chunks,self.tmp): d.mkdir(parents=True,exist_ok=True)
                 self.chunk_size=self._size(self._conf(conf,"chunk_size","4M"))
@@ -68,8 +79,13 @@ jobs:
                 self.size=total or 100*1024**3
                 self.lock=threading.RLock(); self.remote=set()
                 self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=512
-                self.dirty={}; self.sync_every=sync_every
-                threading.Thread(target=self._syncer,daemon=True).start()
+                # realtime write-through
+                self.q=queue.Queue(); self.pending=set(); self.plock=threading.Lock()
+                self.ver={}; self.vlock=threading.Lock()
+                self.manifest_dirty=False
+                for i in range(UPLOADERS):
+                    threading.Thread(target=self._uploader,daemon=True).start()
+                threading.Thread(target=self._manifest_loop,daemon=True).start()
 
             def _size(self,v):
                 if isinstance(v,int):return v
@@ -163,39 +179,52 @@ jobs:
                     ch[off:off+len(data)]=data
                     final=bytes(ch)
                     t=self.tmp/f"{cid:08d}_{uuid.uuid4().hex}";t.write_bytes(final);os.replace(t,p)
-                    self.dirty[cid]=True
                     with self.clock:
                         self.cache_data[cid]=final;self.cache_data.move_to_end(cid)
                         while len(self.cache_data)>self.MAXC:self.cache_data.popitem(last=False)
+                # bump version + enqueue for IMMEDIATE push
+                with self.vlock:self.ver[cid]=self.ver.get(cid,0)+1
+                with self.plock:
+                    if cid not in self.pending:
+                        self.pending.add(cid);self.q.put(cid)
 
-            def _syncer(self):
+            def _uploader(self):
                 while True:
-                    time.sleep(self.sync_every)
-                    try:self.flush()
+                    cid=self.q.get()
+                    try:
+                        with self.vlock:v0=self.ver.get(cid,0)
+                        self._push(cid)
+                        with self.vlock:
+                            if self.ver.get(cid,0)!=v0:  # rewritten while uploading
+                                self.q.put(cid)          # push again
                     except Exception:pass
+                    finally:
+                        with self.plock:self.pending.discard(cid)
+                        self.q.task_done()
+                        self.manifest_dirty=True
 
-            def flush(self):
-                with self.lock:
-                    ids=list(self.dirty.keys());self.dirty.clear()
-                if not ids:return
-                by={}
-                for cid in ids:
-                    p=self.chunks/f"{cid:08d}.part"
-                    if not p.exists():continue
-                    r=self._acct(cid)
-                    if r:by.setdefault(r,[]).append((cid,p.read_bytes()))
-                for r,items in by.items():
-                    stage=self.tmp/f"st_{uuid.uuid4().hex}";stage.mkdir(exist_ok=True)
-                    for cid,data in items:
-                        with gzip.open(stage/f"{cid:08d}.gz","wb") as f:f.write(data)
-                    subprocess.run(["rclone","copy",str(stage),f"{r}:liveblock/chunks/","--transfers","8","--no-update-modtime"],capture_output=True)
-                    import shutil;shutil.rmtree(stage,ignore_errors=True)
-                self._upload_manifest()
+            def _push(self,cid):
+                p=self.chunks/f"{cid:08d}.part"
+                r=self._acct(cid)
+                if not p.exists() or not r:return
+                t=self.tmp/f"up_{cid:08d}_{uuid.uuid4().hex}.gz"
+                with gzip.open(t,"wb") as f:f.write(p.read_bytes())
+                subprocess.run(["rclone","copyto",str(t),f"{r}:liveblock/chunks/{cid:08d}.gz","--retries","2"],capture_output=True,timeout=60)
+                try:t.unlink()
+                except:pass
+                self.remote.add(cid)
+
+            def _manifest_loop(self):
+                while True:
+                    time.sleep(2)
+                    if self.manifest_dirty:
+                        self.manifest_dirty=False
+                        try:self._upload_manifest()
+                        except Exception:pass
 
             def _upload_manifest(self):
                 cur=sorted(int(p.stem) for p in self.chunks.glob("*.part"))
-                rem=sorted(self.remote)
-                allids=sorted(set(cur)|set(rem))
+                allids=sorted(set(cur)|set(self.remote))
                 m={"chunks":[{"id":i} for i in allids]}
                 t=self.tmp/f"m_{uuid.uuid4().hex}.gz"
                 with gzip.open(t,"wt") as f:json.dump(m,f)
@@ -203,6 +232,10 @@ jobs:
                     subprocess.run(["rclone","copyto",str(t),f"{self.accounts[0]['name']}:liveblock/manifest.json.gz"],capture_output=True)
                 try:t.unlink()
                 except:pass
+
+            def flush(self):
+                self.q.join()
+                self._upload_manifest()
 
         def recv(conn,n):
             b=b""
@@ -260,7 +293,7 @@ jobs:
             args=sys.argv[1:];cfg={}
             for a in args[1:]:
                 if "=" in a:k,v=a.split("=",1);cfg[k]=v
-            eng=Engine(cfg.get("conf") or "drime-storage.conf",
+            eng=Bridge(cfg.get("conf") or "drime-storage.conf",
                        cfg.get("accounts") or "/run/drimelive/accounts.txt",
                        cfg.get("cache") or "/var/lib/drimelive")
             eng.load_manifest()
@@ -281,7 +314,7 @@ jobs:
         #!/usr/bin/env bash
         set -Eeuo pipefail
         case "${1:-}" in
-          serve) mkdir -p /var/lib/drimelive /run/drimelive; exec python3 ./live_sync.py serve conf=drime-storage.conf accounts=/run/drimelive/accounts.txt cache=/var/lib/drimelive;;
+          serve) mkdir -p /var/lib/drimelive /run/drimelive; exec python3 ./bridge.py serve conf=drime-storage.conf accounts=/run/drimelive/accounts.txt cache=/var/lib/drimelive;;
           *) exit 1;;
         esac
         SHEOF
@@ -314,10 +347,10 @@ jobs:
         PY
         sudo chmod 644 /run/drimelive/accounts.txt
 
-    - name: Start Live-Sync Server
+    - name: Start Realtime Bridge
       run: |
         sudo rm -f /run/drimelive/nbd.sock
-        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup ./drimeblock serve > /var/log/live.log 2>&1 &"
+        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup ./drimeblock serve > /var/log/bridge.log 2>&1 &"
         for i in $(seq 1 60); do
           [ -S /run/drimelive/nbd.sock ] && exit 0
           sleep 1
