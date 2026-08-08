@@ -1,4 +1,4 @@
-name: Drime Native Boot + Terminal Logs
+name: Drime Master VM (Persistent + Native VNC + Terminal Logs)
 
 on:
   push:
@@ -91,55 +91,6 @@ jobs:
         DRIME48: ${{ secrets.DRIME48 }}
         DRIME49: ${{ secrets.DRIME49 }}
         DRIME50: ${{ secrets.DRIME50 }}
-        DRIME51: ${{ secrets.DRIME51 }}
-        DRIME52: ${{ secrets.DRIME52 }}
-        DRIME53: ${{ secrets.DRIME53 }}
-        DRIME54: ${{ secrets.DRIME54 }}
-        DRIME55: ${{ secrets.DRIME55 }}
-        DRIME56: ${{ secrets.DRIME56 }}
-        DRIME57: ${{ secrets.DRIME57 }}
-        DRIME58: ${{ secrets.DRIME58 }}
-        DRIME59: ${{ secrets.DRIME59 }}
-        DRIME60: ${{ secrets.DRIME60 }}
-        DRIME61: ${{ secrets.DRIME61 }}
-        DRIME62: ${{ secrets.DRIME62 }}
-        DRIME63: ${{ secrets.DRIME63 }}
-        DRIME64: ${{ secrets.DRIME64 }}
-        DRIME65: ${{ secrets.DRIME65 }}
-        DRIME66: ${{ secrets.DRIME66 }}
-        DRIME67: ${{ secrets.DRIME67 }}
-        DRIME68: ${{ secrets.DRIME68 }}
-        DRIME69: ${{ secrets.DRIME69 }}
-        DRIME70: ${{ secrets.DRIME70 }}
-        DRIME71: ${{ secrets.DRIME71 }}
-        DRIME72: ${{ secrets.DRIME72 }}
-        DRIME73: ${{ secrets.DRIME73 }}
-        DRIME74: ${{ secrets.DRIME74 }}
-        DRIME75: ${{ secrets.DRIME75 }}
-        DRIME76: ${{ secrets.DRIME76 }}
-        DRIME77: ${{ secrets.DRIME77 }}
-        DRIME78: ${{ secrets.DRIME78 }}
-        DRIME79: ${{ secrets.DRIME79 }}
-        DRIME80: ${{ secrets.DRIME80 }}
-        DRIME81: ${{ secrets.DRIME81 }}
-        DRIME82: ${{ secrets.DRIME82 }}
-        DRIME83: ${{ secrets.DRIME83 }}
-        DRIME84: ${{ secrets.DRIME84 }}
-        DRIME85: ${{ secrets.DRIME85 }}
-        DRIME86: ${{ secrets.DRIME86 }}
-        DRIME87: ${{ secrets.DRIME87 }}
-        DRIME88: ${{ secrets.DRIME88 }}
-        DRIME89: ${{ secrets.DRIME89 }}
-        DRIME90: ${{ secrets.DRIME90 }}
-        DRIME91: ${{ secrets.DRIME91 }}
-        DRIME92: ${{ secrets.DRIME92 }}
-        DRIME93: ${{ secrets.DRIME93 }}
-        DRIME94: ${{ secrets.DRIME94 }}
-        DRIME95: ${{ secrets.DRIME95 }}
-        DRIME96: ${{ secrets.DRIME96 }}
-        DRIME97: ${{ secrets.DRIME97 }}
-        DRIME98: ${{ secrets.DRIME98 }}
-        DRIME99: ${{ secrets.DRIME99 }}
       run: |
         sudo mkdir -p /run/drimelive; sudo chmod 777 /run/drimelive
         sudo -E python3 - <<'PY'
@@ -168,7 +119,6 @@ jobs:
       run: |
         REMOTE=$(cat /tmp/drime_remote)
         sudo mkdir -p /mnt/drime
-        # Read-only prevents FUSE lockups
         sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
           --vfs-cache-mode full \
           --vfs-cache-max-size 12G \
@@ -183,13 +133,22 @@ jobs:
         done
         echo "ERROR: vmdk not visible"; exit 1
 
-    - name: Create Local Overlay
+    - name: Create or Resume Local Overlay
       run: |
+        REMOTE=$(cat /tmp/drime_remote)
         BASE=$(ls /mnt/drime/*.vmdk | head -1)
-        # Overlay goes on the LOCAL disk (/tmp) to prevent FUSE write deadlocks
-        sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /tmp/overlay.qcow2
+        
+        # PERSISTENCE: If we have a saved overlay on Drime, download it and resume!
+        if rclone lsf "${REMOTE}:liveblock/" 2>/dev/null | grep -q "overlay.qcow2"; then
+          echo "Resuming previous session: downloading saved overlay from Drime..."
+          rclone copyto "${REMOTE}:liveblock/overlay.qcow2" /tmp/overlay.qcow2 --progress
+        else
+          echo "Fresh session: creating new local overlay..."
+          sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /tmp/overlay.qcow2
+        fi
         sudo chmod 666 /tmp/overlay.qcow2
-        echo "Local overlay created. Boot is guaranteed."
+        ls -lh /tmp/overlay.qcow2
+        echo "Overlay ready. Boot is guaranteed."
 
     - name: Boot VM + Show Terminal Logs + Native VNC
       run: |
@@ -203,12 +162,13 @@ jobs:
         echo "Boot logs will stream below:"
         echo "------------------------------------------"
         
-        # Start background sync to Drime
+        # Start background sync to Drime (Realtime-ish persistence)
         (
           while true; do
             sleep 10
             qemu-img convert -f qcow2 -O qcow2 /tmp/overlay.qcow2 /tmp/sync.qcow2 2>/dev/null
             rclone copyto /tmp/sync.qcow2 "${REMOTE}:liveblock/overlay.qcow2" --log-level ERROR 2>/dev/null
+            echo "[SYNC] Overlay pushed to Drime $(date +%T)"
           done
         ) &
 
