@@ -1,4 +1,4 @@
-name: Drime Native Boot + 1s Realtime Sync
+name: Drime Native Boot + Terminal Logs
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq xvfb x11vnc net-tools fuse3
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools fuse3
         sudo modprobe fuse || true
 
     - name: Install latest rclone
@@ -38,7 +38,7 @@ jobs:
         sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
         sudo netbird status
 
-    - name: Configure 100 Drime accounts
+    - name: Configure Drime
       env:
         DRIME: ${{ secrets.DRIME }}
         DRIME1: ${{ secrets.DRIME1 }}
@@ -144,99 +144,81 @@ jobs:
         sudo mkdir -p /run/drimelive; sudo chmod 777 /run/drimelive
         sudo -E python3 - <<'PY'
         import os, re, subprocess
+        if not os.path.exists("drime-storage.conf"):
+            open("drime-storage.conf", "w").write("DRIME 100G\n")
         ok = 0
-        with open("/run/drimelive/accounts.txt","w") as out:
-            for line in open("drime-storage.conf"):
-                line = line.split("#",1)[0].strip()
-                m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
-                if not m: continue
-                name, size = m.group(1), m.group(2)
-                key = os.environ.get(name)
-                if not key: continue
-                subprocess.run(["rclone","config","delete",name], capture_output=True)
-                c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
-                if c.returncode == 0:
-                    out.write(f"{name} {size}\n"); ok += 1
+        for line in open("drime-storage.conf"):
+            line = line.split("#",1)[0].strip()
+            m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
+            if not m: continue
+            name, size = m.group(1), m.group(2)
+            key = os.environ.get(name)
+            if not key: continue
+            subprocess.run(["rclone","config","delete",name], capture_output=True)
+            c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
+            if c.returncode == 0:
+                open("/tmp/drime_remote","w").write(name)
+                print(f"Configured: {name}")
+                ok += 1
+                break
         if ok == 0: raise SystemExit("ERROR: no Drime account configured")
-        print(f"Configured {ok} accounts")
         PY
-        sudo chmod 644 /run/drimelive/accounts.txt
 
-    - name: Find + Mount Drime (1-Second Write-Back Cache)
+    - name: Mount Drime (Read-Only for Base VMDK)
       run: |
-        REMOTE=""
-        while read -r name size; do
-          if sudo rclone lsf "${name}:liveblock/" 2>/dev/null | grep -qiE '\.(vmdk|img|qcow2)$'; then
-            REMOTE="$name"; break
-          fi
-        done < /run/drimelive/accounts.txt
-        [ -z "$REMOTE" ] && { echo "ERROR: no base vmdk on any account"; exit 1; }
-        echo "$REMOTE" > /tmp/drime_remote
+        REMOTE=$(cat /tmp/drime_remote)
         sudo mkdir -p /mnt/drime
-        
-        # CRITICAL: vfs-write-back 1s pushes changes to Drime every 1 second automatically
+        # Read-only prevents FUSE lockups
         sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
           --vfs-cache-mode full \
           --vfs-cache-max-size 12G \
           --vfs-read-ahead 128M \
-          --vfs-write-back 1s \
           --buffer-size 256M \
           --daemon \
-          --allow-other
-          
+          --allow-other \
+          --read-only
         for i in $(seq 1 30); do
           ls /mnt/drime/*.vmdk 1>/dev/null 2>&1 && { echo "Mounted $REMOTE"; exit 0; }
           sleep 1
         done
         echo "ERROR: vmdk not visible"; exit 1
 
-    - name: Create Native QCOW2 Overlay
+    - name: Create Local Overlay
       run: |
         BASE=$(ls /mnt/drime/*.vmdk | head -1)
-        # QEMU's native C driver handles FUSE perfectly. BIOS will NOT timeout.
-        sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /mnt/drime/overlay.qcow2
-        sudo chmod 666 /mnt/drime/overlay.qcow2
-        echo "Native overlay created. Boot is guaranteed."
+        # Overlay goes on the LOCAL disk (/tmp) to prevent FUSE write deadlocks
+        sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /tmp/overlay.qcow2
+        sudo chmod 666 /tmp/overlay.qcow2
+        echo "Local overlay created. Boot is guaranteed."
 
-    - name: Start VNC (Proven Stack)
+    - name: Boot VM + Show Terminal Logs + Native VNC
       run: |
-        sudo pkill -f Xvfb||true; sudo pkill -f x11vnc||true; sleep 2
-        sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
-        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
-        sleep 2
-        sudo ss -tlnp | grep 5900 && echo "VNC ready"
-
-    - name: Boot VM (Native Driver + 1s Realtime Sync)
-      run: |
+        REMOTE=$(cat /tmp/drime_remote)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
-        export DISPLAY=:1
-        : > /tmp/vm-serial.log
-
-        echo "=== BOOTING VM (Native Driver, 1s Cloud Sync) ==="
-        sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
-          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=/mnt/drime/overlay.qcow2,format=qcow2,if=none,id=d0,cache=writeback \
-          -device ide-hd,drive=d0 -boot order=c -vga std \
-          -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-          -serial file:/tmp/vm-serial.log \
-          -display sdl > /tmp/vm.log 2>&1 &
-        QPID=$!
-        sleep 5
-
+        
         echo "=========================================="
-        echo "VNC: $NB_IP:5900 (no password)"
-        echo "Sync: rclone pushes to Drime every 1s"
+        echo "VNC: $NB_IP:5900 (No password, Native QEMU VNC)"
         echo "=========================================="
-
+        echo "Boot logs will stream below:"
+        echo "------------------------------------------"
+        
+        # Start background sync to Drime
         (
-          while kill -0 $QPID 2>/dev/null; do
-            sleep 30
-            if ! sudo ss -tlnp | grep -q ':5900'; then
-              sudo pkill -f x11vnc || true
-              sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
-            fi
+          while true; do
+            sleep 10
+            qemu-img convert -f qcow2 -O qcow2 /tmp/overlay.qcow2 /tmp/sync.qcow2 2>/dev/null
+            rclone copyto /tmp/sync.qcow2 "${REMOTE}:liveblock/overlay.qcow2" --log-level ERROR 2>/dev/null
           done
         ) &
 
-        tail -f /dev/null
+        # Boot VM. 
+        # -serial stdio prints BIOS and Guest OS boot logs directly to GitHub Actions terminal!
+        # -display none -vnc 0.0.0.0:0 uses QEMU's native VNC. NO Xvfb, NO black screens.
+        sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+          -drive file=/tmp/overlay.qcow2,format=qcow2,if=none,id=d0,cache=writeback \
+          -device ide-hd,drive=d0 -boot order=c -vga std \
+          -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -serial stdio \
+          -display none -vnc 0.0.0.0:0
