@@ -1,4 +1,4 @@
-name: Drime Master VM (Persistent + Native VNC + Terminal Logs)
+name: DLIVE1 Live VM
 
 on:
   push:
@@ -21,8 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools fuse3
-        sudo modprobe fuse || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools
 
     - name: Install latest rclone
       run: |
@@ -35,150 +34,364 @@ jobs:
         echo "deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main" | sudo tee /etc/apt/sources.list.d/netbird.list
         sudo apt-get update -y
         sudo apt-get install -y netbird
-        sudo netbird up --setup-key CE303734-75C3-44DC-8E35-B533A858A900
+        sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}"
         sudo netbird status
 
-    - name: Configure Drime
+    - name: Configure Drime accounts
       env:
         DRIME: ${{ secrets.DRIME }}
-        DRIME1: ${{ secrets.DRIME1 }}
-        DRIME2: ${{ secrets.DRIME2 }}
-        DRIME3: ${{ secrets.DRIME3 }}
-        DRIME4: ${{ secrets.DRIME4 }}
-        DRIME5: ${{ secrets.DRIME5 }}
-        DRIME6: ${{ secrets.DRIME6 }}
-        DRIME7: ${{ secrets.DRIME7 }}
-        DRIME8: ${{ secrets.DRIME8 }}
-        DRIME9: ${{ secrets.DRIME9 }}
-        DRIME10: ${{ secrets.DRIME10 }}
-        DRIME11: ${{ secrets.DRIME11 }}
-        DRIME12: ${{ secrets.DRIME12 }}
-        DRIME13: ${{ secrets.DRIME13 }}
-        DRIME14: ${{ secrets.DRIME14 }}
-        DRIME15: ${{ secrets.DRIME15 }}
-        DRIME16: ${{ secrets.DRIME16 }}
-        DRIME17: ${{ secrets.DRIME17 }}
-        DRIME18: ${{ secrets.DRIME18 }}
-        DRIME19: ${{ secrets.DRIME19 }}
-        DRIME20: ${{ secrets.DRIME20 }}
-        DRIME21: ${{ secrets.DRIME21 }}
-        DRIME22: ${{ secrets.DRIME22 }}
-        DRIME23: ${{ secrets.DRIME23 }}
-        DRIME24: ${{ secrets.DRIME24 }}
-        DRIME25: ${{ secrets.DRIME25 }}
-        DRIME26: ${{ secrets.DRIME26 }}
-        DRIME27: ${{ secrets.DRIME27 }}
-        DRIME28: ${{ secrets.DRIME28 }}
-        DRIME29: ${{ secrets.DRIME29 }}
-        DRIME30: ${{ secrets.DRIME30 }}
-        DRIME31: ${{ secrets.DRIME31 }}
-        DRIME32: ${{ secrets.DRIME32 }}
-        DRIME33: ${{ secrets.DRIME33 }}
-        DRIME34: ${{ secrets.DRIME34 }}
-        DRIME35: ${{ secrets.DRIME35 }}
-        DRIME36: ${{ secrets.DRIME36 }}
-        DRIME37: ${{ secrets.DRIME37 }}
-        DRIME38: ${{ secrets.DRIME38 }}
-        DRIME39: ${{ secrets.DRIME39 }}
-        DRIME40: ${{ secrets.DRIME40 }}
-        DRIME41: ${{ secrets.DRIME41 }}
-        DRIME42: ${{ secrets.DRIME42 }}
-        DRIME43: ${{ secrets.DRIME43 }}
-        DRIME44: ${{ secrets.DRIME44 }}
-        DRIME45: ${{ secrets.DRIME45 }}
-        DRIME46: ${{ secrets.DRIME46 }}
-        DRIME47: ${{ secrets.DRIME47 }}
-        DRIME48: ${{ secrets.DRIME48 }}
-        DRIME49: ${{ secrets.DRIME49 }}
-        DRIME50: ${{ secrets.DRIME50 }}
+        DRIME_ACCOUNTS: ${{ secrets.DRIME_ACCOUNTS }}
+        ACCT_SIZE: "20G"
       run: |
-        sudo mkdir -p /run/drimelive; sudo chmod 777 /run/drimelive
-        sudo -E python3 - <<'PY'
+        python3 - <<'PY'
         import os, re, subprocess
-        if not os.path.exists("drime-storage.conf"):
-            open("drime-storage.conf", "w").write("DRIME 100G\n")
-        ok = 0
-        for line in open("drime-storage.conf"):
-            line = line.split("#",1)[0].strip()
-            m = re.match(r'^(DRIME[0-9]*)\s+(\S+)', line)
-            if not m: continue
-            name, size = m.group(1), m.group(2)
-            key = os.environ.get(name)
-            if not key: continue
-            subprocess.run(["rclone","config","delete",name], capture_output=True)
-            c = subprocess.run(["rclone","config","create",name,"drime","access_token="+key], capture_output=True)
-            if c.returncode == 0:
-                open("/tmp/drime_remote","w").write(name)
-                print(f"Configured: {name}")
-                ok += 1
-                break
-        if ok == 0: raise SystemExit("ERROR: no Drime account configured")
+        def parse_size(v):
+            v=(v or "20G").strip().upper()
+            m=re.match(r"^([0-9.]+)\s*([KMGTP]?)$",v)
+            if not m: return 20*1024**3
+            n=float(m.group(1)); u=m.group(2)
+            return int(n*{"":1,"K":1024,"M":1024**2,"G":1024**3,"T":1024**4,"P":1024**5}[u])
+        size=parse_size(os.environ.get("ACCT_SIZE"))
+        accounts=[]
+        d=os.environ.get("DRIME","")
+        if d: accounts.append(("DRIME", d))
+        batch=os.environ.get("DRIME_ACCOUNTS","") or ""
+        n=1
+        for line in batch.splitlines():
+            line=line.strip()
+            if not line: continue
+            parts=line.split()
+            if len(parts)>=2: name,tok=parts[0],parts[1]
+            else: name,tok=f"DRIME{n}",parts[0]; n+=1
+            accounts.append((name,tok))
+        if not accounts: raise SystemExit("ERROR: no Drime accounts")
+        with open("/tmp/dlive_accounts","w") as out:
+            for name,tok in accounts:
+                subprocess.run(["rclone","config","delete",name],capture_output=True)
+                c=subprocess.run(["rclone","config","create",name,"drime","access_token="+tok],capture_output=True)
+                if c.returncode==0:
+                    out.write(f"{name} {size}\n"); print("account ready:",name)
+                else:
+                    print("account FAILED:",name)
         PY
+        cat /tmp/dlive_accounts
 
-    - name: Mount Drime (Read-Only for Base VMDK)
+    - name: Write DLIVE1 engine
       run: |
-        REMOTE=$(cat /tmp/drime_remote)
-        sudo mkdir -p /mnt/drime
-        sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
-          --vfs-cache-mode full \
-          --vfs-cache-max-size 12G \
-          --vfs-read-ahead 128M \
-          --buffer-size 256M \
-          --daemon \
-          --allow-other \
-          --read-only
-        for i in $(seq 1 30); do
-          ls /mnt/drime/*.vmdk 1>/dev/null 2>&1 && { echo "Mounted $REMOTE"; exit 0; }
+        cat > dlive.py <<'PYEOF'
+        #!/usr/bin/env python3
+        # DLIVE1 - custom live block storage over Drime object storage
+        import os, json, zlib, socket, struct, threading, queue, subprocess, time, argparse
+        from pathlib import Path
+
+        B = 512 * 1024
+        NBD_MAGIC=b"NBDMAGIC"; IHAVEOPT=b"IHAVEOPT"
+        OPT_EXPORT=1; C_NO_ZEROES=2
+        REQ_MAGIC=0x25609513; REP_MAGIC=0x67446ab5
+        CMD_READ,CMD_WRITE,CMD_DISC,CMD_FLUSH,CMD_TRIM=0,1,2,3,4
+
+        def rc(*a, timeout=600):
+            return subprocess.run(["rclone"]+list(a), capture_output=True, timeout=timeout)
+
+        class Engine:
+            def __init__(s, accounts_file, cache):
+                s.cache=Path(cache); s.cache.mkdir(parents=True, exist_ok=True)
+                s.local=[]
+                for line in open(accounts_file):
+                    p=line.split()
+                    if len(p)>=2: s.local.append([p[0], int(p[1])])
+                s.anchor=s.local[0][0]
+                s.blk_locks={}; s.glock=threading.Lock()
+                s.stats={"hits":0,"miss":0,"up":0,"zero":0}
+                s.up_q=queue.Queue(); s.up_set=set(); s.upl=threading.Lock()
+                s.pf_q=queue.Queue(); s.pf_set=set(); s.pfl=threading.Lock()
+
+            def log(s,*a): print("[DLIVE]",*a,flush=True)
+
+            def load(s):
+                sb="/tmp/dlive_sb.json"
+                r=rc("copyto", f"{s.anchor}:dlive/superblock.json", sb, "--retries","1")
+                acc=None
+                if r.returncode==0 and os.path.exists(sb):
+                    try: acc=json.load(open(sb))
+                    except Exception: acc=None
+                if acc and acc.get("accounts"):
+                    s.accounts=acc["accounts"]
+                    names=[a[0] for a in s.accounts]
+                    for name,size in s.local:
+                        if name not in names:
+                            s.accounts.append([name,size]); s.log("added account",name)
+                    s.save_sb()
+                else:
+                    s.accounts=[[n,sz] for n,sz in s.local]
+                    s.save_sb()
+                s.ranges=[]; off=0
+                for name,size in s.accounts:
+                    nb=size//B
+                    s.ranges.append([name,off,off+nb]); off+=nb
+                s.size=off*B
+                s.log("accounts:",[a[0] for a in s.accounts],"total bytes:",s.size)
+                for i in range(4): threading.Thread(target=s._uploader,daemon=True).start()
+                for i in range(8): threading.Thread(target=s._prefetcher,daemon=True).start()
+                threading.Thread(target=s._stats,daemon=True).start()
+                threading.Thread(target=s.prewarm,daemon=True).start()
+
+            def save_sb(s):
+                sb="/tmp/dlive_sb.json"
+                json.dump({"magic":"DLIVE1","block":B,"accounts":s.accounts,"created":int(time.time())},open(sb,"w"))
+                rc("copyto", sb, f"{s.anchor}:dlive/superblock.json", "--retries","1")
+
+            def acct_for(s,cid):
+                for name,a,b in s.ranges:
+                    if a<=cid<b: return name, cid-a
+                return None,None
+
+            def raw(s,cid): return s.cache/f"{cid:08d}.blk"
+
+            def block_lock(s,cid):
+                with s.glock:
+                    l=s.blk_locks.get(cid)
+                    if not l: l=threading.Lock(); s.blk_locks[cid]=l
+                    return l
+
+            def fetch(s,cid):
+                name,lid=s.acct_for(cid)
+                if name is None: return None
+                tmp=str(s.raw(cid))+".dl"
+                r=rc("copyto", f"{name}:dlive/blocks/{lid:08d}.gz", tmp, "--retries","1")
+                data=None
+                if r.returncode==0 and os.path.exists(tmp):
+                    try: data=zlib.decompress(open(tmp,"rb").read())
+                    except Exception: data=None
+                    try: os.unlink(tmp)
+                    except Exception: pass
+                return data
+
+            def prewarm(s):
+                for cid in range(128):
+                    with s.pfl:
+                        if cid not in s.pf_set:
+                            s.pf_set.add(cid); s.pf_q.put(cid)
+                s.log("prewarm queued")
+
+            def _stats(s):
+                while True:
+                    time.sleep(30)
+                    s.log("stats",s.stats)
+
+            def _prefetcher(s):
+                while True:
+                    cid=s.pf_q.get()
+                    try:
+                        p=s.raw(cid)
+                        if not p.exists():
+                            data=s.fetch(cid)
+                            if data is not None:
+                                if len(data)<B: data+=b"\x00"*(B-len(data))
+                                with s.block_lock(cid): p.write_bytes(data)
+                    except Exception: pass
+                    finally:
+                        with s.pfl: s.pf_set.discard(cid)
+                        s.pf_q.task_done()
+
+            def read(s,cid):
+                p=s.raw(cid)
+                with s.block_lock(cid):
+                    if p.exists():
+                        s.stats["hits"]+=1
+                        return p.read_bytes()
+                s.stats["miss"]+=1
+                data=s.fetch(cid)
+                if data is None: data=b"\x00"*B
+                if len(data)<B: data+=b"\x00"*(B-len(data))
+                with s.block_lock(cid): p.write_bytes(data)
+                for a in range(1,17):
+                    c2=cid+a
+                    with s.pfl:
+                        if c2 not in s.pf_set:
+                            s.pf_set.add(c2); s.pf_q.put(c2)
+                return data
+
+            def pread(s,off,length):
+                out=bytearray(length); pos=0
+                while pos<length:
+                    o=off+pos; cid=o//B; co=o%B
+                    n=min(B-co,length-pos)
+                    b=s.read(cid)
+                    out[pos:pos+n]=b[co:co+n]; pos+=n
+                return bytes(out)
+
+            def _mark_dirty(s,cid):
+                with s.upl:
+                    if cid not in s.up_set:
+                        s.up_set.add(cid); s.up_q.put(cid)
+
+            def write(s,off,data):
+                pos=0; n=len(data)
+                while pos<n:
+                    o=off+pos; cid=o//B; co=o%B
+                    k=min(B-co,n-pos)
+                    with s.block_lock(cid):
+                        p=s.raw(cid)
+                        cur=p.read_bytes() if p.exists() else None
+                        if cur is None:
+                            cur=s.fetch(cid) or b"\x00"*B
+                        if len(cur)<B: cur+=b"\x00"*(B-len(cur))
+                        cur=bytearray(cur); cur[co:co+k]=data[pos:pos+k]
+                        p.write_bytes(bytes(cur))
+                    s._mark_dirty(cid)
+                    pos+=k
+
+            def _uploader(s):
+                while True:
+                    cid=s.up_q.get()
+                    batch=[cid]
+                    dl=time.time()+0.15
+                    while len(batch)<32:
+                        try: batch.append(s.up_q.get(timeout=max(0.01,dl-time.time())))
+                        except queue.Empty: break
+                    by={}
+                    for c in batch:
+                        p=s.raw(c)
+                        if not p.exists(): continue
+                        data=p.read_bytes()
+                        if not any(data):
+                            s.stats["zero"]+=1
+                            continue
+                        name,lid=s.acct_for(c)
+                        if name is None: continue
+                        by.setdefault(name,[]).append((lid,data))
+                    for name,items in by.items():
+                        stage=s.cache/f"st{threading.get_ident()}"
+                        stage.mkdir(exist_ok=True)
+                        for lid,data in items:
+                            open(stage/f"{lid:08d}.gz","wb").write(zlib.compress(data,1))
+                        rc("copy", str(stage), f"{name}:dlive/blocks/", "--transfers","16","--retries","1")
+                        for f in stage.glob("*"): f.unlink()
+                        s.stats["up"]+=len(items)
+                    with s.upl:
+                        for c in batch: s.up_set.discard(c)
+
+            def flush(s):
+                t0=time.time()
+                while time.time()-t0<30:
+                    with s.upl: busy=len(s.up_set)>0
+                    if not busy and s.up_q.empty(): break
+                    time.sleep(0.05)
+
+        def recv_exact(c,n):
+            b=b""
+            while len(b)<n:
+                k=c.recv(n-len(b))
+                if not k: return None
+                b+=k
+            return b
+
+        def client(s,c):
+            try:
+                c.sendall(NBD_MAGIC+IHAVEOPT+struct.pack(">H",3))
+                cf=struct.unpack(">I",recv_exact(c,4))[0]
+                noz=bool(cf&C_NO_ZEROES)
+                while True:
+                    h=recv_exact(c,16)
+                    if not h: return
+                    mg,opt,ol=struct.unpack(">QII",h)
+                    d=recv_exact(c,ol) if ol else b""
+                    if opt==OPT_EXPORT:
+                        tf=(1<<0)|(1<<2)|(1<<5)
+                        r=struct.pack(">QH",s.size,tf)
+                        if not noz: r+=b"\x00"*124
+                        c.sendall(r); break
+                    else:
+                        c.sendall(struct.pack(">QIII",0x3e889045565a9,opt,0x80000001,0))
+                while True:
+                    q=recv_exact(c,28)
+                    if not q: return
+                    mg,fl,cmd,hd,off,ln=struct.unpack(">IHHQQI",q)
+                    if mg!=REQ_MAGIC: return
+                    er=0
+                    if cmd==CMD_READ:
+                        try: pl=s.pread(off,ln)
+                        except Exception: er=5; pl=b"\x00"*ln
+                        c.sendall(struct.pack(">IIQ",REP_MAGIC,er,hd)+pl)
+                    elif cmd==CMD_WRITE:
+                        wd=recv_exact(c,ln)
+                        if wd is None: return
+                        try: s.write(off,wd)
+                        except Exception: er=5
+                        if fl&1: s.flush()
+                        c.sendall(struct.pack(">IIQ",REP_MAGIC,er,hd))
+                    elif cmd==CMD_FLUSH:
+                        s.flush(); c.sendall(struct.pack(">IIQ",REP_MAGIC,0,hd))
+                    elif cmd==CMD_TRIM:
+                        c.sendall(struct.pack(">IIQ",REP_MAGIC,0,hd))
+                    elif cmd==CMD_DISC:
+                        return
+                    else:
+                        c.sendall(struct.pack(">IIQ",REP_MAGIC,22,hd))
+            except Exception as e:
+                s.log("client err",e)
+            finally:
+                try: c.close()
+                except Exception: pass
+
+        def serve(s, sockpath):
+            try: os.unlink(sockpath)
+            except Exception: pass
+            srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            srv.bind(sockpath); os.chmod(sockpath,0o777); srv.listen(32)
+            s.log("nbd listening",sockpath)
+            while True:
+                c,_=srv.accept()
+                threading.Thread(target=client,args=(s,c),daemon=True).start()
+
+        if __name__=="__main__":
+            ap=argparse.ArgumentParser()
+            ap.add_argument("cmd")
+            ap.add_argument("--accounts",required=True)
+            ap.add_argument("--cache",required=True)
+            ap.add_argument("--sock",default="/run/dlive.sock")
+            a=ap.parse_args()
+            e=Engine(a.accounts,a.cache)
+            e.load()
+            serve(e,a.sock)
+        PYEOF
+        echo "DLIVE1 engine written"
+
+    - name: Start DLIVE1 engine
+      run: |
+        if df -P /mnt 2>/dev/null | awk 'NR==2{exit !($4>30000000)}'; then CACHE=/mnt/dlive; else CACHE=/var/lib/dlive; fi
+        sudo mkdir -p "$CACHE" /run
+        sudo bash -c "nohup python3 dlive.py serve --accounts /tmp/dlive_accounts --cache $CACHE --sock /run/dlive.sock > /var/log/dlive.log 2>&1 &"
+        for i in $(seq 1 90); do
+          [ -S /run/dlive.sock ] && { echo "DLIVE1 engine up"; cat /var/log/dlive.log; exit 0; }
           sleep 1
         done
-        echo "ERROR: vmdk not visible"; exit 1
+        cat /var/log/dlive.log; exit 1
 
-    - name: Create or Resume Local Overlay
+    - name: Download Ubuntu 26.04 LTS Server ISO
       run: |
-        REMOTE=$(cat /tmp/drime_remote)
-        BASE=$(ls /mnt/drime/*.vmdk | head -1)
-        
-        # PERSISTENCE: If we have a saved overlay on Drime, download it and resume!
-        if rclone lsf "${REMOTE}:liveblock/" 2>/dev/null | grep -q "overlay.qcow2"; then
-          echo "Resuming previous session: downloading saved overlay from Drime..."
-          rclone copyto "${REMOTE}:liveblock/overlay.qcow2" /tmp/overlay.qcow2 --progress
-        else
-          echo "Fresh session: creating new local overlay..."
-          sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /tmp/overlay.qcow2
-        fi
-        sudo chmod 666 /tmp/overlay.qcow2
-        ls -lh /tmp/overlay.qcow2
-        echo "Overlay ready. Boot is guaranteed."
+        URL1="https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso"
+        URL2="https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso"
+        wget -q --tries=2 -O /tmp/ubuntu.iso "$URL1" || wget -q --tries=2 -O /tmp/ubuntu.iso "$URL2" || { echo "ISO download failed"; exit 1; }
+        ls -lh /tmp/ubuntu.iso
 
-    - name: Boot VM + Show Terminal Logs + Native VNC
+    - name: Boot VM (manual install over VNC)
       run: |
-        REMOTE=$(cat /tmp/drime_remote)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
-        
-        echo "=========================================="
-        echo "VNC: $NB_IP:5900 (No password, Native QEMU VNC)"
-        echo "=========================================="
-        echo "Boot logs will stream below:"
-        echo "------------------------------------------"
-        
-        # Start background sync to Drime (Realtime-ish persistence)
-        (
-          while true; do
-            sleep 10
-            qemu-img convert -f qcow2 -O qcow2 /tmp/overlay.qcow2 /tmp/sync.qcow2 2>/dev/null
-            rclone copyto /tmp/sync.qcow2 "${REMOTE}:liveblock/overlay.qcow2" --log-level ERROR 2>/dev/null
-            echo "[SYNC] Overlay pushed to Drime $(date +%T)"
-          done
-        ) &
-
-        # Boot VM. 
-        # -serial stdio prints BIOS and Guest OS boot logs directly to GitHub Actions terminal!
-        # -display none -vnc 0.0.0.0:0 uses QEMU's native VNC. NO Xvfb, NO black screens.
+        echo "=================================================="
+        echo "VNC: $NB_IP:5900  (no password)"
+        echo "Install Ubuntu Server onto the 20GB DLIVE disk."
+        echo "After install + reboot it boots from DLIVE live."
+        echo "=================================================="
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=/tmp/overlay.qcow2,format=qcow2,if=none,id=d0,cache=writeback \
-          -device ide-hd,drive=d0 -boot order=c -vga std \
+          -drive file=nbd:unix:/run/dlive.sock,format=raw,if=none,id=d0,cache=writeback \
+          -device ide-hd,drive=d0 \
+          -cdrom /tmp/ubuntu.iso \
+          -boot order=cd \
+          -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial stdio \
           -display none -vnc 0.0.0.0:0
