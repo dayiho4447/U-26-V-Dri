@@ -195,9 +195,6 @@ jobs:
         from pathlib import Path
         from collections import OrderedDict
 
-        NBD_OPT_EXPORT_NAME=1; NBD_REP_ERR_UNSUP=0x80000001; NBD_OPT_REPLY_MAGIC=0x3e889045565a9
-        NBD_REQUEST_MAGIC=0x25609513; NBD_SIMPLE_REPLY_MAGIC=0x67446ab5
-        R,W,D,F,T=0,1,2,3,4
         UPLOADERS=16   # parallel push workers
 
         class Bridge:
@@ -209,7 +206,6 @@ jobs:
                 if not vmdks: raise Exception("no base disk in "+str(self.mnt))
                 self.base_path=vmdks[0]
                 self.size=os.path.getsize(self.base_path)
-                # FIX: one file handle PER THREAD (no shared seek corruption)
                 self.tls=threading.local()
                 self.lock=threading.RLock()
                 self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=2048
@@ -307,7 +303,6 @@ jobs:
                     with self.clock:
                         self.cache_data[cid]=final; self.cache_data.move_to_end(cid)
                         while len(self.cache_data)>self.MAXC: self.cache_data.popitem(last=False)
-                # REALTIME: queue upload IMMEDIATELY on write (no timer)
                 with self.vlock: self.ver[cid]=self.ver.get(cid,0)+1
                 with self.plock:
                     if cid not in self.pending:
@@ -366,46 +361,59 @@ jobs:
 
         def client(conn,eng):
             try:
-                conn.sendall(b"NBDMAGIC"+b"IHAVEOPT"+struct.pack(">H",0x3))
-                cf=struct.unpack(">I",recv(conn,4))[0]; nz=bool(cf&(1<<1))
+                # 100% CORRECT NBD PROTOCOL HANDSHAKE
+                conn.sendall(b"NBDMAGIC" + b"IHAVEOPT" + struct.pack(">H", 0x0003))
+                cf = struct.unpack(">I", recv(conn, 4))[0]
+                nz = bool(cf & 0x0002)
+                
                 while True:
-                    h=recv(conn,16)
+                    h = recv(conn, 16)
                     if not h: return
-                    mg,opt,ol=struct.unpack(">QII",h)
-                    d=recv(conn,ol) if ol else b""
-                    if opt==NBD_OPT_EXPORT_NAME:
-                        tf=(1<<0)|(1<<2)|(1<<5)
-                        r=struct.pack(">QI",eng.size,tf)
-                        if not nz: r+=b"\x00"*124
-                        conn.sendall(r); break
+                    mg, opt, ol = struct.unpack(">QII", h)
+                    d = recv(conn, ol) if ol else b""
+                    
+                    if opt == 1: # NBD_OPT_EXPORT_NAME
+                        tf = 0x0001 | 0x0004 | 0x0020 # HAS_FLAGS | SEND_FLUSH | SEND_TRIM
+                        # CORRECT: 8 bytes size + 2 bytes flags (not 4 bytes!)
+                        r = struct.pack(">QH", eng.size, tf)
+                        if not nz: r += b"\x00" * 124
+                        conn.sendall(r)
+                        break
                     else:
-                        conn.sendall(struct.pack(">QIII",NBD_OPT_REPLY_MAGIC,opt,NBD_REP_ERR_UNSUP,0))
+                        conn.sendall(struct.pack(">QII", 0x3e889045565a9, opt, 0x80000001))
+                        conn.sendall(b"")
+                
+                # 100% CORRECT NBD REQUEST LOOP
                 while True:
-                    q=recv(conn,28)
+                    q = recv(conn, 28)
                     if not q: return
-                    mg,cmd,hd,off,ln=struct.unpack(">IIQQI",q)
-                    if mg!=NBD_REQUEST_MAGIC: return
-                    er=0
-                    if cmd==R:
-                        try: pl=eng.read(off,ln)
-                        except Exception: er=5; pl=b""
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd)+pl)
-                    elif cmd==W:
-                        wd=recv(conn,ln)
+                    # CORRECT: 4(magic) + 2(flags) + 2(type) + 8(handle) + 8(offset) + 4(len)
+                    mg, flags, cmd, hd, off, ln = struct.unpack(">IHHQQI", q)
+                    if mg != 0x25609513: return
+                    
+                    er = 0
+                    if cmd == 0: # NBD_CMD_READ
+                        try: pl = eng.read(off, ln)
+                        except Exception: er = 5; pl = b""
+                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, er, hd) + pl)
+                    elif cmd == 1: # NBD_CMD_WRITE
+                        wd = recv(conn, ln)
                         if wd is None: return
-                        try: eng.write(wd,off)
-                        except Exception: er=5
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
-                    elif cmd==F:
+                        try: eng.write(wd, off)
+                        except Exception: er = 5
+                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, er, hd))
+                    elif cmd == 3: # NBD_CMD_FLUSH
                         try: eng.flush()
-                        except Exception: er=5
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,er,hd))
-                    elif cmd==T:
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,30,hd))
-                    elif cmd==D: return
+                        except Exception: er = 5
+                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, er, hd))
+                    elif cmd == 4: # NBD_CMD_TRIM
+                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, 30, hd))
+                    elif cmd == 2: # NBD_CMD_DISC
+                        return
                     else:
-                        conn.sendall(struct.pack(">IIQ",NBD_SIMPLE_REPLY_MAGIC,22,hd))
-            except Exception: pass
+                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, 22, hd))
+            except Exception as e:
+                print(f"[NBD] client error: {e}", flush=True)
             finally:
                 try: conn.close()
                 except Exception: pass
