@@ -71,12 +71,10 @@ jobs:
                 c=subprocess.run(["rclone","config","create",name,"drime","access_token="+tok],capture_output=True)
                 if c.returncode==0:
                     out.write(f"{name} {size}\n"); print("account ready:",name)
-                else:
-                    print("account FAILED:",name)
         PY
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 engine
+    - name: Write DLIVE1 engine (space-safe)
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -90,8 +88,9 @@ jobs:
         REQ_MAGIC=0x25609513; REP_MAGIC=0x67446ab5
         CMD_READ,CMD_WRITE,CMD_DISC,CMD_FLUSH,CMD_TRIM=0,1,2,3,4
 
-        def rc(*a, timeout=600):
-            return subprocess.run(["rclone"]+list(a), capture_output=True, timeout=timeout)
+        RC_FLAGS=["--retries","1","--low-level-retries","1","--contimeout","10s","--timeout","120s"]
+        def rc(*a, timeout=300):
+            return subprocess.run(["rclone"]+list(a)+RC_FLAGS, capture_output=True, timeout=timeout)
 
         class Engine:
             def __init__(s, accounts_file, cache):
@@ -102,7 +101,7 @@ jobs:
                     if len(p)>=2: s.local.append([p[0], int(p[1])])
                 s.anchor=s.local[0][0]
                 s.blk_locks={}; s.glock=threading.Lock()
-                s.stats={"hits":0,"miss":0,"up":0,"zero":0}
+                s.stats={"hits":0,"miss":0,"up":0,"zero":0,"evict":0,"retry":0}
                 s.up_q=queue.Queue(); s.up_set=set(); s.upl=threading.Lock()
                 s.pf_q=queue.Queue(); s.pf_set=set(); s.pfl=threading.Lock()
 
@@ -110,7 +109,7 @@ jobs:
 
             def load(s):
                 sb="/tmp/dlive_sb.json"
-                r=rc("copyto", f"{s.anchor}:dlive/superblock.json", sb, "--retries","1")
+                r=rc("copyto", f"{s.anchor}:dlive/superblock.json", sb)
                 acc=None
                 if r.returncode==0 and os.path.exists(sb):
                     try: acc=json.load(open(sb))
@@ -132,14 +131,14 @@ jobs:
                 s.size=off*B
                 s.log("accounts:",[a[0] for a in s.accounts],"total bytes:",s.size)
                 for i in range(4): threading.Thread(target=s._uploader,daemon=True).start()
-                for i in range(8): threading.Thread(target=s._prefetcher,daemon=True).start()
+                for i in range(6): threading.Thread(target=s._prefetcher,daemon=True).start()
                 threading.Thread(target=s._stats,daemon=True).start()
                 threading.Thread(target=s.prewarm,daemon=True).start()
 
             def save_sb(s):
                 sb="/tmp/dlive_sb.json"
                 json.dump({"magic":"DLIVE1","block":B,"accounts":s.accounts,"created":int(time.time())},open(sb,"w"))
-                rc("copyto", sb, f"{s.anchor}:dlive/superblock.json", "--retries","1")
+                rc("copyto", sb, f"{s.anchor}:dlive/superblock.json")
 
             def acct_for(s,cid):
                 for name,a,b in s.ranges:
@@ -154,11 +153,38 @@ jobs:
                     if not l: l=threading.Lock(); s.blk_locks[cid]=l
                     return l
 
+            def evict(s):
+                try:
+                    files=sorted(s.cache.glob("*.blk"), key=lambda p:p.stat().st_mtime)
+                    n=0
+                    for f in files:
+                        if n>=256: break
+                        cid=int(f.stem)
+                        with s.block_lock(cid):
+                            if cid not in s.up_set:
+                                try: f.unlink(); n+=1
+                                except Exception: pass
+                    s.stats["evict"]+=n
+                except Exception: pass
+
+            def cache_write(s,cid,data):
+                p=s.raw(cid)
+                with s.block_lock(cid):
+                    try:
+                        p.write_bytes(data)
+                    except OSError:
+                        s.evict()
+                        try: p.write_bytes(data)
+                        except OSError: pass
+
             def fetch(s,cid):
                 name,lid=s.acct_for(cid)
                 if name is None: return None
                 tmp=str(s.raw(cid))+".dl"
-                r=rc("copyto", f"{name}:dlive/blocks/{lid:08d}.gz", tmp, "--retries","1")
+                try:
+                    r=rc("copyto", f"{name}:dlive/blocks/{lid:08d}.gz", tmp)
+                except Exception:
+                    return None
                 data=None
                 if r.returncode==0 and os.path.exists(tmp):
                     try: data=zlib.decompress(open(tmp,"rb").read())
@@ -188,7 +214,7 @@ jobs:
                             data=s.fetch(cid)
                             if data is not None:
                                 if len(data)<B: data+=b"\x00"*(B-len(data))
-                                with s.block_lock(cid): p.write_bytes(data)
+                                s.cache_write(cid,data)
                     except Exception: pass
                     finally:
                         with s.pfl: s.pf_set.discard(cid)
@@ -204,7 +230,7 @@ jobs:
                 data=s.fetch(cid)
                 if data is None: data=b"\x00"*B
                 if len(data)<B: data+=b"\x00"*(B-len(data))
-                with s.block_lock(cid): p.write_bytes(data)
+                s.cache_write(cid,data)
                 for a in range(1,17):
                     c2=cid+a
                     with s.pfl:
@@ -233,12 +259,15 @@ jobs:
                     k=min(B-co,n-pos)
                     with s.block_lock(cid):
                         p=s.raw(cid)
-                        cur=p.read_bytes() if p.exists() else None
+                        cur=None
+                        if p.exists():
+                            try: cur=p.read_bytes()
+                            except Exception: cur=None
                         if cur is None:
                             cur=s.fetch(cid) or b"\x00"*B
                         if len(cur)<B: cur+=b"\x00"*(B-len(cur))
                         cur=bytearray(cur); cur[co:co+k]=data[pos:pos+k]
-                        p.write_bytes(bytes(cur))
+                        s.cache_write(cid,bytes(cur))
                     s._mark_dirty(cid)
                     pos+=k
 
@@ -261,14 +290,26 @@ jobs:
                         name,lid=s.acct_for(c)
                         if name is None: continue
                         by.setdefault(name,[]).append((lid,data))
+                    failed=[]
                     for name,items in by.items():
                         stage=s.cache/f"st{threading.get_ident()}"
                         stage.mkdir(exist_ok=True)
                         for lid,data in items:
                             open(stage/f"{lid:08d}.gz","wb").write(zlib.compress(data,1))
-                        rc("copy", str(stage), f"{name}:dlive/blocks/", "--transfers","16","--retries","1")
+                        r=rc("copy", str(stage), f"{name}:dlive/blocks/", "--transfers","16")
                         for f in stage.glob("*"): f.unlink()
-                        s.stats["up"]+=len(items)
+                        if r.returncode==0: s.stats["up"]+=len(items)
+                        else:
+                            s.stats["retry"]+=1
+                            for lid,data in items:
+                                failed.append(lid)  # local ids; map back below
+                            # requeue by global cid
+                            base=None
+                            for nm,a,b in s.ranges:
+                                if nm==name: base=a; break
+                            if base is not None:
+                                for lid in failed:
+                                    s._mark_dirty(base+lid)
                     with s.upl:
                         for c in batch: s.up_set.discard(c)
 
@@ -312,13 +353,15 @@ jobs:
                     er=0
                     if cmd==CMD_READ:
                         try: pl=s.pread(off,ln)
-                        except Exception: er=5; pl=b"\x00"*ln
+                        except Exception as e:
+                            s.log("read err",e); er=5; pl=b"\x00"*ln
                         c.sendall(struct.pack(">IIQ",REP_MAGIC,er,hd)+pl)
                     elif cmd==CMD_WRITE:
                         wd=recv_exact(c,ln)
                         if wd is None: return
                         try: s.write(off,wd)
-                        except Exception: er=5
+                        except Exception as e:
+                            s.log("write err",e); er=5
                         if fl&1: s.flush()
                         c.sendall(struct.pack(">IIQ",REP_MAGIC,er,hd))
                     elif cmd==CMD_FLUSH:
@@ -358,38 +401,42 @@ jobs:
         PYEOF
         echo "DLIVE1 engine written"
 
-    - name: Start DLIVE1 engine
+    - name: Start DLIVE1 engine (big-disk cache)
       run: |
         if df -P /mnt 2>/dev/null | awk 'NR==2{exit !($4>30000000)}'; then CACHE=/mnt/dlive; else CACHE=/var/lib/dlive; fi
         sudo mkdir -p "$CACHE" /run
+        echo "$CACHE" > /tmp/dlive_cache
         sudo bash -c "nohup python3 dlive.py serve --accounts /tmp/dlive_accounts --cache $CACHE --sock /run/dlive.sock > /var/log/dlive.log 2>&1 &"
         for i in $(seq 1 90); do
-          [ -S /run/dlive.sock ] && { echo "DLIVE1 engine up"; cat /var/log/dlive.log; exit 0; }
+          [ -S /run/dlive.sock ] && { echo "DLIVE1 engine up (cache=$CACHE)"; cat /var/log/dlive.log; exit 0; }
           sleep 1
         done
         cat /var/log/dlive.log; exit 1
 
-    - name: Download Ubuntu 26.04 LTS Server ISO
+    - name: Download Ubuntu 26.04 LTS Server ISO (to big disk)
       run: |
+        CACHE=$(cat /tmp/dlive_cache)
+        ISO="$CACHE/ubuntu.iso"
         URL1="https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso"
         URL2="https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso"
-        wget -q --tries=2 -O /tmp/ubuntu.iso "$URL1" || wget -q --tries=2 -O /tmp/ubuntu.iso "$URL2" || { echo "ISO download failed"; exit 1; }
-        ls -lh /tmp/ubuntu.iso
+        wget -q --tries=2 -O "$ISO" "$URL1" || wget -q --tries=2 -O "$ISO" "$URL2" || { echo "ISO download failed"; exit 1; }
+        echo "$ISO" > /tmp/dlive_iso
+        ls -lh "$ISO"
 
     - name: Boot VM (manual install over VNC)
       run: |
+        ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
         echo "=================================================="
         echo "VNC: $NB_IP:5900  (no password)"
-        echo "Install Ubuntu Server onto the 20GB DLIVE disk."
-        echo "After install + reboot it boots from DLIVE live."
+        echo "Install: entire disk, NO LVM. Then finish + reboot."
         echo "=================================================="
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -drive file=nbd:unix:/run/dlive.sock,format=raw,if=none,id=d0,cache=writeback \
           -device ide-hd,drive=d0 \
-          -cdrom /tmp/ubuntu.iso \
+          -cdrom "$ISO" \
           -boot order=cd \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
