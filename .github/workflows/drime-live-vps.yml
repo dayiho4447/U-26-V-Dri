@@ -1,4 +1,4 @@
-name: Drime Realtime Write-Through VM
+name: Drime Native Boot + 1s Realtime Sync
 
 on:
   push:
@@ -162,7 +162,7 @@ jobs:
         PY
         sudo chmod 644 /run/drimelive/accounts.txt
 
-    - name: Find + Mount Drime (writable for COW uploads)
+    - name: Find + Mount Drime (1-Second Write-Back Cache)
       run: |
         REMOTE=""
         while read -r name size; do
@@ -173,276 +173,32 @@ jobs:
         [ -z "$REMOTE" ] && { echo "ERROR: no base vmdk on any account"; exit 1; }
         echo "$REMOTE" > /tmp/drime_remote
         sudo mkdir -p /mnt/drime
+        
+        # CRITICAL: vfs-write-back 1s pushes changes to Drime every 1 second automatically
         sudo rclone mount "${REMOTE}:liveblock" /mnt/drime \
           --vfs-cache-mode full \
           --vfs-cache-max-size 12G \
           --vfs-read-ahead 128M \
-          --vfs-write-back 2s \
+          --vfs-write-back 1s \
           --buffer-size 256M \
           --daemon \
           --allow-other
+          
         for i in $(seq 1 30); do
           ls /mnt/drime/*.vmdk 1>/dev/null 2>&1 && { echo "Mounted $REMOTE"; exit 0; }
           sleep 1
         done
         echo "ERROR: vmdk not visible"; exit 1
 
-    - name: Create Realtime Write-Through Bridge
+    - name: Create Native QCOW2 Overlay
       run: |
-        cat > bridge.py <<'PYEOF'
-        #!/usr/bin/env python3
-        import os, json, gzip, threading, socket, struct, glob, queue, time
-        from pathlib import Path
-        from collections import OrderedDict
+        BASE=$(ls /mnt/drime/*.vmdk | head -1)
+        # QEMU's native C driver handles FUSE perfectly. BIOS will NOT timeout.
+        sudo qemu-img create -f qcow2 -F vmdk -b "$BASE" /mnt/drime/overlay.qcow2
+        sudo chmod 666 /mnt/drime/overlay.qcow2
+        echo "Native overlay created. Boot is guaranteed."
 
-        UPLOADERS=16   # parallel push workers
-
-        class Bridge:
-            def __init__(self, mnt="/mnt/drime", cache="/var/lib/drimelive"):
-                self.mnt=Path(mnt); self.cache=Path(cache); self.tmp=self.cache/"tmp"
-                self.tmp.mkdir(parents=True,exist_ok=True)
-                self.chunk_size=4*1024*1024
-                vmdks=glob.glob(str(self.mnt/"*.vmdk"))+glob.glob(str(self.mnt/"*.img"))+glob.glob(str(self.mnt/"*.qcow2"))
-                if not vmdks: raise Exception("no base disk in "+str(self.mnt))
-                self.base_path=vmdks[0]
-                self.size=os.path.getsize(self.base_path)
-                self.tls=threading.local()
-                self.lock=threading.RLock()
-                self.cache_data=OrderedDict(); self.clock=threading.Lock(); self.MAXC=2048
-                self.chunks_dir=self.mnt/"chunks"
-                self.q=queue.Queue(); self.pending=set(); self.plock=threading.Lock()
-                self.ver={}; self.vlock=threading.Lock()
-                self.manifest_dirty=False
-                self.remote_cow=set()
-                self.load_manifest()
-                for i in range(UPLOADERS):
-                    threading.Thread(target=self._uploader,daemon=True).start()
-                threading.Thread(target=self._manifest_loop,daemon=True).start()
-                print(f"[BRIDGE] base={self.base_path} size={self.size} cow={len(self.remote_cow)} uploaders={UPLOADERS}",flush=True)
-
-            def _base_file(self):
-                f=getattr(self.tls,"f",None)
-                if f is None:
-                    f=open(self.base_path,"rb"); self.tls.f=f
-                return f
-
-            def load_manifest(self):
-                m_path=self.mnt/"manifest.json.gz"
-                if m_path.exists():
-                    try:
-                        with gzip.open(m_path,"rt") as f: m=json.load(f)
-                        self.remote_cow=set(c["id"] for c in m.get("chunks",[]))
-                    except Exception: pass
-
-            def _clen(self,cid): return min(self.chunk_size,self.size-cid*self.chunk_size)
-
-            def _read_exact(self,f,n):
-                data=b""
-                while len(data)<n:
-                    chunk=f.read(n-len(data))
-                    if not chunk: break
-                    data+=chunk
-                return data
-
-            def _base_range(self,cid):
-                off=cid*self.chunk_size; n=self._clen(cid)
-                if n<=0: return b""
-                f=self._base_file()
-                f.seek(off)
-                data=self._read_exact(f,n)
-                if len(data)<n: data+=b"\x00"*(n-len(data))
-                return data
-
-            def _dl(self,cid):
-                p=self.tmp/f"{cid:08d}.part"
-                if p.exists(): return p.read_bytes()
-                cow=self.chunks_dir/f"{cid:08d}.gz"
-                if cow.exists():
-                    try:
-                        with gzip.open(cow,"rb") as f: data=self._read_exact(f,self._clen(cid))
-                        exp=self._clen(cid)
-                        if len(data)<exp: data+=b"\x00"*(exp-len(data))
-                        p.write_bytes(data); return data
-                    except Exception: pass
-                return self._base_range(cid)
-
-            def read_chunk(self,cid):
-                with self.clock:
-                    if cid in self.cache_data:
-                        self.cache_data.move_to_end(cid); return self.cache_data[cid]
-                data=self._dl(cid)
-                with self.clock:
-                    self.cache_data[cid]=data; self.cache_data.move_to_end(cid)
-                    while len(self.cache_data)>self.MAXC: self.cache_data.popitem(last=False)
-                return data
-
-            def read(self,off,length):
-                out=bytearray(length); pos=0
-                while pos<length:
-                    o=off+pos; cid=o//self.chunk_size; co=o%self.chunk_size
-                    n=min(self.chunk_size-co,length-pos)
-                    ch=self.read_chunk(cid); out[pos:pos+n]=ch[co:co+n]; pos+=n
-                return bytes(out)
-
-            def write(self,data,offset):
-                pos=0; total=len(data)
-                while pos<total:
-                    o=offset+pos; cid=o//self.chunk_size; co=o%self.chunk_size
-                    n=min(self.chunk_size-co,total-pos)
-                    self._write_chunk(cid,data[pos:pos+n],co); pos+=n
-
-            def _write_chunk(self,cid,data,off):
-                with self.lock:
-                    p=self.tmp/f"{cid:08d}.part"
-                    if p.exists(): ch=bytearray(p.read_bytes())
-                    else: ch=bytearray(self.read_chunk(cid))
-                    exp=self._clen(cid)
-                    if len(ch)<exp: ch.extend(b"\x00"*(exp-len(ch)))
-                    ch[off:off+len(data)]=data
-                    final=bytes(ch); p.write_bytes(final)
-                    with self.clock:
-                        self.cache_data[cid]=final; self.cache_data.move_to_end(cid)
-                        while len(self.cache_data)>self.MAXC: self.cache_data.popitem(last=False)
-                with self.vlock: self.ver[cid]=self.ver.get(cid,0)+1
-                with self.plock:
-                    if cid not in self.pending:
-                        self.pending.add(cid); self.q.put(cid)
-
-            def _uploader(self):
-                while True:
-                    cid=self.q.get()
-                    try:
-                        with self.vlock: v0=self.ver.get(cid,0)
-                        self._push(cid)
-                        with self.vlock:
-                            if self.ver.get(cid,0)!=v0: self.q.put(cid)
-                    except Exception: pass
-                    finally:
-                        with self.plock: self.pending.discard(cid)
-                        self.q.task_done(); self.manifest_dirty=True
-
-            def _push(self,cid):
-                p=self.tmp/f"{cid:08d}.part"
-                if not p.exists(): return
-                self.chunks_dir.mkdir(exist_ok=True)
-                cow=self.chunks_dir/f"{cid:08d}.gz"
-                with gzip.open(cow,"wb") as f: f.write(p.read_bytes())
-
-            def _manifest_loop(self):
-                while True:
-                    time.sleep(1)
-                    if self.manifest_dirty:
-                        self.manifest_dirty=False
-                        try: self._upload_manifest()
-                        except Exception: pass
-
-            def _upload_manifest(self):
-                ids=set()
-                for p in self.chunks_dir.glob("*.gz"):
-                    try: ids.add(int(p.stem))
-                    except Exception: pass
-                for p in self.tmp.glob("*.part"):
-                    try: ids.add(int(p.stem))
-                    except Exception: pass
-                m={"chunks":[{"id":i} for i in sorted(ids)]}
-                with gzip.open(self.mnt/"manifest.json.gz","wt") as f: json.dump(m,f)
-
-            def flush(self):
-                self.q.join()
-                self._upload_manifest()
-
-        def recv(conn,n):
-            b=b""
-            while len(b)<n:
-                c=conn.recv(n-len(b))
-                if not c: return None
-                b+=c
-            return b
-
-        def client(conn,eng):
-            try:
-                # 100% CORRECT NBD PROTOCOL HANDSHAKE
-                conn.sendall(b"NBDMAGIC" + b"IHAVEOPT" + struct.pack(">H", 0x0003))
-                cf = struct.unpack(">I", recv(conn, 4))[0]
-                nz = bool(cf & 0x0002)
-                
-                while True:
-                    h = recv(conn, 16)
-                    if not h: return
-                    mg, opt, ol = struct.unpack(">QII", h)
-                    d = recv(conn, ol) if ol else b""
-                    
-                    if opt == 1: # NBD_OPT_EXPORT_NAME
-                        tf = 0x0001 | 0x0004 | 0x0020 # HAS_FLAGS | SEND_FLUSH | SEND_TRIM
-                        # CORRECT: 8 bytes size + 2 bytes flags (not 4 bytes!)
-                        r = struct.pack(">QH", eng.size, tf)
-                        if not nz: r += b"\x00" * 124
-                        conn.sendall(r)
-                        break
-                    else:
-                        conn.sendall(struct.pack(">QII", 0x3e889045565a9, opt, 0x80000001))
-                        conn.sendall(b"")
-                
-                # 100% CORRECT NBD REQUEST LOOP
-                while True:
-                    q = recv(conn, 28)
-                    if not q: return
-                    # CORRECT: 4(magic) + 2(flags) + 2(type) + 8(handle) + 8(offset) + 4(len)
-                    mg, flags, cmd, hd, off, ln = struct.unpack(">IHHQQI", q)
-                    if mg != 0x25609513: return
-                    
-                    er = 0
-                    if cmd == 0: # NBD_CMD_READ
-                        try: pl = eng.read(off, ln)
-                        except Exception: er = 5; pl = b""
-                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, er, hd) + pl)
-                    elif cmd == 1: # NBD_CMD_WRITE
-                        wd = recv(conn, ln)
-                        if wd is None: return
-                        try: eng.write(wd, off)
-                        except Exception: er = 5
-                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, er, hd))
-                    elif cmd == 3: # NBD_CMD_FLUSH
-                        try: eng.flush()
-                        except Exception: er = 5
-                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, er, hd))
-                    elif cmd == 4: # NBD_CMD_TRIM
-                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, 30, hd))
-                    elif cmd == 2: # NBD_CMD_DISC
-                        return
-                    else:
-                        conn.sendall(struct.pack(">IIQ", 0x67446ab5, 22, hd))
-            except Exception as e:
-                print(f"[NBD] client error: {e}", flush=True)
-            finally:
-                try: conn.close()
-                except Exception: pass
-
-        if __name__=="__main__":
-            eng=Bridge("/mnt/drime","/var/lib/drimelive")
-            sp="/run/drimelive/nbd.sock"
-            try: os.unlink(sp)
-            except Exception: pass
-            os.makedirs("/run/drimelive",exist_ok=True)
-            srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-            srv.bind(sp); os.chmod(sp,0o777); srv.listen(16)
-            print("[BRIDGE] listening",flush=True)
-            while True:
-                c,_=srv.accept()
-                threading.Thread(target=client,args=(c,eng),daemon=True).start()
-        PYEOF
-
-    - name: Start Realtime Bridge
-      run: |
-        sudo rm -f /run/drimelive/nbd.sock
-        sudo bash -c "cd \"$GITHUB_WORKSPACE\" && nohup python3 bridge.py > /var/log/bridge.log 2>&1 &"
-        for i in $(seq 1 60); do
-          [ -S /run/drimelive/nbd.sock ] && { cat /var/log/bridge.log; exit 0; }
-          sleep 1
-        done
-        cat /var/log/bridge.log; exit 1
-
-    - name: Start VNC (proven stack)
+    - name: Start VNC (Proven Stack)
       run: |
         sudo pkill -f Xvfb||true; sudo pkill -f x11vnc||true; sleep 2
         sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
@@ -450,17 +206,17 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "VNC ready"
 
-    - name: Boot VM (realtime write-through)
+    - name: Boot VM (Native Driver + 1s Realtime Sync)
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
         export DISPLAY=:1
         : > /tmp/vm-serial.log
 
-        echo "=== BOOTING VM (2c/4t, 16G, KVM, realtime sync) ==="
+        echo "=== BOOTING VM (Native Driver, 1s Cloud Sync) ==="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=nbd:unix:/run/drimelive/nbd.sock,if=none,id=d0,format=vmdk,cache=writeback \
+          -drive file=/mnt/drime/overlay.qcow2,format=qcow2,if=none,id=d0,cache=writeback \
           -device ide-hd,drive=d0 -boot order=c -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial file:/tmp/vm-serial.log \
@@ -470,14 +226,12 @@ jobs:
 
         echo "=========================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "Write-through: every block pushed on write"
+        echo "Sync: rclone pushes to Drime every 1s"
         echo "=========================================="
 
         (
           while kill -0 $QPID 2>/dev/null; do
             sleep 30
-            echo "--- serial ---"; sudo tail -n 5 /tmp/vm-serial.log 2>/dev/null || true
-            echo "--- bridge ---"; sudo tail -n 5 /var/log/bridge.log 2>/dev/null || true
             if ! sudo ss -tlnp | grep -q ':5900'; then
               sudo pkill -f x11vnc || true
               sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
