@@ -37,7 +37,7 @@ jobs:
         sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}" || { echo "NetBird failed"; exit 1; }
         sudo netbird status
 
-    - name: Configure Drime accounts (bulletproof)
+    - name: Configure Drime accounts
       env:
         DRIME: ${{ secrets.DRIME }}
         DRIME_ACCOUNTS: ${{ secrets.DRIME_ACCOUNTS }}
@@ -46,13 +46,9 @@ jobs:
         python3 - <<'PY'
         import os, re, subprocess, sys
         accounts = []
-        
-        # Primary account
         d = os.environ.get("DRIME", "").strip()
         if d:
             accounts.append(("DRIME", d, 20*1024**3))
-        
-        # Batch accounts
         batch = os.environ.get("DRIME_ACCOUNTS", "") or ""
         for i, line in enumerate(batch.splitlines(), 1):
             line = line.strip()
@@ -68,11 +64,9 @@ jobs:
                 tok = parts[0]
                 size = 20*1024**3
             accounts.append((name, tok, size))
-        
         if not accounts:
             print("ERROR: No Drime accounts configured!", file=sys.stderr)
             sys.exit(1)
-        
         with open("/tmp/dlive_accounts", "w") as out:
             for name, tok, size in accounts:
                 subprocess.run(["rclone", "config", "delete", name], capture_output=True)
@@ -82,10 +76,8 @@ jobs:
                     print(f"✓ Account configured: {name} ({size//1024**3}GB)")
                 else:
                     print(f"✗ Account FAILED: {name}", file=sys.stderr)
-        
         print(f"\nTotal accounts: {len(accounts)}")
         PY
-        
         if [ ! -s /tmp/dlive_accounts ]; then
           echo "FATAL: accounts file is empty"
           exit 1
@@ -96,20 +88,12 @@ jobs:
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
-        """
-        DLIVE1 Enterprise Storage Engine
-        - Write-Ahead Log (WAL) for crash safety
-        - Block-level checksums
-        - Atomic metadata updates
-        - Health monitoring
-        - Proper error recovery
-        """
         import os, json, zlib, socket, struct, threading, queue, subprocess, time, argparse, hashlib, sys
         from pathlib import Path
         from collections import defaultdict
 
         VERSION = "1.0"
-        B = 512 * 1024  # 512KB blocks
+        B = 512 * 1024
         NBD_MAGIC = b"NBDMAGIC"
         IHAVEOPT = b"IHAVEOPT"
         OPT_EXPORT = 1
@@ -134,41 +118,27 @@ jobs:
             def __init__(self):
                 self.lock = threading.Lock()
                 self.counters = defaultdict(int)
-            
             def inc(self, name, n=1):
-                with self.lock:
-                    self.counters[name] += n
-            
+                with self.lock: self.counters[name] += n
             def report(self):
-                with self.lock:
-                    return dict(self.counters)
+                with self.lock: return dict(self.counters)
 
         class WAL:
-            """Write-Ahead Log for crash-safe operations"""
             def __init__(self, cache_dir):
                 self.wal_dir = Path(cache_dir) / "wal"
                 self.wal_dir.mkdir(parents=True, exist_ok=True)
                 self.lock = threading.Lock()
                 self.seq = 0
-            
             def append(self, op_type, cid, data):
                 with self.lock:
                     self.seq += 1
-                    entry = {
-                        "seq": self.seq,
-                        "op": op_type,
-                        "cid": cid,
-                        "checksum": checksum(data),
-                        "size": len(data)
-                    }
+                    entry = {"seq": self.seq, "op": op_type, "cid": cid, "checksum": checksum(data), "size": len(data)}
                     wal_file = self.wal_dir / f"{self.seq:08d}.wal"
                     with open(wal_file, "wb") as f:
                         f.write(json.dumps(entry).encode() + b"\n")
                         f.write(data)
                     return self.seq
-            
             def replay(self):
-                """Replay uncommitted WAL entries on startup"""
                 ops = []
                 for wal_file in sorted(self.wal_dir.glob("*.wal")):
                     try:
@@ -181,16 +151,12 @@ jobs:
                     except Exception as e:
                         print(f"[WAL] replay error: {e}", flush=True)
                 return ops
-            
             def cleanup(self, seq):
-                """Remove WAL entries up to seq"""
                 for wal_file in self.wal_dir.glob("*.wal"):
                     try:
                         s = int(wal_file.stem)
-                        if s <= seq:
-                            wal_file.unlink()
-                    except Exception:
-                        pass
+                        if s <= seq: wal_file.unlink()
+                    except Exception: pass
 
         class Engine:
             def __init__(self, accounts_file, cache):
@@ -198,53 +164,35 @@ jobs:
                 self.cache.mkdir(parents=True, exist_ok=True)
                 self.blocks_dir = self.cache / "blocks"
                 self.blocks_dir.mkdir(exist_ok=True)
-                
-                # Load accounts
                 self.accounts = []
                 for line in open(accounts_file):
                     parts = line.split()
-                    if len(parts) >= 2:
-                        self.accounts.append([parts[0], int(parts[1])])
-                
-                if not self.accounts:
-                    raise RuntimeError("No accounts loaded")
-                
+                    if len(parts) >= 2: self.accounts.append([parts[0], int(parts[1])])
+                if not self.accounts: raise RuntimeError("No accounts loaded")
                 self.anchor = self.accounts[0][0]
                 self.wal = WAL(self.cache)
                 self.metrics = Metrics()
-                
-                # Block locks (fine-grained)
                 self.blk_locks = {}
                 self.glock = threading.Lock()
-                
-                # Upload queue
                 self.up_q = queue.Queue()
                 self.up_set = set()
                 self.up_lock = threading.Lock()
-                
-                # Prefetch queue
                 self.pf_q = queue.Queue()
                 self.pf_set = set()
                 self.pf_lock = threading.Lock()
-                
                 self.running = True
 
-            def log(self, *args):
-                print(f"[DLIVE]", *args, flush=True)
+            def log(self, *args): print(f"[DLIVE]", *args, flush=True)
 
             def block_lock(self, cid):
                 with self.glock:
-                    if cid not in self.blk_locks:
-                        self.blk_locks[cid] = threading.Lock()
+                    if cid not in self.blk_locks: self.blk_locks[cid] = threading.Lock()
                     return self.blk_locks[cid]
 
             def load(self):
                 self.log("Initializing storage engine...")
-                
-                # Try to load superblock
                 sb_path = self.cache / "superblock.json"
                 r = rc("copyto", f"{self.anchor}:dlive/v1/superblock.json", str(sb_path))
-                
                 if r.returncode == 0 and sb_path.exists():
                     try:
                         sb = json.load(open(sb_path))
@@ -256,8 +204,6 @@ jobs:
                 else:
                     self.log("Creating new disk...")
                     self._create_superblock()
-                
-                # Calculate ranges
                 self.ranges = []
                 off = 0
                 for name, size in self.accounts:
@@ -266,36 +212,21 @@ jobs:
                     off += nb
                 self.size = off * B
                 self.log(f"Disk size: {self.size // 1024**3}GB ({off} blocks)")
-                
-                # Replay WAL for crash recovery
                 ops = self.wal.replay()
                 if ops:
                     self.log(f"Replaying {len(ops)} WAL entries...")
-                    for cid, data in ops:
-                        self._write_block_local(cid, data)
+                    for cid, data in ops: self._write_block_local(cid, data)
                     self.log("WAL replay complete")
-                
-                # Start worker threads
-                for i in range(4):
-                    threading.Thread(target=self._uploader, daemon=True).start()
-                for i in range(8):
-                    threading.Thread(target=self._prefetcher, daemon=True).start()
+                for i in range(4): threading.Thread(target=self._uploader, daemon=True).start()
+                for i in range(8): threading.Thread(target=self._prefetcher, daemon=True).start()
                 threading.Thread(target=self._health_monitor, daemon=True).start()
                 threading.Thread(target=self._prewarm, daemon=True).start()
-                
                 self.log("Engine ready")
 
             def _create_superblock(self):
-                sb = {
-                    "version": VERSION,
-                    "magic": "DLIVE1",
-                    "block_size": B,
-                    "accounts": self.accounts,
-                    "created": int(time.time())
-                }
+                sb = {"version": VERSION, "magic": "DLIVE1", "block_size": B, "accounts": self.accounts, "created": int(time.time())}
                 sb_path = self.cache / "superblock.json"
-                with open(sb_path, "w") as f:
-                    json.dump(sb, f, indent=2)
+                with open(sb_path, "w") as f: json.dump(sb, f, indent=2)
                 rc("copyto", str(sb_path), f"{self.anchor}:dlive/v1/superblock.json")
 
             def _health_monitor(self):
@@ -303,50 +234,40 @@ jobs:
                     time.sleep(30)
                     m = self.metrics.report()
                     self.log(f"Health: {m}")
-                    # Check disk space
                     try:
                         st = os.statvfs(self.cache)
                         free_gb = (st.f_bavail * st.f_frsize) / 1024**3
                         if free_gb < 1:
                             self.log("WARNING: Low disk space, evicting...")
                             self._evict(1024)
-                    except Exception:
-                        pass
+                    except Exception: pass
 
             def _evict(self, count):
-                """Evict clean blocks to free space"""
                 files = sorted(self.blocks_dir.glob("*.blk"), key=lambda p: p.stat().st_mtime)
                 evicted = 0
                 for f in files:
-                    if evicted >= count:
-                        break
+                    if evicted >= count: break
                     try:
                         cid = int(f.stem)
                         with self.block_lock(cid):
                             if cid not in self.up_set:
                                 f.unlink()
                                 evicted += 1
-                    except Exception:
-                        pass
+                    except Exception: pass
                 self.metrics.inc("evict", evicted)
 
             def acct_for(self, cid):
                 for name, start, end in self.ranges:
-                    if start <= cid < end:
-                        return name, cid - start
+                    if start <= cid < end: return name, cid - start
                 return None, None
 
-            def block_path(self, cid):
-                return self.blocks_dir / f"{cid:08d}.blk"
+            def block_path(self, cid): return self.blocks_dir / f"{cid:08d}.blk"
 
             def _fetch_block(self, cid):
                 name, lid = self.acct_for(cid)
-                if name is None:
-                    return None
-                
+                if name is None: return None
                 tmp = str(self.block_path(cid)) + ".tmp"
                 r = rc("copyto", f"{name}:dlive/v1/blocks/{lid:08d}.gz", tmp)
-                
                 if r.returncode == 0 and os.path.exists(tmp):
                     try:
                         data = zlib.decompress(open(tmp, "rb").read())
@@ -359,21 +280,16 @@ jobs:
                 return None
 
             def _write_block_local(self, cid, data):
-                """Write block to local cache"""
                 path = self.block_path(cid)
                 with self.block_lock(cid):
-                    try:
-                        path.write_bytes(data)
+                    try: path.write_bytes(data)
                     except OSError:
                         self._evict(256)
-                        try:
-                            path.write_bytes(data)
-                        except OSError as e:
-                            self.log(f"FATAL: Cannot write block: {e}")
+                        try: path.write_bytes(data)
+                        except OSError as e: self.log(f"FATAL: Cannot write block: {e}")
 
             def _prewarm(self):
-                """Preload boot-critical blocks"""
-                for cid in range(256):  # First 128MB
+                for cid in range(256):
                     with self.pf_lock:
                         if cid not in self.pf_set:
                             self.pf_set.add(cid)
@@ -388,15 +304,12 @@ jobs:
                         if not path.exists():
                             data = self._fetch_block(cid)
                             if data is not None:
-                                if len(data) < B:
-                                    data += b"\x00" * (B - len(data))
+                                if len(data) < B: data += b"\x00" * (B - len(data))
                                 self._write_block_local(cid, data)
                                 self.metrics.inc("prefetch")
-                    except Exception as e:
-                        self.log(f"Prefetch error: {e}")
+                    except Exception as e: self.log(f"Prefetch error: {e}")
                     finally:
-                        with self.pf_lock:
-                            self.pf_set.discard(cid)
+                        with self.pf_lock: self.pf_set.discard(cid)
                         self.pf_q.task_done()
 
             def read(self, off, length):
@@ -407,8 +320,6 @@ jobs:
                     cid = o // B
                     co = o % B
                     n = min(B - co, length - pos)
-                    
-                    # Read block
                     path = self.block_path(cid)
                     with self.block_lock(cid):
                         if path.exists():
@@ -416,24 +327,18 @@ jobs:
                             self.metrics.inc("cache_hit")
                         else:
                             data = self._fetch_block(cid)
-                            if data is None:
-                                data = b"\x00" * B
-                            if len(data) < B:
-                                data += b"\x00" * (B - len(data))
+                            if data is None: data = b"\x00" * B
+                            if len(data) < B: data += b"\x00" * (B - len(data))
                             self._write_block_local(cid, data)
                             self.metrics.inc("cache_miss")
-                    
                     out[pos:pos+n] = data[co:co+n]
                     pos += n
-                    
-                    # Prefetch ahead
                     for a in range(1, 32):
                         c2 = cid + a
                         with self.pf_lock:
                             if c2 not in self.pf_set:
                                 self.pf_set.add(c2)
                                 self.pf_q.put(c2)
-                
                 return bytes(out)
 
             def write(self, off, data):
@@ -444,33 +349,19 @@ jobs:
                     cid = o // B
                     co = o % B
                     k = min(B - co, n - pos)
-                    
-                    # WAL first (crash safety)
                     with self.block_lock(cid):
                         path = self.block_path(cid)
-                        if path.exists():
-                            cur = bytearray(path.read_bytes())
-                        else:
-                            cur = bytearray(self._fetch_block(cid) or (b"\x00" * B))
-                        
-                        if len(cur) < B:
-                            cur.extend(b"\x00" * (B - len(cur)))
-                        
+                        if path.exists(): cur = bytearray(path.read_bytes())
+                        else: cur = bytearray(self._fetch_block(cid) or (b"\x00" * B))
+                        if len(cur) < B: cur.extend(b"\x00" * (B - len(cur)))
                         cur[co:co+k] = data[pos:pos+k]
                         new_data = bytes(cur)
-                        
-                        # Write to WAL
                         self.wal.append("write", cid, new_data)
-                        
-                        # Write to cache
                         self._write_block_local(cid, new_data)
-                        
-                        # Queue for upload
                         with self.up_lock:
                             if cid not in self.up_set:
                                 self.up_set.add(cid)
                                 self.up_q.put(cid)
-                    
                     pos += k
                 self.metrics.inc("write_bytes", n)
 
@@ -479,50 +370,32 @@ jobs:
                     cid = self.up_q.get()
                     batch = [cid]
                     deadline = time.time() + 0.15
-                    
-                    # Micro-batch up to 32 blocks
                     while len(batch) < 32:
-                        try:
-                            batch.append(self.up_q.get(timeout=max(0.01, deadline - time.time())))
-                        except queue.Empty:
-                            break
-                    
-                    # Group by account
+                        try: batch.append(self.up_q.get(timeout=max(0.01, deadline - time.time())))
+                        except queue.Empty: break
                     by_acct = defaultdict(list)
                     for c in batch:
                         path = self.block_path(c)
-                        if not path.exists():
-                            continue
+                        if not path.exists(): continue
                         data = path.read_bytes()
-                        if not any(data):  # Skip zero blocks
+                        if not any(data):
                             self.metrics.inc("skip_zero")
                             continue
                         name, lid = self.acct_for(c)
-                        if name:
-                            by_acct[name].append((lid, data))
-                    
-                    # Upload each account's blocks
+                        if name: by_acct[name].append((lid, data))
                     for name, items in by_acct.items():
                         stage = self.cache / f"stage_{threading.get_ident()}"
                         stage.mkdir(exist_ok=True)
-                        
                         for lid, data in items:
                             gz_path = stage / f"{lid:08d}.gz"
-                            with open(gz_path, "wb") as f:
-                                f.write(zlib.compress(data, 1))
-                        
+                            with open(gz_path, "wb") as f: f.write(zlib.compress(data, 1))
                         r = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", "16")
-                        
-                        # Cleanup stage
                         for f in stage.glob("*"):
                             try: f.unlink()
                             except: pass
-                        
-                        if r.returncode == 0:
-                            self.metrics.inc("upload_success", len(items))
+                        if r.returncode == 0: self.metrics.inc("upload_success", len(items))
                         else:
                             self.metrics.inc("upload_fail")
-                            # Requeue failed blocks
                             for lid, _ in items:
                                 for nm, start, end in self.ranges:
                                     if nm == name:
@@ -530,20 +403,16 @@ jobs:
                                             self.up_set.add(start + lid)
                                             self.up_q.put(start + lid)
                                         break
-                    
-                    # Cleanup WAL
                     with self.up_lock:
-                        for c in batch:
-                            self.up_set.discard(c)
+                        for c in batch: self.up_set.discard(c)
 
             def flush(self):
                 t0 = time.time()
                 while time.time() - t0 < 30:
                     with self.up_lock:
-                        if not self.up_set and self.up_q.empty():
-                            break
+                        if not self.up_set and self.up_q.empty(): break
                     time.sleep(0.05)
-                self.wal.cleanup(999999999)  # Clean all WAL after flush
+                self.wal.cleanup(999999999)
 
             def shutdown(self):
                 self.running = False
@@ -553,8 +422,7 @@ jobs:
             b = b""
             while len(b) < n:
                 k = c.recv(n - len(b))
-                if not k:
-                    return None
+                if not k: return None
                 b += k
             return b
 
@@ -563,102 +431,74 @@ jobs:
                 conn.sendall(NBD_MAGIC + IHAVEOPT + struct.pack(">H", 3))
                 cf = struct.unpack(">I", recv_exact(conn, 4))[0]
                 noz = bool(cf & C_NO_ZEROES)
-                
                 while True:
                     h = recv_exact(conn, 16)
-                    if not h:
-                        return
+                    if not h: return
                     mg, opt, ol = struct.unpack(">QII", h)
                     d = recv_exact(conn, ol) if ol else b""
-                    
                     if opt == OPT_EXPORT:
                         tf = (1 << 0) | (1 << 2) | (1 << 5)
                         r = struct.pack(">QH", eng.size, tf)
-                        if not noz:
-                            r += b"\x00" * 124
+                        if not noz: r += b"\x00" * 124
                         conn.sendall(r)
                         break
                     else:
                         conn.sendall(struct.pack(">QIII", 0x3e889045565a9, opt, 0x80000001, 0))
-                
                 while True:
                     q = recv_exact(conn, 28)
-                    if not q:
-                        return
+                    if not q: return
                     mg, fl, cmd, hd, off, ln = struct.unpack(">IHHQQI", q)
-                    if mg != REQ_MAGIC:
-                        return
-                    
+                    if mg != REQ_MAGIC: return
                     er = 0
                     if cmd == CMD_READ:
-                        try:
-                            pl = eng.read(off, ln)
+                        try: pl = eng.read(off, ln)
                         except Exception as e:
                             eng.log(f"Read error: {e}")
                             er = 5
                             pl = b"\x00" * ln
                         conn.sendall(struct.pack(">IIQ", REP_MAGIC, er, hd) + pl)
-                    
                     elif cmd == CMD_WRITE:
                         wd = recv_exact(conn, ln)
-                        if wd is None:
-                            return
-                        try:
-                            eng.write(off, wd)
+                        if wd is None: return
+                        try: eng.write(off, wd)
                         except Exception as e:
                             eng.log(f"Write error: {e}")
                             er = 5
-                        if fl & 1:
-                            eng.flush()
+                        if fl & 1: eng.flush()
                         conn.sendall(struct.pack(">IIQ", REP_MAGIC, er, hd))
-                    
                     elif cmd == CMD_FLUSH:
                         eng.flush()
                         conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, hd))
-                    
                     elif cmd == CMD_TRIM:
                         conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, hd))
-                    
-                    elif cmd == CMD_DISC:
-                        return
-                    
-                    else:
-                        conn.sendall(struct.pack(">IIQ", REP_MAGIC, 22, hd))
-            
-            except Exception as e:
-                eng.log(f"Client error: {e}")
+                    elif cmd == CMD_DISC: return
+                    else: conn.sendall(struct.pack(">IIQ", REP_MAGIC, 22, hd))
+            except Exception as e: eng.log(f"Client error: {e}")
             finally:
-                try:
-                    conn.close()
-                except:
-                    pass
+                try: conn.close()
+                except: pass
 
         def serve(eng, sockpath):
-            try:
-                os.unlink(sockpath)
-            except:
-                pass
+            try: os.unlink(sockpath)
+            except: pass
             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             srv.bind(sockpath)
             os.chmod(sockpath, 0o777)
             srv.listen(32)
             eng.log(f"NBD listening on {sockpath}")
-            
             try:
                 while eng.running:
                     c, _ = srv.accept()
                     threading.Thread(target=client, args=(eng, c), daemon=True).start()
-            finally:
-                eng.shutdown()
+            finally: eng.shutdown()
 
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
             ap.add_argument("cmd")
             ap.add_argument("--accounts", required=True)
             ap.add_argument("--cache", required=True)
-            ap.add_argument("--sock", default="/run/dlive.sock")
+            ap.add_argument("--sock", default="/tmp/dlive.sock")
             a = ap.parse_args()
-            
             try:
                 e = Engine(a.accounts, a.cache)
                 e.load()
@@ -676,28 +516,29 @@ jobs:
         if df -P /mnt 2>/dev/null | awk 'NR==2{exit !($4>30000000)}'; then
           CACHE=/mnt/dlive
         fi
-        sudo mkdir -p "$CACHE" /run
+        sudo mkdir -p "$CACHE"
+        sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
         
-        sudo nohup python3 -u dlive.py serve --accounts /tmp/dlive_accounts --cache "$CACHE" --sock /run/dlive.sock > /var/log/dlive.log 2>&1 &
+        nohup python3 -u dlive.py serve --accounts /tmp/dlive_accounts --cache "$CACHE" --sock /tmp/dlive.sock > /tmp/dlive.log 2>&1 &
         PID=$!
         
         for i in $(seq 1 90); do
-          if [ -S /run/dlive.sock ]; then
+          if [ -S /tmp/dlive.sock ]; then
             echo "✓ Engine started (cache=$CACHE)"
-            cat /var/log/dlive.log
+            cat /tmp/dlive.log
             exit 0
           fi
           if ! kill -0 $PID 2>/dev/null; then
             echo "✗ Engine crashed"
-            cat /var/log/dlive.log
+            cat /tmp/dlive.log
             exit 1
           fi
           sleep 1
         done
         
         echo "✗ Engine timeout"
-        cat /var/log/dlive.log
+        cat /tmp/dlive.log
         exit 1
 
     - name: Download Ubuntu 26.04 LTS Server ISO
@@ -723,7 +564,7 @@ jobs:
         
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file=nbd:unix:/run/dlive.sock,format=raw,if=none,id=d0,cache=writeback \
+          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback \
           -device ide-hd,drive=d0 \
           -cdrom "$ISO" \
           -boot order=cd \
