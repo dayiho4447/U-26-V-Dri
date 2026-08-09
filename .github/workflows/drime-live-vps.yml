@@ -87,7 +87,7 @@ jobs:
           echo "Clean skipped — will restore existing disk"
         fi
 
-    - name: Write DLIVE1 engine
+    - name: Write DLIVE1 engine (full implementation)
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -97,7 +97,7 @@ jobs:
         from collections import defaultdict
 
         VERSION = "1.0"
-        B = 512 * 1024
+        B = 512 * 1024  # 512KB blocks
         RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "180s"]
 
         def rc(*args, timeout=600):
@@ -119,6 +119,7 @@ jobs:
                 s.blk_locks = {}; s.glock = threading.Lock()
                 s.up_q = queue.Queue(); s.up_set = set(); s.up_lock = threading.Lock()
                 s.running = True
+                s.stats = {"uploaded": 0, "skipped": 0, "changed": 0}
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
@@ -226,7 +227,11 @@ jobs:
                         for f in stage.glob("*"):
                             try: f.unlink()
                             except Exception: pass
-                        if r.returncode != 0:
+                        if r.returncode == 0:
+                            s.stats["uploaded"] += len(items)
+                            if len(items) > 0:
+                                s.log(f"Uploaded {len(items)} blocks to {name}")
+                        else:
                             base = next((a for nm, a, b in s.ranges if nm == name), None)
                             if base is not None:
                                 for lid, _ in items:
@@ -254,15 +259,37 @@ jobs:
                 return changed
 
             def cycle(s, overlay):
-                r = subprocess.run(["qemu-img", "map", "--output=json", overlay], capture_output=True, timeout=120)
-                extents = json.loads(r.stdout)
+                # Direct scan - reads overlay file directly, more reliable than qemu-img map
                 pushed = 0
-                for ex in extents:
-                    if not ex.get("data") or ex.get("zero"): continue
-                    if overlay not in ex.get("filename", ""): continue
+                total_blocks = s.size // B
+                
+                try:
                     with open(overlay, "rb") as f:
-                        f.seek(ex["offset"]); d = f.read(ex["length"])
-                    pushed += s.write_changed(ex["start"], d)
+                        for cid in range(total_blocks):
+                            f.seek(cid * B)
+                            d = f.read(B)
+                            if len(d) == B and any(d):  # non-zero block
+                                # Check if already cached and identical
+                                p = s.block_path(cid)
+                                if p.exists():
+                                    cur = p.read_bytes()
+                                    if cur == d:
+                                        s.stats["skipped"] += 1
+                                        continue  # skip unchanged blocks
+                                
+                                # Mark as changed and queue for upload
+                                s._write_block_local(cid, d)
+                                with s.up_lock:
+                                    if cid not in s.up_set:
+                                        s.up_set.add(cid)
+                                        s.up_q.put(cid)
+                                pushed += 1
+                                s.stats["changed"] += 1
+                                if pushed % 100 == 0:
+                                    s.log(f"cycle: {pushed} blocks queued, {s.stats['uploaded']} uploaded, {s.stats['skipped']} skipped")
+                except Exception as e:
+                    s.log(f"cycle scan error: {e}")
+                
                 return pushed
 
             def livepush(s, overlay, interval):
@@ -290,6 +317,7 @@ jobs:
                     with s.up_lock:
                         if not s.up_set and s.up_q.empty(): break
                     time.sleep(0.1)
+                s.log(f"Final stats: uploaded={s.stats['uploaded']}, skipped={s.stats['skipped']}, changed={s.stats['changed']}")
 
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
@@ -359,11 +387,13 @@ jobs:
         python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --interval 1 > /tmp/livepush.log 2>&1 &
         PUSH_PID=$!
         echo "✓ livepush daemon started (event-driven, 1s fallback)"
+        echo "Monitor progress: tail -f /tmp/livepush.log"
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
         echo "First boot = Ubuntu installer. Reboots = your disk."
         echo "Install: entire disk, NO LVM."
+        echo "Drime will show increasing usage as blocks upload."
         echo "=================================================="
 
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
