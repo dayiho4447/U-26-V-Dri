@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools xdotool
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc xdotool inotify-tools
 
     - name: Install latest rclone
       run: |
@@ -70,27 +70,43 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 engine (MAX SPEED: 0.05s write-through)
+    - name: Start rclone rc daemon (zero-spawn uploads)
+      run: |
+        set +e
+        nohup rclone rcd --rc-addr 127.0.0.1:5572 --rc-no-auth \
+          --transfers 32 --checkers 32 --retries 2 --low-level-retries 2 \
+          --contimeout 10s --timeout 120s > /tmp/rcd.log 2>&1 &
+        for i in $(seq 1 30); do
+          curl -s -m 2 http://127.0.0.1:5572/rc/noop >/dev/null && { echo "✓ rclone rcd up"; exit 0; }
+          sleep 1
+        done
+        echo "⚠ rcd not up, will fall back to subprocess"; cat /tmp/rcd.log
+
+    - name: Write DLIVE1 engine (MAX speed)
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, json, zlib, subprocess, time, argparse, hashlib, sys, threading, queue, select
+        import os, json, zlib, subprocess, time, argparse, hashlib, sys, threading, queue, select, http.client
         from pathlib import Path
         from collections import defaultdict
 
-        VERSION = "2.0"
-        B = 256 * 1024          # 256KB blocks = faster individual uploads
-        DEBOUNCE = 0.05         # push 50ms after last write event
-        POLL = 0.5              # safety poll
-        UPLOADERS = 8           # parallel uploader threads
-        TRANSFERS = "32"        # parallel rclone transfers per batch
+        VERSION = "1.0"
+        B = 512 * 1024
         RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "10s", "--timeout", "120s"]
 
-        def rc(*args, timeout=300):
+        def rc(*args, timeout=600):
             try: return subprocess.run(["rclone"] + list(args) + RC_FLAGS, capture_output=True, timeout=timeout)
             except Exception as e:
                 print(f"[RC ERROR] {e}", flush=True)
                 return subprocess.CompletedProcess(args, 1, b"", str(e).encode())
+
+        def rc_http(op, params, timeout=300):
+            conn = http.client.HTTPConnection("127.0.0.1", 5572, timeout=timeout)
+            conn.request("POST", "/" + op, body=json.dumps(params), headers={"Content-Type": "application/json"})
+            resp = conn.getresponse(); data = resp.read(); conn.close()
+            if resp.status != 200:
+                raise RuntimeError(f"rc {op} -> {resp.status}: {data[:200]}")
+            return json.loads(data) if data else {}
 
         class Engine:
             def __init__(s, accounts_file, cache):
@@ -116,22 +132,19 @@ jobs:
             def load(s):
                 sb = s.cache / "superblock.json"
                 r = rc("copyto", f"{s.anchor}:dlive/v1/superblock.json", str(sb))
-                ok = False
                 if r.returncode == 0 and sb.exists():
                     try:
-                        j = json.load(open(sb))
-                        if j.get("block_size") == B:
-                            s.accounts = j["accounts"]; ok = True
-                            s.log(f"Loaded existing disk: {len(s.accounts)} accounts")
-                        else:
-                            s.log("Old block size on Drime, recreating disk")
-                    except Exception: pass
-                if not ok: s._create_superblock()
+                        s.accounts = json.load(open(sb))["accounts"]
+                        s.log(f"Loaded existing disk: {len(s.accounts)} accounts")
+                    except Exception:
+                        s._create_superblock()
+                else:
+                    s.log("Creating new disk..."); s._create_superblock()
                 s.ranges = []; off = 0
                 for name, size in s.accounts:
                     nb = size // B; s.ranges.append((name, off, off + nb)); off += nb
                 s.size = off * B
-                s.log(f"Disk size: {s.size // 1024**3}GB ({off} blocks of {B//1024}KB)")
+                s.log(f"Disk size: {s.size // 1024**3}GB ({off} blocks)")
 
             def _create_superblock(s):
                 sb = {"version": VERSION, "magic": "DLIVE1", "block_size": B, "accounts": s.accounts, "created": int(time.time())}
@@ -149,8 +162,13 @@ jobs:
                 name, lid = s.acct_for(cid)
                 if name is None: return None
                 tmp = str(s.block_path(cid)) + ".tmp"
-                r = rc("copyto", f"{name}:dlive/v1/blocks/{lid:08d}.gz", tmp)
-                if r.returncode == 0 and os.path.exists(tmp):
+                ok = False
+                try:
+                    rc_http("operations/copyfile", {"srcFs": f"{name}:dlive/v1/blocks", "srcRemote": f"{lid:08d}.gz", "dstFs": "", "dstRemote": tmp})
+                    ok = os.path.exists(tmp)
+                except Exception:
+                    ok = rc("copyto", f"{name}:dlive/v1/blocks/{lid:08d}.gz", tmp).returncode == 0 and os.path.exists(tmp)
+                if ok:
                     try:
                         d = zlib.decompress(open(tmp, "rb").read()); os.unlink(tmp); return d
                     except Exception:
@@ -165,12 +183,20 @@ jobs:
             def remote_cids(s):
                 cids = []
                 for name, s0, e0 in s.ranges:
-                    r = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
-                    if r.returncode != 0: continue
-                    for ln in r.stdout.decode().split():
-                        if ln.endswith(".gz"):
-                            try: cids.append(s0 + int(ln.split(".")[0]))
-                            except Exception: pass
+                    try:
+                        r = rc_http("operations/list", {"fs": f"{name}:dlive/v1/blocks"})
+                        for item in r.get("list", []):
+                            n = item.get("Name", "")
+                            if n.endswith(".gz"):
+                                try: cids.append(s0 + int(n.split(".")[0]))
+                                except Exception: pass
+                    except Exception:
+                        rr = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
+                        if rr.returncode == 0:
+                            for ln in rr.stdout.decode().split():
+                                if ln.endswith(".gz"):
+                                    try: cids.append(s0 + int(ln.split(".")[0]))
+                                    except Exception: pass
                 return cids
 
             def restore(s, out):
@@ -186,16 +212,16 @@ jobs:
                     if any(d): os.pwrite(fd, d, cid * B)
                     s._write_block_local(cid, d)
                     done += 1
-                    if done % 512 == 0: s.log(f"restored {done}/{len(ids)}")
+                    if done % 256 == 0: s.log(f"restored {done}/{len(ids)}")
                 os.close(fd)
                 s.log(f"Restore complete: {done} blocks")
 
             def start_uploaders(s):
-                for i in range(UPLOADERS): threading.Thread(target=s._uploader, daemon=True).start()
+                for i in range(8): threading.Thread(target=s._uploader, daemon=True).start()
 
             def _uploader(s):
                 while s.running:
-                    cid = s.up_q.get(); batch = [cid]; dl = time.time() + DEBOUNCE
+                    cid = s.up_q.get(); batch = [cid]; dl = time.time() + 0.05
                     while len(batch) < 64:
                         try: batch.append(s.up_q.get(timeout=max(0.005, dl - time.time())))
                         except queue.Empty: break
@@ -211,11 +237,16 @@ jobs:
                         stage = s.cache / f"stage_{threading.get_ident()}"; stage.mkdir(exist_ok=True)
                         for lid, d in items:
                             open(stage / f"{lid:08d}.gz", "wb").write(zlib.compress(d, 1))
-                        r = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", TRANSFERS)
-                        if r.returncode == 0:
-                            s.log(f"UPLOADED {len(items)} blocks -> {name}")
+                        ok = False
+                        try:
+                            rc_http("sync/copy", {"srcFs": str(stage), "dstFs": f"{name}:dlive/v1/blocks", "_config": {"Transfers": 32}})
+                            ok = True
+                        except Exception:
+                            ok = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", "32").returncode == 0
+                        if ok:
+                            s.log(f"UPLOADED {len(items)} blocks to {name}")
                         else:
-                            s.log(f"UPLOAD FAILED {name}: {r.stderr.decode()[:150]}")
+                            s.log(f"UPLOAD FAILED {name}")
                             base = next((a for nm, a, b in s.ranges if nm == name), None)
                             if base is not None:
                                 for lid, _ in items:
@@ -250,42 +281,43 @@ jobs:
                 try:
                     r = subprocess.run(["qemu-img", "map", "-U", "--output=json", overlay], capture_output=True, timeout=120)
                     if r.returncode != 0:
-                        s.log(f"map FAILED: {r.stderr.decode()[:200]}"); return 0
-                    pushed = 0; ov = 0
-                    for ex in json.loads(r.stdout):
-                        if not ex.get("data") or ex.get("zero"): continue
-                        fn = ex.get("filename", "")
-                        if not fn or "base.raw" in fn: continue
-                        ov += 1
+                        s.log(f"map FAILED: {r.stderr.decode()[:300]}")
+                        return 0
+                    ext = json.loads(r.stdout)
+                    ov = [ex for ex in ext if ex.get("data") and not ex.get("zero")
+                          and ex.get("filename", "") and "base.raw" not in ex.get("filename", "")]
+                    pushed = 0
+                    for ex in ov:
                         with open(overlay, "rb") as f:
                             f.seek(ex["offset"]); d = f.read(ex["length"])
                         pushed += s.write_changed(ex["start"], d)
-                    if pushed: s.log(f"push: {ov} overlay extents, {pushed} changed blocks queued")
+                    if pushed: s.log(f"pushed {pushed} changed blocks")
                     return pushed
                 except Exception as e:
-                    s.log(f"push ERROR: {e}"); return 0
+                    s.log(f"push ERROR: {e}")
+                    return 0
 
-            def livepush(s, overlay):
+            def livepush(s, overlay, interval, debounce):
                 s.start_uploaders()
-                s.log(f"MAX-SPEED livepush: debounce={DEBOUNCE}s poll={POLL}s uploaders={UPLOADERS}")
+                s.log(f"livepush MAX: reaction=10ms debounce={debounce}s fallback={interval}s")
                 last_poll = time.time(); dirty = False; due = 0.0; stdin_ok = True
                 while s.running:
                     rlist = []
                     if stdin_ok:
-                        try: rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        try: rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
                         except Exception: rlist = []
                     now = time.time()
                     if rlist:
                         line = sys.stdin.readline()
                         if line:
                             dirty = True
-                            if due == 0.0: due = now + DEBOUNCE
+                            if due == 0.0: due = now + debounce
                         else:
                             stdin_ok = False
                     if dirty and due and now >= due:
                         s.push_once(overlay)
                         dirty = False; due = 0.0; last_poll = now
-                    if now - last_poll > POLL:
+                    elif now - last_poll > interval:
                         s.push_once(overlay)
                         last_poll = now
 
@@ -303,6 +335,8 @@ jobs:
             ap.add_argument("--cache", required=True)
             ap.add_argument("--out")
             ap.add_argument("--overlay")
+            ap.add_argument("--interval", type=float, default=1)
+            ap.add_argument("--debounce", type=float, default=0.02)
             ap.add_argument("--flushtime", type=int, default=30)
             a = ap.parse_args()
             e = Engine(a.accounts, a.cache)
@@ -310,13 +344,13 @@ jobs:
             if a.cmd == "restore":
                 e.restore(a.out)
             elif a.cmd == "livepush":
-                e.livepush(a.overlay)
+                e.livepush(a.overlay, a.interval, a.debounce)
             elif a.cmd == "pushonce":
                 e.start_uploaders()
                 e.push_once(a.overlay)
                 e.flush(a.flushtime)
         PYEOF
-        echo "✓ MAX-SPEED engine written"
+        echo "✓ Engine written"
 
     - name: Start Xvfb
       run: |
@@ -345,7 +379,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM (MAX-SPEED 0.05s live sync)
+    - name: Boot VM + MAX live sync
       run: |
         set +e
         CACHE=$(cat /tmp/dlive_cache)
@@ -355,15 +389,10 @@ jobs:
 
         qemu-img create -f qcow2 -F raw -b "$CACHE/base.raw" "$CACHE/overlay.qcow2"
 
-        # MAX-SPEED event-driven sync: inotify -> 0.05s debounce -> 8x32 parallel upload
-        inotifywait -m -e modify -e close_write "$CACHE/overlay.qcow2" 2>/dev/null | \
-          python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" > /tmp/livepush.log 2>&1 &
-        echo "✓ MAX-SPEED sync daemon started"
-
         echo "=================================================="
         echo "VNC: $NB_IP:5900"
         echo "Install: entire disk, NO LVM"
-        echo "Sync: 0.05s debounce, 8x32 parallel uploads"
+        echo "MAX sync: ~0.3-0.5s to Drime (network limit)"
         echo "=================================================="
         sudo -E DISPLAY=:1 SDL_VIDEO_WINDOW_POS=0,0 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
@@ -391,8 +420,11 @@ jobs:
         fi
         echo "✓ VNC up"
 
+        inotifywait -m -e modify -e close_write "$CACHE/overlay.qcow2" 2>/dev/null | \
+          python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --interval 1 --debounce 0.02 > /tmp/livepush.log 2>&1 &
+
         ( while kill -0 $QPID 2>/dev/null; do
-            sleep 15
+            sleep 10
             echo "--- livepush ---"; tail -n 4 /tmp/livepush.log 2>/dev/null
           done ) &
 
