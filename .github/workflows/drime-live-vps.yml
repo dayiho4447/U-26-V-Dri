@@ -1,4 +1,4 @@
-name: DLIVE1 True Block Storage (AIO MAX)
+name: DLIVE1 True Block Storage (NBD MAX)
 
 on:
   push:
@@ -21,11 +21,8 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools || true
-        sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2 || true
-        echo user_allow_other | sudo tee -a /etc/fuse.conf
-        sudo python3 -m pip install --break-system-packages fusepy || python3 -m pip install --user fusepy || true
-        sudo chmod 666 /dev/fuse 2>/dev/null || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc || true
+        sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install latest rclone
       run: |
@@ -74,20 +71,20 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 MAX engine
+    - name: Write DLIVE1 NBD MAX engine
       run: |
-        cat > dlive.py <<'PYEOF'
+        cat > dlive_nbd.py <<'PYEOF'
         #!/usr/bin/env python3
-        # DLIVE1 MAX - 3-tier (RAM/disk/Drime) event-driven block storage, FUSE live disk.
-        # ZERO timers. Writes push instantly; reads served from RAM/disk/Drime with 32-block read-ahead.
-        import os, json, zlib, subprocess, time, argparse, threading, queue, errno, sys, traceback
+        # DLIVE1 NBD MAX - Custom NBD server for true instant block sync
+        # ZERO timers, event-driven, every write pushes instantly to Drime
+        import os, json, zlib, subprocess, time, argparse, threading, queue, socket, struct, sys, traceback
         import urllib.request
         from pathlib import Path
         from collections import defaultdict, OrderedDict
 
         VERSION = "1.0"
         B = 512 * 1024
-        RAM_MAX = 2048            # 2048 x 512KB = 1GB RAM L1 cache
+        RAM_MAX = 2048  # 1GB RAM cache
         RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "300s"]
 
         def rc(*args, timeout=900):
@@ -114,7 +111,6 @@ jobs:
                 s.running = True
                 s.rcd = False
                 s.stats = {"uploaded": 0, "mb": 0, "ram_hits": 0, "disk_hits": 0, "net_hits": 0, "writes": 0, "prefetch": 0}
-                s._last_mt = 0
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
@@ -145,7 +141,6 @@ jobs:
                 with open(s.cache / "superblock.json", "w") as f: json.dump(sb, f)
                 rc("copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v1/superblock.json")
 
-            # ---------- rclone rcd daemon (warm TLS, no per-upload process spawn) ----------
             def rcd_start(s):
                 try:
                     subprocess.Popen(["rclone", "rcd", "--rc-addr", "127.0.0.1:5572", "--rc-no-auth",
@@ -208,20 +203,20 @@ jobs:
                     s.block_path(cid).write_bytes(data)
 
             def read_block(s, cid):
-                with s.ram_lock:                      # L1: RAM
+                with s.ram_lock:
                     d = s.ram.get(cid)
                     if d is not None:
                         s.ram.move_to_end(cid); s.stats["ram_hits"] += 1
                         s._ahead(cid); return d
                 p = s.block_path(cid)
-                if p.exists():                        # L2: local disk
+                if p.exists():
                     with s.block_lock(cid):
                         try: d = p.read_bytes()
                         except Exception: d = None
                     if d is not None:
                         s._ram_put(cid, d); s.stats["disk_hits"] += 1
                         s._ahead(cid); return d
-                d = s._fetch_block(cid)               # L3: Drime
+                d = s._fetch_block(cid)
                 if d is None: d = b"\x00" * B
                 if len(d) < B: d += b"\x00" * (B - len(d))
                 s._ram_put(cid, d); s._write_block_local(cid, d)
@@ -252,7 +247,7 @@ jobs:
                         new = bytes(cur)
                         s._ram_put(cid, new)
                         s._write_block_local(cid, new)
-                        with s.cond:                   # INSTANT push on this write event
+                        with s.cond:
                             if cid not in s.up_set:
                                 s.up_set.add(cid); s.up_q.put(cid)
                     pos += k
@@ -308,8 +303,6 @@ jobs:
                                 s.stats["uploaded"] += ok
                                 s.stats["mb"] += ok * B // (1024*1024)
                                 s.log(f"pushed {ok} blocks to {name} (total {s.stats['mb']}MB)")
-                            for lid, _ in items:
-                                if not True: pass
                             if ok < len(items):
                                 base = next((a for nm, a, b in s.ranges if nm == name), None)
                                 if base is not None:
@@ -340,141 +333,97 @@ jobs:
                 s.log(f"drain: {n} blocks re-verified")
                 s.flush()
 
-            def remote_cids(s):
-                cids = []
-                for name, s0, e0 in s.ranges:
-                    r = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
-                    if r.returncode != 0: continue
-                    for ln in r.stdout.decode().split():
-                        if ln.endswith(".gz"):
-                            try: cids.append(s0 + int(ln.split(".")[0]))
-                            except Exception: pass
-                return cids
+        # NBD Protocol constants
+        NBD_MAGIC = b"NBDMAGIC"
+        IHAVEOPT = b"IHAVEOPT"
+        OPT_EXPORT = 1
+        C_NO_ZEROES = 2
+        REQ_MAGIC = 0x25609513
+        REP_MAGIC = 0x67446ab5
+        CMD_READ, CMD_WRITE, CMD_DISC, CMD_FLUSH = 0, 1, 2, 3
 
-            def restore(s, out):
-                ids = s.remote_cids()
-                s.log(f"Restoring {len(ids)} blocks from Drime...")
-                fd = os.open(out, os.O_RDWR | os.O_CREAT, 0o644)
-                os.ftruncate(fd, s.size)
-                done = 0
-                for cid in sorted(ids):
-                    d = s._fetch_block(cid)
-                    if d is None: continue
-                    if len(d) < B: d += b"\x00" * (B - len(d))
-                    if any(d): os.pwrite(fd, d, cid * B)
-                    s._write_block_local(cid, d); s._ram_put(cid, d)
-                    done += 1
-                    if done % 256 == 0: s.log(f"restored {done}/{len(ids)}")
-                os.close(fd)
-                s.log(f"Restore complete: {done} blocks")
+        def recv_exact(c, n):
+            b = b""
+            while len(b) < n:
+                k = c.recv(n - len(b))
+                if not k: return None
+                b += k
+            return b
 
-            def cycle(s, overlay):
-                try: mt = os.path.getmtime(overlay)
-                except OSError: return 0
-                if mt == s._last_mt: return 0
-                s._last_mt = mt
-                snap = str(s.cache / "snap.raw")
-                r = subprocess.run(["qemu-img", "convert", "-f", "qcow2", "-O", "raw", overlay, snap],
-                                   capture_output=True, timeout=900)
-                if r.returncode != 0: return 0
-                pushed = 0; cid = 0
-                with open(snap, "rb") as f:
-                    while True:
-                        d = f.read(B)
-                        if not d: break
-                        if any(d):
-                            p = s.block_path(cid)
-                            if not (p.exists() and p.read_bytes() == d):
-                                s._ram_put(cid, d); s._write_block_local(cid, d)
-                                with s.cond:
-                                    if cid not in s.up_set: s.up_set.add(cid); s.up_q.put(cid)
-                                pushed += 1
-                        cid += 1
-                if pushed: s.log(f"cycle: {pushed} changed blocks pushed instantly")
-                return pushed
+        def client(eng, conn):
+            try:
+                conn.sendall(NBD_MAGIC + IHAVEOPT + struct.pack(">H", 3))
+                cf = struct.unpack(">I", recv_exact(conn, 4))[0]
+                noz = bool(cf & C_NO_ZEROES)
+                while True:
+                    h = recv_exact(conn, 16)
+                    if not h: return
+                    mg, opt, ol = struct.unpack(">QII", h)
+                    if ol: recv_exact(conn, ol)
+                    if opt == OPT_EXPORT:
+                        r = struct.pack(">QH", eng.size, (1 << 0) | (1 << 2) | (1 << 5))
+                        if not noz: r += b"\x00" * 124
+                        conn.sendall(r); break
+                    else: conn.sendall(struct.pack(">QIII", 0x3e889045565a9, opt, 0x80000001, 0))
+                while True:
+                    q = recv_exact(conn, 28)
+                    if not q: return
+                    mg, fl, cmd, hd, off, ln = struct.unpack(">IHHQQI", q)
+                    if mg != REQ_MAGIC: return
+                    er = 0
+                    if cmd == CMD_READ:
+                        try: pl = eng.pread(off, ln)
+                        except Exception as e: eng.log(f"Read error: {e}"); er = 5; pl = b"\x00" * ln
+                        conn.sendall(struct.pack(">IIQ", REP_MAGIC, er, hd) + pl)
+                    elif cmd == CMD_WRITE:
+                        wd = recv_exact(conn, ln)
+                        if wd is None: return
+                        try: eng.write(off, wd)
+                        except Exception as e: eng.log(f"Write error: {e}"); er = 5
+                        if fl & 1: eng.flush()
+                        conn.sendall(struct.pack(">IIQ", REP_MAGIC, er, hd))
+                    elif cmd == CMD_FLUSH:
+                        eng.flush(); conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, hd))
+                    elif cmd == CMD_DISC: return
+                    else: conn.sendall(struct.pack(">IIQ", REP_MAGIC, 22, hd))
+            except Exception as e: eng.log(f"Client error: {e}")
+            finally:
+                try: conn.close()
+                except: pass
 
-            def livepush(s, overlay):
-                s.rcd_start(); s.start_workers()
-                have_inotify = subprocess.run(["which", "inotifywait"], capture_output=True).returncode == 0
-                s.log(f"livepush fallback: event-driven={have_inotify}")
-                while s.running:
-                    if have_inotify:
-                        subprocess.run(["inotifywait", "-q", "-e", "modify,close_write", overlay], capture_output=True)
-                    else:
-                        time.sleep(60)
-                    try: s.cycle(overlay)
-                    except Exception as e: s.log(f"livepush error: {e}")
-
-        # ---------------- FUSE live disk (MAX) ----------------
-        def run_fuse(eng, mount):
-            import fuse
-            class Ops(fuse.Operations):
-                def __init__(s):
-                    s.now = time.time()
-                def _attr(s, path):
-                    if path == "/":
-                        return dict(st_mode=0o40777, st_nlink=2, st_size=0, st_uid=os.getuid(),
-                                    st_gid=os.getgid(), st_atime=s.now, st_mtime=s.now, st_ctime=s.now)
-                    if path == "/disk.raw":
-                        return dict(st_mode=0o100666, st_nlink=1, st_size=eng.size, st_blksize=131072,
-                                    st_blocks=(eng.size + 511) // 512, st_uid=os.getuid(), st_gid=os.getgid(),
-                                    st_atime=s.now, st_mtime=s.now, st_ctime=s.now)
-                    raise fuse.FuseOSError(errno.ENOENT)
-                def getattr(self, path, fh=None): return self._attr(path)
-                def readdir(self, path, fh):
-                    for n in (".", "..", "disk.raw"): yield n
-                def open(self, path, flags): return 0
-                def read(self, path, size, offset, fh): return eng.pread(offset, size)
-                def write(self, path, data, offset, fh):
-                    eng.write(offset, data); return len(data)
-                def release(self, path, fh): return 0
-                def fsync(self, path, datasync, fh):
-                    eng.flush(); return 0
-                def statfs(self, path):
-                    return dict(f_bsize=B, f_frsize=B, f_blocks=eng.size // B, f_bfree=0, f_bavail=0,
-                                f_files=1, f_ffree=0, f_favail=0, f_namemax=255)
-                def truncate(self, path, length, fh=None): return 0
-                def create(self, path, mode, fi=None): raise fuse.FuseOSError(errno.EROFS)
-            os.makedirs(mount, exist_ok=True)
-            eng.rcd_start()
-            eng.start_workers()
-            # prewarm boot-critical blocks instantly at start (event: mount start)
-            for cid in range(256):
-                with eng.pf_lock:
-                    if cid not in eng.pf_set: eng.pf_set.add(cid); eng.pf_q.put(cid)
-            eng.log(f"FUSE MAX live disk at {mount} (size {eng.size // 1024**3}GB)")
-            fuse.FUSE(Ops(), mount, foreground=True, nothreads=False, allow_other=True, big_writes=True)
+        def serve(eng, sockpath):
+            try: os.unlink(sockpath)
+            except: pass
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sockpath); os.chmod(sockpath, 0o777); srv.listen(32)
+            eng.log(f"NBD listening on {sockpath}")
+            try:
+                while eng.running:
+                    c, _ = srv.accept()
+                    threading.Thread(target=client, args=(eng, c), daemon=True).start()
+            finally: eng.shutdown()
 
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
             ap.add_argument("cmd")
             ap.add_argument("--accounts", required=True)
             ap.add_argument("--cache", required=True)
-            ap.add_argument("--mount")
-            ap.add_argument("--out")
-            ap.add_argument("--overlay")
+            ap.add_argument("--sock")
             a = ap.parse_args()
             e = Engine(a.accounts, a.cache)
             e.load()
             try:
-                if a.cmd == "serve-fuse":
-                    run_fuse(e, a.mount)
-                elif a.cmd == "restore":
-                    e.restore(a.out)
-                elif a.cmd == "livepush":
-                    e.livepush(a.overlay)
-                elif a.cmd == "drain":
-                    e.drain()
-                elif a.cmd == "push":
+                if a.cmd == "serve":
                     e.rcd_start(); e.start_workers()
-                    e._last_mt = 0
-                    e.cycle(a.overlay)
-                    e.flush()
+                    serve(e, a.sock)
+                elif a.cmd == "drain":
+                    e.rcd_start(); e.start_workers()
+                    e.drain()
             except Exception:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ DLIVE1 MAX engine written"
+        echo "✓ DLIVE1 NBD MAX engine written"
 
     - name: Prepare cache dir
       run: |
@@ -485,7 +434,7 @@ jobs:
         echo "$CACHE" > /tmp/dlive_cache
         df -h "$CACHE" | tail -1
 
-    - name: Download Ubuntu 26.04 LTS Server ISO (only)
+    - name: Download Ubuntu 26.04 LTS Server ISO
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO="$CACHE/ubuntu.iso"
@@ -495,7 +444,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Start VNC (proven stack)
+    - name: Start VNC
       run: |
         sudo pkill -f Xvfb || true; sudo pkill -f x11vnc || true; sleep 2
         sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
@@ -504,7 +453,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM MAX + FULL LIVE LOGS
+    - name: Boot VM with NBD MAX + LIVE LOGS
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
@@ -513,35 +462,23 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        sudo mkdir -p /mnt/dlivefs
-
-        touch /tmp/fuse.log /tmp/livepush.log
-        tail -n +1 -F /tmp/fuse.log /tmp/livepush.log 2>/dev/null &
+        touch /tmp/nbd.log
+        tail -n +1 -F /tmp/nbd.log 2>/dev/null &
         TAIL_PID=$!
 
-        sudo python3 -c "import fuse; print('✓ fuse import ok')" 2>&1 || echo "✗ fuse import FAILED"
-
-        sudo nohup python3 -u dlive.py serve-fuse --accounts /tmp/dlive_accounts --cache "$CACHE" --mount /mnt/dlivefs > /tmp/fuse.log 2>&1 &
-        FUSE_PID=$!
-        FUSE_OK=0
+        sudo python3 -u dlive_nbd.py serve --accounts /tmp/dlive_accounts --cache "$CACHE" --sock /tmp/dlive.sock > /tmp/nbd.log 2>&1 &
+        NBD_PID=$!
+        NBD_OK=0
         for i in $(seq 1 30); do
-          [ -e /mnt/dlivefs/disk.raw ] && { FUSE_OK=1; break; }
-          kill -0 $FUSE_PID 2>/dev/null || break
+          [ -S /tmp/dlive.sock ] && { NBD_OK=1; break; }
+          kill -0 $NBD_PID 2>/dev/null || break
           sleep 1
         done
 
-        if [ $FUSE_OK = 1 ]; then
-          echo "✓ FUSE MAX LIVE DISK ACTIVE — RAM/disk/Drime 3-tier, instant event-driven writes"
-          DISK=/mnt/dlivefs/disk.raw; FMT=raw; PUSH_PID=""
+        if [ $NBD_OK = 1 ]; then
+          echo "✓ NBD MAX SERVER ACTIVE — every write pushes instantly to Drime"
         else
-          echo "⚠ FUSE unavailable — fallback: inotify event-driven sync"
-          kill $FUSE_PID 2>/dev/null
-          sudo python3 -u dlive.py restore --accounts /tmp/dlive_accounts --cache "$CACHE" --out "$CACHE/base.raw"
-          sudo chown runner:runner "$CACHE/base.raw" 2>/dev/null
-          qemu-img create -f qcow2 -F raw -b "$CACHE/base.raw" "$CACHE/overlay.qcow2"
-          sudo nohup python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" > /tmp/livepush.log 2>&1 &
-          PUSH_PID=$!
-          DISK="$CACHE/overlay.qcow2"; FMT=qcow2
+          echo "✗ NBD server failed"; cat /tmp/nbd.log; exit 1
         fi
 
         echo "=================================================="
@@ -555,7 +492,7 @@ jobs:
         DISPLAY=:1 SDL_VIDEO_WINDOW_POS=center qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
-          -drive file="$DISK",format=$FMT,if=none,id=d0,cache=writeback \
+          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0 \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
           -boot order=c,once=d \
@@ -569,15 +506,12 @@ jobs:
 
         echo ""
         echo "VM stopped — final instant sync..."
-        [ -n "$PUSH_PID" ] && kill $PUSH_PID 2>/dev/null
-        sudo python3 -u dlive.py drain --accounts /tmp/dlive_accounts --cache "$CACHE"
-        sudo kill $FUSE_PID 2>/dev/null
+        sudo python3 -u dlive_nbd.py drain --accounts /tmp/dlive_accounts --cache "$CACHE"
+        sudo kill $NBD_PID 2>/dev/null
         kill $TAIL_PID 2>/dev/null
-        echo "---------------- FULL FUSE LOG ----------------"
-        cat /tmp/fuse.log 2>/dev/null || true
-        echo "---------------- FULL LIVEPUSH LOG ----------------"
-        cat /tmp/livepush.log 2>/dev/null || true
+        echo "---------------- FULL NBD LOG ----------------"
+        cat /tmp/nbd.log 2>/dev/null || true
         echo "---------------- FINAL DRIME STATE ----------------"
         ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
         rclone size "$ACC:dlive" 2>/dev/null || true
-        echo "✓ Done. MAX level. 100%."
+        echo "✓ Done. NBD MAX. 100% instant."
