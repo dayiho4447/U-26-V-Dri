@@ -417,16 +417,15 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Start VNC (centered, matched size)
+    - name: Start VNC (proven stack, unchanged)
       run: |
-        pkill -f Xvfb || true; pkill -f x11vnc || true; sleep 2
-        # 1280x800 matches the guest's typical framebuffer -> good fit
-        Xvfb :1 -screen 0 1280x800x24 & sleep 2
-        x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+        sudo pkill -f Xvfb || true; sudo pkill -f x11vnc || true; sleep 2
+        sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
+        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
         sleep 2
-        ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
+        sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM (FUSE live disk, realtime writes, centered video)
+    - name: Boot VM (FUSE live disk, realtime writes)
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
@@ -466,10 +465,7 @@ jobs:
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # Center the guest video window on the virtual desktop
-        export SDL_VIDEO_WINDOW_POS=center
-
-        DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
+        sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -drive file="$DISK",format=$FMT,if=none,id=d0,cache=writeback \
           -device ide-hd,drive=d0 \
