@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc xdotool x11-utils
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc xdotool
 
     - name: Install latest rclone
       run: |
@@ -64,46 +64,29 @@ jobs:
                 subprocess.run(["rclone", "config", "delete", name], capture_output=True)
                 c = subprocess.run(["rclone", "config", "create", name, "drime", f"access_token={tok}"], capture_output=True)
                 if c.returncode == 0:
-                    out.write(f"{name} {size}\n"); print(f"✓ Account: {name} ({size//1024**3}GB)")
+                    out.write(f"{name} {size}\n"); print(f"✓ Account configured: {name} ({size//1024**3}GB)")
+        print(f"Total accounts: {len(accounts)}")
         PY
-        [ -s /tmp/dlive_accounts ] || { echo "FATAL: no accounts"; exit 1; }
+        [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Start rclone rcd daemon
-      run: |
-        set +e
-        nohup rclone rcd --rc-addr 127.0.0.1:5572 --rc-no-auth \
-          --transfers 32 --checkers 32 --retries 2 --contimeout 10s --timeout 120s > /tmp/rcd.log 2>&1 &
-        for i in $(seq 1 30); do
-          curl -s -m 2 http://127.0.0.1:5572/rc/noop >/dev/null && { echo "✓ rcd up"; exit 0; }
-          sleep 1
-        done
-        echo "⚠ rcd not up"; cat /tmp/rcd.log
-
-    - name: Write DLIVE1 engine
+    - name: Write DLIVE1 engine (VISIBLE SIMPLE SYNC)
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, json, zlib, subprocess, time, argparse, sys, threading, queue, http.client
+        import os, json, zlib, subprocess, time, argparse, threading, queue, sys
         from pathlib import Path
         from collections import defaultdict
 
-        VERSION = "1.0"
-        B = 512 * 1024
-        RC_FLAGS = ["--retries","2","--low-level-retries","2","--contimeout","10s","--timeout","120s"]
+        VERSION = "3.0"
+        B = 256 * 1024
+        RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "10s", "--timeout", "120s"]
 
-        def rc(*args, timeout=600):
-            try: return subprocess.run(["rclone"]+list(args)+RC_FLAGS, capture_output=True, timeout=timeout)
+        def rc(*args, timeout=300):
+            try: return subprocess.run(["rclone"] + list(args) + RC_FLAGS, capture_output=True, timeout=timeout)
             except Exception as e:
                 print(f"[RC ERROR] {e}", flush=True)
                 return subprocess.CompletedProcess(args, 1, b"", str(e).encode())
-
-        def rc_http(op, params, timeout=300):
-            conn = http.client.HTTPConnection("127.0.0.1", 5572, timeout=timeout)
-            conn.request("POST", "/"+op, body=json.dumps(params), headers={"Content-Type":"application/json"})
-            resp = conn.getresponse(); data = resp.read(); conn.close()
-            if resp.status != 200: raise RuntimeError(f"rc {op} -> {resp.status}: {data[:200]}")
-            return json.loads(data) if data else {}
 
         class Engine:
             def __init__(s, accounts_file, cache):
@@ -129,21 +112,25 @@ jobs:
             def load(s):
                 sb = s.cache / "superblock.json"
                 r = rc("copyto", f"{s.anchor}:dlive/v1/superblock.json", str(sb))
+                ok = False
                 if r.returncode == 0 and sb.exists():
                     try:
-                        s.accounts = json.load(open(sb))["accounts"]
-                        s.log(f"Loaded existing: {len(s.accounts)} accounts")
-                    except Exception: s._create_superblock()
-                else:
-                    s.log("Creating new disk..."); s._create_superblock()
+                        j = json.load(open(sb))
+                        if j.get("block_size") == B:
+                            s.accounts = j["accounts"]; ok = True
+                            s.log(f"Loaded existing disk: {len(s.accounts)} accounts")
+                        else:
+                            s.log("Old block size, recreating")
+                    except Exception: pass
+                if not ok: s._create_superblock()
                 s.ranges = []; off = 0
                 for name, size in s.accounts:
                     nb = size // B; s.ranges.append((name, off, off + nb)); off += nb
                 s.size = off * B
-                s.log(f"Disk: {s.size // 1024**3}GB ({off} blocks)")
+                s.log(f"Disk: {s.size // 1024**3}GB ({off} blocks of {B//1024}KB)")
 
             def _create_superblock(s):
-                sb = {"version":VERSION,"magic":"DLIVE1","block_size":B,"accounts":s.accounts,"created":int(time.time())}
+                sb = {"version": VERSION, "magic": "DLIVE1", "block_size": B, "accounts": s.accounts, "created": int(time.time())}
                 with open(s.cache / "superblock.json", "w") as f: json.dump(sb, f)
                 rc("copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v1/superblock.json")
 
@@ -158,40 +145,28 @@ jobs:
                 name, lid = s.acct_for(cid)
                 if name is None: return None
                 tmp = str(s.block_path(cid)) + ".tmp"
-                ok = False
-                try:
-                    rc_http("operations/copyfile", {"srcFs": f"{name}:dlive/v1/blocks", "srcRemote": f"{lid:08d}.gz", "dstFs": "", "dstRemote": tmp})
-                    ok = os.path.exists(tmp)
-                except Exception:
-                    ok = rc("copyto", f"{name}:dlive/v1/blocks/{lid:08d}.gz", tmp).returncode == 0 and os.path.exists(tmp)
-                if ok:
+                r = rc("copyto", f"{name}:dlive/v1/blocks/{lid:08d}.gz", tmp)
+                if r.returncode == 0 and os.path.exists(tmp):
                     try:
-                        d = zlib.decompress(open(tmp,"rb").read()); os.unlink(tmp); return d
+                        d = zlib.decompress(open(tmp, "rb").read()); os.unlink(tmp); return d
                     except Exception:
                         try: os.unlink(tmp)
                         except Exception: pass
                 return None
 
             def _write_block_local(s, cid, data):
-                with s.block_lock(cid): s.block_path(cid).write_bytes(data)
+                with s.block_lock(cid):
+                    s.block_path(cid).write_bytes(data)
 
             def remote_cids(s):
                 cids = []
                 for name, s0, e0 in s.ranges:
-                    try:
-                        r = rc_http("operations/list", {"fs": f"{name}:dlive/v1/blocks"})
-                        for item in r.get("list", []):
-                            n = item.get("Name", "")
-                            if n.endswith(".gz"):
-                                try: cids.append(s0 + int(n.split(".")[0]))
-                                except Exception: pass
-                    except Exception:
-                        rr = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
-                        if rr.returncode == 0:
-                            for ln in rr.stdout.decode().split():
-                                if ln.endswith(".gz"):
-                                    try: cids.append(s0 + int(ln.split(".")[0]))
-                                    except Exception: pass
+                    r = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
+                    if r.returncode != 0: continue
+                    for ln in r.stdout.decode().split():
+                        if ln.endswith(".gz"):
+                            try: cids.append(s0 + int(ln.split(".")[0]))
+                            except Exception: pass
                 return cids
 
             def restore(s, out):
@@ -207,17 +182,18 @@ jobs:
                     if any(d): os.pwrite(fd, d, cid * B)
                     s._write_block_local(cid, d)
                     done += 1
+                    if done % 512 == 0: s.log(f"restored {done}/{len(ids)}")
                 os.close(fd)
-                s.log(f"Restore done: {done} blocks")
+                s.log(f"Restore complete: {done} blocks")
 
             def start_uploaders(s):
                 for i in range(8): threading.Thread(target=s._uploader, daemon=True).start()
 
             def _uploader(s):
                 while s.running:
-                    cid = s.up_q.get(); batch = [cid]; dl = time.time() + 0.05
-                    while len(batch) < 64:
-                        try: batch.append(s.up_q.get(timeout=max(0.005, dl - time.time())))
+                    cid = s.up_q.get(); batch = [cid]
+                    for _ in range(63):
+                        try: batch.append(s.up_q.get(timeout=0.05))
                         except queue.Empty: break
                     by = defaultdict(list)
                     for c in batch:
@@ -231,15 +207,11 @@ jobs:
                         stage = s.cache / f"stage_{threading.get_ident()}"; stage.mkdir(exist_ok=True)
                         for lid, d in items:
                             open(stage / f"{lid:08d}.gz", "wb").write(zlib.compress(d, 1))
-                        ok = False
-                        try:
-                            rc_http("sync/copy", {"srcFs": str(stage), "dstFs": f"{name}:dlive/v1/blocks", "_config": {"Transfers": 32}})
-                            ok = True
-                        except Exception:
-                            ok = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers","32").returncode == 0
-                        if ok: s.log(f"UPLOADED {len(items)} blocks to {name}")
+                        r = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", "32")
+                        if r.returncode == 0:
+                            s.log(f"✓ UPLOADED {len(items)} blocks -> {name}")
                         else:
-                            s.log(f"UPLOAD FAILED {name}")
+                            s.log(f"✗ UPLOAD FAILED {name}: {r.stderr.decode()[:200]}")
                             base = next((a for nm, a, b in s.ranges if nm == name), None)
                             if base is not None:
                                 for lid, _ in items:
@@ -257,7 +229,8 @@ jobs:
                     with s.block_lock(cid):
                         p = s.block_path(cid)
                         cur = p.read_bytes() if p.exists() else None
-                        if cur is None: cur = s._fetch_block(cid) or b"\x00" * B
+                        if cur is None:
+                            cur = s._fetch_block(cid) or b"\x00" * B
                         if len(cur) < B: cur += b"\x00" * (B - len(cur))
                         seg = data[pos:pos + k]
                         if cur[co:co + k] != seg:
@@ -270,50 +243,40 @@ jobs:
                 return changed
 
             def push_once(s, overlay):
+                s.log(f"--- SYNC CYCLE ---")
                 try:
-                    r = subprocess.run(["qemu-img","map","-U","--output=json",overlay], capture_output=True, timeout=120)
+                    r = subprocess.run(["qemu-img", "map", "-U", "--output=json", overlay], capture_output=True, timeout=60)
                     if r.returncode != 0:
-                        s.log(f"map FAILED: {r.stderr.decode()[:300]}"); return 0
+                        s.log(f"✗ qemu-img map FAILED: {r.stderr.decode()[:300]}")
+                        return 0
                     ext = json.loads(r.stdout)
-                    ov = [ex for ex in ext if ex.get("data") and not ex.get("zero")
-                          and ex.get("filename","") and "base.raw" not in ex.get("filename","")]
-                    s.log(f"overlay has {len(ov)} written extents")
+                    s.log(f"  extents: {len(ext)}")
+                    ov_exts = []
+                    for ex in ext:
+                        if not ex.get("data") or ex.get("zero"): continue
+                        fn = ex.get("filename", "")
+                        if not fn or "base.raw" in fn: continue
+                        ov_exts.append(ex)
+                    s.log(f"  overlay extents: {len(ov_exts)}")
+                    if not ov_exts: return 0
                     pushed = 0
-                    for ex in ov:
+                    for ex in ov_exts:
                         with open(overlay, "rb") as f:
                             f.seek(ex["offset"]); d = f.read(ex["length"])
                         pushed += s.write_changed(ex["start"], d)
-                    if pushed: s.log(f"PUSHED {pushed} changed blocks")
+                    s.log(f"  queued {pushed} changed blocks for upload")
                     return pushed
                 except Exception as e:
-                    s.log(f"push ERROR: {e}"); return 0
+                    s.log(f"✗ push ERROR: {e}")
+                    import traceback; s.log(traceback.format_exc())
+                    return 0
 
-            def poll_loop(s, overlay, poll_interval):
+            def simple_loop(s, overlay):
                 s.start_uploaders()
-                s.log(f"DAEMON UP: poll every {poll_interval}s")
-                last_mtime = 0; last_size = 0; last_push = 0
+                s.log("SIMPLE SYNC: every 0.5s, everything visible")
                 while s.running:
-                    try:
-                        st = os.stat(overlay)
-                        mtime = st.st_mtime; size = st.st_size
-                        if mtime != last_mtime or size != last_size:
-                            s.log(f"change detected (mtime={mtime}, size={size}), pushing...")
-                            s.push_once(overlay)
-                            last_mtime = mtime; last_size = size; last_push = time.time()
-                        elif time.time() - last_push > 30:
-                            # safety: push at least every 30s even if no mtime change
-                            s.push_once(overlay)
-                            last_push = time.time()
-                    except Exception as e:
-                        s.log(f"poll error: {e}")
-                    time.sleep(poll_interval)
-
-            def flush(s, timeout=30):
-                t0 = time.time()
-                while time.time() - t0 < timeout:
-                    with s.up_lock:
-                        if not s.up_set and s.up_q.empty(): break
-                    time.sleep(0.05)
+                    s.push_once(overlay)
+                    time.sleep(0.5)
 
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
@@ -322,19 +285,13 @@ jobs:
             ap.add_argument("--cache", required=True)
             ap.add_argument("--out")
             ap.add_argument("--overlay")
-            ap.add_argument("--poll", type=float, default=0.5)
-            ap.add_argument("--flushtime", type=int, default=30)
             a = ap.parse_args()
             e = Engine(a.accounts, a.cache)
             e.load()
             if a.cmd == "restore":
                 e.restore(a.out)
-            elif a.cmd == "daemon":
-                e.poll_loop(a.overlay, a.poll)
-            elif a.cmd == "pushonce":
-                e.start_uploaders()
-                e.push_once(a.overlay)
-                e.flush(a.flushtime)
+            elif a.cmd == "simpleloop":
+                e.simple_loop(a.overlay)
         PYEOF
         echo "✓ Engine written"
 
@@ -344,7 +301,7 @@ jobs:
         sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
         echo "✓ Xvfb ready"
 
-    - name: Restore disk
+    - name: Restore disk from Drime
       run: |
         set +e
         CACHE=/var/lib/dlive
@@ -353,7 +310,7 @@ jobs:
         echo "$CACHE" > /tmp/dlive_cache
         python3 -u dlive.py restore --accounts /tmp/dlive_accounts --cache "$CACHE" --out "$CACHE/base.raw"
 
-    - name: Download ISO
+    - name: Download Ubuntu 26.04 LTS Server ISO
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO="$CACHE/ubuntu.iso"
@@ -365,7 +322,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM + persistent daemon + perfect-fit VNC
+    - name: Boot VM (VISIBLE SYNC - see everything in log)
       run: |
         set +e
         CACHE=$(cat /tmp/dlive_cache)
@@ -375,10 +332,16 @@ jobs:
 
         qemu-img create -f qcow2 -F raw -b "$CACHE/base.raw" "$CACHE/overlay.qcow2"
 
-        # PERSISTENT DAEMON - never dies, polls every 0.5s
-        python3 -u dlive.py daemon --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --poll 0.5 > /tmp/livepush.log 2>&1 &
-        DAEMON_PID=$!
-        echo "✓ Daemon PID=$DAEMON_PID"
+        echo "=================================================="
+        echo "VNC: $NB_IP:5900"
+        echo "Install: entire disk, NO LVM"
+        echo "SYNC LOG BELOW (every 0.5s):"
+        echo "=================================================="
+
+        # Start sync in background, prints directly to workflow log
+        python3 -u dlive.py simpleloop --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" > /tmp/sync.log 2>&1 &
+        SYNC_PID=$!
+        echo "✓ Sync started (PID=$SYNC_PID)"
 
         sudo -E DISPLAY=:1 SDL_VIDEO_WINDOW_POS=0,0 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
@@ -392,39 +355,27 @@ jobs:
           -display sdl > /tmp/vm.log 2>&1 &
         QPID=$!
 
-        # Wait for QEMU window
         WID=""
         for i in $(seq 1 30); do
           WID=$(sudo DISPLAY=:1 xdotool search --name -i "qemu" 2>/dev/null | head -1)
           [ -n "$WID" ] && break
           sleep 1
         done
-
         sudo pkill -f x11vnc || true; sleep 1
-
         if [ -n "$WID" ]; then
-          # Get INNER geometry (skip title bar + borders)
-          GEO=$(sudo DISPLAY=:1 xwininfo -id "$WID" | grep -E "(Width|Height|Absolute upper-left)" | awk '{print $NF}' | tr '\n' ' ')
-          read -r X Y W H <<< "$GEO"
-          echo "Window: inner=$W x $H at $X,$Y"
-          # Clip to inner area - removes title bar and borders
-          sudo x11vnc -display :1 -clip "${W}x${H}+${X}+${Y}" -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log -scale 1 -cursor none
+          sudo x11vnc -display :1 -id "$WID" -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
         else
-          echo "⚠ Window not found, sharing full desktop"
           sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
         fi
-        sleep 2
-        echo "=================================================="
-        echo "VNC: $NB_IP:5900 (perfect fit, no title bar)"
-        echo "Install: entire disk, NO LVM"
-        echo "Daemon running forever, polls every 0.5s"
-        echo "=================================================="
+        echo "✓ VNC up"
 
+        # Print sync log every 10s
         ( while kill -0 $QPID 2>/dev/null; do
-            sleep 15
-            echo "--- daemon log ---"; tail -n 6 /tmp/livepush.log 2>/dev/null
+            sleep 10
+            echo "=== SYNC STATUS ==="
+            tail -n 20 /tmp/sync.log 2>/dev/null
           done ) &
 
         wait $QPID
-        echo "VM stopped - final sync..."
-        python3 -u dlive.py pushonce --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --flushtime 60
+        kill $SYNC_PID 2>/dev/null
+        echo "VM stopped"
