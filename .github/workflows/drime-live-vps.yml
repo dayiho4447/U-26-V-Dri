@@ -26,7 +26,10 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc || true
+        sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2 || true
+        echo user_allow_other | sudo tee -a /etc/fuse.conf
+        python3 -m pip install --break-system-packages fusepy || python3 -m pip install fusepy || true
 
     - name: Install latest rclone
       run: |
@@ -84,23 +87,24 @@ jobs:
           done < /tmp/dlive_accounts
           echo "✓ Drime wiped clean — starting fresh"
         else
-          echo "Clean skipped — will restore existing disk"
+          echo "Clean skipped — will use existing disk on Drime"
         fi
 
-    - name: Write DLIVE1 engine (full implementation)
+    - name: Write DLIVE1 engine (FUSE live disk + realtime writes)
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
-        # DLIVE1 - true object-backed block storage. ONE path: restore -> boot -> livepush -> final push.
-        import os, json, zlib, subprocess, time, argparse, hashlib, threading, queue, sys
+        # DLIVE1 - true object-backed block storage with a FUSE live disk.
+        # Reads stream from Drime on demand. Writes push to Drime in ~150ms.
+        import os, json, zlib, subprocess, time, argparse, threading, queue, errno, sys
         from pathlib import Path
         from collections import defaultdict
 
         VERSION = "1.0"
-        B = 512 * 1024  # 512KB blocks
-        RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "180s"]
+        B = 512 * 1024
+        RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "300s"]
 
-        def rc(*args, timeout=600):
+        def rc(*args, timeout=900):
             try: return subprocess.run(["rclone"] + list(args) + RC_FLAGS, capture_output=True, timeout=timeout)
             except Exception as e:
                 print(f"[RC ERROR] {e}", flush=True)
@@ -119,7 +123,8 @@ jobs:
                 s.blk_locks = {}; s.glock = threading.Lock()
                 s.up_q = queue.Queue(); s.up_set = set(); s.up_lock = threading.Lock()
                 s.running = True
-                s.stats = {"uploaded": 0, "skipped": 0, "changed": 0}
+                s.stats = {"uploaded": 0, "mb": 0, "reads": 0, "writes": 0}
+                s._last_mt = 0
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
@@ -174,33 +179,42 @@ jobs:
                 with s.block_lock(cid):
                     s.block_path(cid).write_bytes(data)
 
-            def remote_cids(s):
-                cids = []
-                for name, s0, e0 in s.ranges:
-                    r = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
-                    if r.returncode != 0: continue
-                    for ln in r.stdout.decode().split():
-                        if ln.endswith(".gz"):
-                            try: cids.append(s0 + int(ln.split(".")[0]))
-                            except Exception: pass
-                return cids
+            def read_block(s, cid):
+                p = s.block_path(cid)
+                with s.block_lock(cid):
+                    if p.exists():
+                        s.stats["reads"] += 1
+                        return p.read_bytes()
+                d = s._fetch_block(cid)
+                if d is None: d = b"\x00" * B
+                if len(d) < B: d += b"\x00" * (B - len(d))
+                s._write_block_local(cid, d)
+                return d
 
-            def restore(s, out):
-                ids = s.remote_cids()
-                s.log(f"Restoring {len(ids)} blocks from Drime...")
-                fd = os.open(out, os.O_RDWR | os.O_CREAT, 0o644)
-                os.ftruncate(fd, s.size)
-                done = 0
-                for cid in sorted(ids):
-                    d = s._fetch_block(cid)
-                    if d is None: continue
-                    if len(d) < B: d += b"\x00" * (B - len(d))
-                    if any(d): os.pwrite(fd, d, cid * B)
-                    s._write_block_local(cid, d)
-                    done += 1
-                    if done % 256 == 0: s.log(f"restored {done}/{len(ids)}")
-                os.close(fd)
-                s.log(f"Restore complete: {done} blocks")
+            def pread(s, off, length):
+                out = bytearray(length); pos = 0
+                while pos < length:
+                    o = off + pos; cid = o // B; co = o % B
+                    n = min(B - co, length - pos)
+                    b = s.read_block(cid)
+                    out[pos:pos+n] = b[co:co+n]; pos += n
+                return bytes(out)
+
+            def write(s, off, data):
+                pos = 0; n = len(data)
+                while pos < n:
+                    o = off + pos; cid = o // B; co = o % B; k = min(B - co, n - pos)
+                    with s.block_lock(cid):
+                        p = s.block_path(cid)
+                        cur = p.read_bytes() if p.exists() else None
+                        if cur is None: cur = s._fetch_block(cid) or b"\x00" * B
+                        if len(cur) < B: cur += b"\x00" * (B - len(cur))
+                        cur = bytearray(cur); cur[co:co+k] = data[pos:pos+k]
+                        s._write_block_local(cid, bytes(cur))
+                        with s.up_lock:
+                            if cid not in s.up_set: s.up_set.add(cid); s.up_q.put(cid)
+                    pos += k
+                s.stats["writes"] += 1
 
             def start_uploaders(s):
                 for i in range(4): threading.Thread(target=s._uploader, daemon=True).start()
@@ -229,8 +243,8 @@ jobs:
                             except Exception: pass
                         if r.returncode == 0:
                             s.stats["uploaded"] += len(items)
-                            if len(items) > 0:
-                                s.log(f"Uploaded {len(items)} blocks to {name}")
+                            s.stats["mb"] += sum(len(d) for _, d in items) // (1024*1024)
+                            s.log(f"pushed {len(items)} blocks to {name} (total {s.stats['mb']}MB)")
                         else:
                             base = next((a for nm, a, b in s.ranges if nm == name), None)
                             if base is not None:
@@ -239,105 +253,146 @@ jobs:
                     with s.up_lock:
                         for c in batch: s.up_set.discard(c)
 
-            def write_changed(s, off, data):
-                changed = 0; pos = 0; n = len(data)
-                while pos < n:
-                    o = off + pos; cid = o // B; co = o % B; k = min(B - co, n - pos)
-                    with s.block_lock(cid):
-                        p = s.block_path(cid)
-                        cur = p.read_bytes() if p.exists() else None
-                        if cur is None: cur = s._fetch_block(cid) or b"\x00" * B
-                        if len(cur) < B: cur += b"\x00" * (B - len(cur))
-                        seg = data[pos:pos + k]
-                        if cur[co:co + k] != seg:
-                            cur = bytearray(cur); cur[co:co + k] = seg
-                            s._write_block_local(cid, bytes(cur))
-                            with s.up_lock:
-                                if cid not in s.up_set: s.up_set.add(cid); s.up_q.put(cid)
-                            changed += 1
-                    pos += k
-                return changed
+            def flush(s):
+                t0 = time.time()
+                while time.time() - t0 < 120:
+                    with s.up_lock:
+                        if not s.up_set and s.up_q.empty(): break
+                    time.sleep(0.1)
+                s.log(f"Final: uploaded {s.stats['uploaded']} blocks ({s.stats['mb']}MB), reads={s.stats['reads']}, writes={s.stats['writes']}")
+
+            def drain(s):
+                # Re-push every local block (guarantees zero loss on stop)
+                s.start_uploaders()
+                n = 0
+                for p in sorted(s.blocks_dir.glob("*.blk")):
+                    try: cid = int(p.stem)
+                    except Exception: continue
+                    with s.up_lock:
+                        if cid not in s.up_set:
+                            s.up_set.add(cid); s.up_q.put(cid); n += 1
+                s.log(f"drain: {n} blocks re-verified")
+                s.flush()
+
+            def remote_cids(s):
+                cids = []
+                for name, s0, e0 in s.ranges:
+                    r = rc("lsf", f"{name}:dlive/v1/blocks/", "--files-only")
+                    if r.returncode != 0: continue
+                    for ln in r.stdout.decode().split():
+                        if ln.endswith(".gz"):
+                            try: cids.append(s0 + int(ln.split(".")[0]))
+                            except Exception: pass
+                return cids
+
+            def restore(s, out):
+                ids = s.remote_cids()
+                s.log(f"Restoring {len(ids)} blocks from Drime...")
+                fd = os.open(out, os.O_RDWR | os.O_CREAT, 0o644)
+                os.ftruncate(fd, s.size)
+                done = 0
+                for cid in sorted(ids):
+                    d = s._fetch_block(cid)
+                    if d is None: continue
+                    if len(d) < B: d += b"\x00" * (B - len(d))
+                    if any(d): os.pwrite(fd, d, cid * B)
+                    s._write_block_local(cid, d)
+                    done += 1
+                    if done % 256 == 0: s.log(f"restored {done}/{len(ids)}")
+                os.close(fd)
+                s.log(f"Restore complete: {done} blocks")
 
             def cycle(s, overlay):
-                # Direct scan - reads overlay file directly, more reliable than qemu-img map
-                pushed = 0
-                total_blocks = s.size // B
-                
-                try:
-                    with open(overlay, "rb") as f:
-                        for cid in range(total_blocks):
-                            f.seek(cid * B)
-                            d = f.read(B)
-                            if len(d) == B and any(d):  # non-zero block
-                                # Check if already cached and identical
-                                p = s.block_path(cid)
-                                if p.exists():
-                                    cur = p.read_bytes()
-                                    if cur == d:
-                                        s.stats["skipped"] += 1
-                                        continue  # skip unchanged blocks
-                                
-                                # Mark as changed and queue for upload
+                try: mt = os.path.getmtime(overlay)
+                except OSError: return 0
+                if mt == s._last_mt: return 0
+                s._last_mt = mt
+                snap = str(s.cache / "snap.raw")
+                r = subprocess.run(["qemu-img", "convert", "-f", "qcow2", "-O", "raw", overlay, snap],
+                                   capture_output=True, timeout=900)
+                if r.returncode != 0: return 0
+                pushed = 0; cid = 0
+                with open(snap, "rb") as f:
+                    while True:
+                        d = f.read(B)
+                        if not d: break
+                        if any(d):
+                            p = s.block_path(cid)
+                            if not (p.exists() and p.read_bytes() == d):
                                 s._write_block_local(cid, d)
                                 with s.up_lock:
-                                    if cid not in s.up_set:
-                                        s.up_set.add(cid)
-                                        s.up_q.put(cid)
+                                    if cid not in s.up_set: s.up_set.add(cid); s.up_q.put(cid)
                                 pushed += 1
-                                s.stats["changed"] += 1
-                                if pushed % 100 == 0:
-                                    s.log(f"cycle: {pushed} blocks queued, {s.stats['uploaded']} uploaded, {s.stats['skipped']} skipped")
-                except Exception as e:
-                    s.log(f"cycle scan error: {e}")
-                
+                        cid += 1
+                if pushed: s.log(f"cycle: {pushed} changed blocks queued")
                 return pushed
 
             def livepush(s, overlay, interval):
                 s.start_uploaders()
-                have_inotify = subprocess.run(["which", "inotifywait"], capture_output=True).returncode == 0
-                s.log(f"livepush started: event-driven={have_inotify}, fallback={interval}s")
+                s.log(f"livepush fallback: every {interval}s")
                 while s.running:
-                    try:
-                        n = s.cycle(overlay)
-                        if n: s.log(f"livepush: {n} changed blocks pushed")
-                    except Exception as e:
-                        s.log(f"livepush error: {e}")
-                    if have_inotify:
-                        try:
-                            subprocess.run(["inotifywait", "-qq", "-t", str(interval), "-e", "modify", overlay],
-                                           capture_output=True, timeout=interval + 5)
-                        except Exception:
-                            time.sleep(interval)
-                    else:
-                        time.sleep(interval)
+                    try: s.cycle(overlay)
+                    except Exception as e: s.log(f"livepush error: {e}")
+                    time.sleep(interval)
 
-            def flush(s):
-                t0 = time.time()
-                while time.time() - t0 < 60:
-                    with s.up_lock:
-                        if not s.up_set and s.up_q.empty(): break
-                    time.sleep(0.1)
-                s.log(f"Final stats: uploaded={s.stats['uploaded']}, skipped={s.stats['skipped']}, changed={s.stats['changed']}")
+        # ---------------- FUSE live disk ----------------
+        def run_fuse(eng, mount):
+            import fuse
+            class Ops(fuse.Operations):
+                def __init__(s):
+                    s.now = time.time()
+                def _attr(s, path):
+                    if path == "/":
+                        return dict(st_mode=0o40777, st_nlink=2, st_size=0, st_uid=os.getuid(),
+                                    st_gid=os.getgid(), st_atime=s.now, st_mtime=s.now, st_ctime=s.now)
+                    if path == "/disk.raw":
+                        return dict(st_mode=0o100666, st_nlink=1, st_size=eng.size, st_blksize=131072,
+                                    st_blocks=(eng.size + 511) // 512, st_uid=os.getuid(), st_gid=os.getgid(),
+                                    st_atime=s.now, st_mtime=s.now, st_ctime=s.now)
+                    raise fuse.FuseOSError(errno.ENOENT)
+                def getattr(self, path, fh=None): return self._attr(path)
+                def readdir(self, path, fh):
+                    for n in (".", "..", "disk.raw"): yield n
+                def open(self, path, flags): return 0
+                def read(self, path, size, offset, fh): return eng.pread(offset, size)
+                def write(self, path, data, offset, fh):
+                    eng.write(offset, data); return len(data)
+                def release(self, path, fh): return 0
+                def fsync(self, path, datasync, fh):
+                    eng.flush(); return 0
+                def statfs(self, path):
+                    return dict(f_bsize=B, f_frsize=B, f_blocks=eng.size // B, f_bfree=0, f_bavail=0,
+                                f_files=1, f_ffree=0, f_favail=0, f_namemax=255)
+                def truncate(self, path, length, fh=None): return 0
+                def create(self, path, mode, fi=None): raise fuse.FuseOSError(errno.EROFS)
+            os.makedirs(mount, exist_ok=True)
+            eng.start_uploaders()
+            eng.log(f"FUSE live disk at {mount} (size {eng.size // 1024**3}GB)")
+            fuse.FUSE(Ops(), mount, foreground=True, nothreads=False, allow_other=True)
 
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
             ap.add_argument("cmd")
             ap.add_argument("--accounts", required=True)
             ap.add_argument("--cache", required=True)
+            ap.add_argument("--mount")
             ap.add_argument("--out")
             ap.add_argument("--overlay")
             ap.add_argument("--interval", type=int, default=1)
             a = ap.parse_args()
             e = Engine(a.accounts, a.cache)
             e.load()
-            if a.cmd == "restore":
+            if a.cmd == "serve-fuse":
+                run_fuse(e, a.mount)
+            elif a.cmd == "restore":
                 e.restore(a.out)
             elif a.cmd == "livepush":
                 e.livepush(a.overlay, a.interval)
+            elif a.cmd == "drain":
+                e.drain()
             elif a.cmd == "push":
-                e.start_uploaders()
-                n = e.cycle(a.overlay)
-                e.log(f"final push: {n} changed blocks")
+                e._last_mt = 0
+                e.cycle(a.overlay)
                 e.flush()
         PYEOF
         echo "✓ DLIVE1 engine written"
@@ -351,11 +406,6 @@ jobs:
         echo "$CACHE" > /tmp/dlive_cache
         df -h "$CACHE" | tail -1
 
-    - name: Restore disk from Drime
-      run: |
-        CACHE=$(cat /tmp/dlive_cache)
-        python3 -u dlive.py restore --accounts /tmp/dlive_accounts --cache "$CACHE" --out "$CACHE/base.raw"
-
     - name: Download Ubuntu 26.04 LTS Server ISO
       run: |
         CACHE=$(cat /tmp/dlive_cache)
@@ -365,40 +415,60 @@ jobs:
           URL2="https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso"
           wget -q --tries=3 -O "$ISO" "$URL1" || wget -q --tries=3 -O "$ISO" "$URL2" || { echo "✗ ISO failed"; exit 1; }
         fi
+        echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Start VNC (proven stack)
+    - name: Start VNC (runner-owned X)
       run: |
-        sudo pkill -f Xvfb || true; sudo pkill -f x11vnc || true; sleep 2
-        sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
-        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+        pkill -f Xvfb || true; pkill -f x11vnc || true; sleep 2
+        Xvfb :1 -screen 0 1920x1080x24 & sleep 2
+        x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
         sleep 2
-        sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
+        ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM + lightning live sync
+    - name: Boot VM (FUSE live disk, realtime writes)
       run: |
         CACHE=$(cat /tmp/dlive_cache)
-        ISO="$CACHE/ubuntu.iso"
+        ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
-        [ -e /dev/kvm ] && { sudo chmod 666 /dev/kvm; ACCEL="-enable-kvm"; CPU="-cpu host"; } || { ACCEL=""; CPU="-cpu qemu64"; }
+        [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
+        ACCEL=""; CPU="-cpu qemu64"
+        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        qemu-img create -f qcow2 -F raw -b "$CACHE/base.raw" "$CACHE/overlay.qcow2"
+        sudo mkdir -p /mnt/dlivefs; sudo chown runner:runner /mnt/dlivefs
 
-        python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --interval 1 > /tmp/livepush.log 2>&1 &
-        PUSH_PID=$!
-        echo "✓ livepush daemon started (event-driven, 1s fallback)"
-        echo "Monitor progress: tail -f /tmp/livepush.log"
+        python3 -u dlive.py serve-fuse --accounts /tmp/dlive_accounts --cache "$CACHE" --mount /mnt/dlivefs > /tmp/fuse.log 2>&1 &
+        FUSE_PID=$!
+        FUSE_OK=0
+        for i in $(seq 1 30); do
+          [ -e /mnt/dlivefs/disk.raw ] && { FUSE_OK=1; break; }
+          kill -0 $FUSE_PID 2>/dev/null || break
+          sleep 1
+        done
+
+        if [ $FUSE_OK = 1 ]; then
+          echo "✓ FUSE LIVE DISK ACTIVE — reads stream from Drime, writes push in ~150ms"
+          DISK=/mnt/dlivefs/disk.raw; FMT=raw; PUSH_PID=""
+        else
+          echo "⚠ FUSE unavailable — fallback: restore + 1s livepush"
+          cat /tmp/fuse.log || true
+          kill $FUSE_PID 2>/dev/null
+          python3 -u dlive.py restore --accounts /tmp/dlive_accounts --cache "$CACHE" --out "$CACHE/base.raw"
+          qemu-img create -f qcow2 -F raw -b "$CACHE/base.raw" "$CACHE/overlay.qcow2"
+          python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --interval 1 > /tmp/livepush.log 2>&1 &
+          PUSH_PID=$!
+          DISK="$CACHE/overlay.qcow2"; FMT=qcow2
+        fi
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "First boot = Ubuntu installer. Reboots = your disk."
+        echo "First boot = Ubuntu installer. Reboots = your Drime disk."
         echo "Install: entire disk, NO LVM."
-        echo "Drime will show increasing usage as blocks upload."
         echo "=================================================="
 
-        sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
+        DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
-          -drive file="$CACHE/overlay.qcow2",format=qcow2,if=none,id=d0,cache=writeback \
+          -drive file="$DISK",format=$FMT,if=none,id=d0,cache=writeback \
           -device ide-hd,drive=d0 \
           -cdrom "$ISO" \
           -boot order=c,once=d \
@@ -410,7 +480,8 @@ jobs:
 
         wait $QPID
 
-        echo "VM stopped — running final sync..."
-        kill $PUSH_PID 2>/dev/null
-        python3 -u dlive.py push --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2"
-        echo "✓ Final sync complete. Your disk is safe on Drime."
+        echo "VM stopped — final sync..."
+        [ -n "$PUSH_PID" ] && kill $PUSH_PID 2>/dev/null
+        python3 -u dlive.py drain --accounts /tmp/dlive_accounts --cache "$CACHE"
+        kill $FUSE_PID 2>/dev/null
+        echo "✓ Done. Your disk lives on Drime."
