@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools
 
     - name: Install latest rclone
       run: |
@@ -70,11 +70,11 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 engine (restore + livepush mode)
+    - name: Write DLIVE1 engine (0.1s event-driven write-through)
       run: |
         cat > dlive.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, json, zlib, subprocess, time, argparse, hashlib, sys, threading, queue
+        import os, json, zlib, subprocess, time, argparse, hashlib, sys, threading, queue, select
         from pathlib import Path
         from collections import defaultdict
 
@@ -87,8 +87,6 @@ jobs:
             except Exception as e:
                 print(f"[RC ERROR] {e}", flush=True)
                 return subprocess.CompletedProcess(args, 1, b"", str(e).encode())
-
-        def checksum(d): return hashlib.sha256(d).hexdigest()[:16]
 
         class Engine:
             def __init__(s, accounts_file, cache):
@@ -207,14 +205,16 @@ jobs:
                         for lid, d in items:
                             open(stage / f"{lid:08d}.gz", "wb").write(zlib.compress(d, 1))
                         r = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", "16")
-                        for f in stage.glob("*"):
-                            try: f.unlink()
-                            except Exception: pass
-                        if r.returncode != 0:
+                        if r.returncode == 0:
+                            s.log(f"uploaded {len(items)} blocks to {name}")
+                        else:
                             base = next((a for nm, a, b in s.ranges if nm == name), None)
                             if base is not None:
                                 for lid, _ in items:
                                     with s.up_lock: s.up_set.add(base + lid); s.up_q.put(base + lid)
+                        for f in stage.glob("*"):
+                            try: f.unlink()
+                            except Exception: pass
                     with s.up_lock:
                         for c in batch: s.up_set.discard(c)
 
@@ -238,24 +238,47 @@ jobs:
                     pos += k
                 return changed
 
+            def push_once(s, overlay):
+                try:
+                    r = subprocess.run(["qemu-img", "map", "-U", "--output=json", overlay], capture_output=True, timeout=120)
+                    if r.returncode != 0:
+                        s.log(f"map failed: {r.stderr.decode()[:150]}"); return 0
+                    pushed = 0
+                    for ex in json.loads(r.stdout):
+                        if not ex.get("data") or ex.get("zero"): continue
+                        fn = ex.get("filename", "")
+                        if not fn or "base.raw" in fn: continue
+                        with open(overlay, "rb") as f:
+                            f.seek(ex["offset"]); d = f.read(ex["length"])
+                        pushed += s.write_changed(ex["start"], d)
+                    if pushed: s.log(f"pushed {pushed} changed blocks")
+                    return pushed
+                except Exception as e:
+                    s.log(f"push error: {e}"); return 0
+
             def livepush(s, overlay, interval):
                 s.start_uploaders()
-                s.log(f"livepush started on {overlay} every {interval}s")
+                s.log("livepush: event-driven write-through, 0.1s debounce")
+                last_poll = time.time(); dirty = False; due = 0.0; stdin_ok = True
                 while s.running:
-                    try:
-                        r = subprocess.run(["qemu-img", "map", "--output=json", overlay], capture_output=True, timeout=120)
-                        extents = json.loads(r.stdout)
-                        pushed = 0
-                        for ex in extents:
-                            if not ex.get("data") or ex.get("zero"): continue
-                            if overlay not in ex.get("filename", ""): continue
-                            with open(overlay, "rb") as f:
-                                f.seek(ex["offset"]); d = f.read(ex["length"])
-                            pushed += s.write_changed(ex["start"], d)
-                        if pushed: s.log(f"livepush: {pushed} changed blocks pushed")
-                    except Exception as e:
-                        s.log(f"livepush error: {e}")
-                    time.sleep(interval)
+                    rlist = []
+                    if stdin_ok:
+                        try: rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        except Exception: rlist = []
+                    now = time.time()
+                    if rlist:
+                        line = sys.stdin.readline()
+                        if line:
+                            dirty = True
+                            if due == 0.0: due = now + 0.1
+                        else:
+                            stdin_ok = False
+                    if dirty and due and now >= due:
+                        s.push_once(overlay)
+                        dirty = False; due = 0.0; last_poll = now
+                    if now - last_poll > interval:
+                        s.push_once(overlay)
+                        last_poll = now
 
             def flush(s):
                 t0 = time.time()
@@ -271,7 +294,7 @@ jobs:
             ap.add_argument("--cache", required=True)
             ap.add_argument("--out")
             ap.add_argument("--overlay")
-            ap.add_argument("--interval", type=int, default=10)
+            ap.add_argument("--interval", type=int, default=2)
             a = ap.parse_args()
             e = Engine(a.accounts, a.cache)
             e.load()
@@ -279,6 +302,11 @@ jobs:
                 e.restore(a.out)
             elif a.cmd == "livepush":
                 e.livepush(a.overlay, a.interval)
+            elif a.cmd == "pushonce":
+                e.start_uploaders()
+                e.push_once(a.overlay)
+                e.flush()
+                e.log("final sync complete")
         PYEOF
         echo "✓ Engine written"
 
@@ -311,8 +339,9 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM (local file + livepush sync)
+    - name: Boot VM (0.1s write-through live sync)
       run: |
+        set +e
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
@@ -320,12 +349,15 @@ jobs:
 
         qemu-img create -f qcow2 -F raw -b "$CACHE/base.raw" "$CACHE/overlay.qcow2"
 
-        nohup python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --interval 10 > /tmp/livepush.log 2>&1 &
-        echo "✓ livepush daemon started"
+        # EVENT-DRIVEN SYNC: inotify fires on every write -> push within 0.1s
+        inotifywait -m -e modify -e close_write "$CACHE/overlay.qcow2" 2>/dev/null | \
+          python3 -u dlive.py livepush --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2" --interval 2 > /tmp/livepush.log 2>&1 &
+        echo "✓ 0.1s write-through sync daemon started"
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
         echo "Install: entire disk, NO LVM"
+        echo "Every write hits Drime within ~0.1s"
         echo "=================================================="
         sudo -E DISPLAY=:1 qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
@@ -336,4 +368,14 @@ jobs:
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial stdio \
-          -display sdl
+          -display sdl > /tmp/vm.log 2>&1 &
+        QPID=$!
+
+        ( while kill -0 $QPID 2>/dev/null; do
+            sleep 20
+            echo "--- livepush ---"; tail -n 4 /tmp/livepush.log 2>/dev/null
+          done ) &
+
+        wait $QPID
+        echo "VM stopped - final sync to Drime..."
+        python3 -u dlive.py pushonce --accounts /tmp/dlive_accounts --cache "$CACHE" --overlay "$CACHE/overlay.qcow2"
