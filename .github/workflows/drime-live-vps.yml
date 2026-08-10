@@ -1,4 +1,4 @@
-name: DLIVE1 PINNACLE + NATIVE VNC (Zero Bottleneck)
+name: DLIVE1 GOD MODE (noVNC + 50ms HyperScan)
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install latest rclone
@@ -71,7 +71,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 PINNACLE engine
+    - name: Write DLIVE1 GOD MODE engine
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -94,8 +94,8 @@ jobs:
                 s.running = True
                 s.stats = {"mb": 0.0}
                 s.pushed_hashes = {}
-                s.compress_queue = queue.Queue(maxsize=200)
-                s.upload_queue = queue.Queue(maxsize=200)
+                s.compress_queue = queue.Queue(maxsize=500)
+                s.upload_queue = queue.Queue(maxsize=500)
                 s.lock = threading.Lock()
                 s.raw_fd = -1
 
@@ -128,8 +128,8 @@ jobs:
             def start_workers(s):
                 threading.Thread(target=s.flusher_loop, daemon=True).start()
                 threading.Thread(target=s.scanner_loop, daemon=True).start()
-                for _ in range(8): threading.Thread(target=s.compress_worker, daemon=True).start()
-                for _ in range(8): threading.Thread(target=s.upload_worker, daemon=True).start()
+                for _ in range(12): threading.Thread(target=s.compress_worker, daemon=True).start()
+                for _ in range(12): threading.Thread(target=s.upload_worker, daemon=True).start()
 
             def rcd_upload(s, gz_path, dest):
                 url = "http://127.0.0.1:5572/operations/copyfile"
@@ -149,12 +149,12 @@ jobs:
                     try:
                         if s.raw_fd >= 0: os.fsync(s.raw_fd)
                     except: pass
-                    time.sleep(0.5)
+                    time.sleep(0.2)  # 0.2s fsync for maximum NVMe speed + data safety
 
             def scanner_loop(s):
                 fd = os.open(s.raw_path, os.O_RDONLY)
                 s.raw_fd = fd
-                s.log(f"⚡ PINNACLE ACTIVE (0.5s fsync + 0.1s scan + 8x compress + 8x upload)")
+                s.log(f"⚡ GOD MODE ACTIVE (0.2s fsync + 50ms scan + 12x compress + 12x upload)")
                 while s.running:
                     pos = 0
                     while True:
@@ -177,7 +177,7 @@ jobs:
                             s.compress_queue.put((cid, d, h))
                         
                         pos = data_end
-                    time.sleep(0.1)
+                    time.sleep(0.05)  # Scan every 50ms
 
             def compress_worker(s):
                 while s.running or not s.compress_queue.empty():
@@ -202,9 +202,9 @@ jobs:
                         with s.lock:
                             s.pushed_hashes[cid] = h
                             s.stats["mb"] += B / (1024*1024)
-                        s.log(f"⚡ INSTANT PUSHED {cid:08d} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
+                        s.log(f"⚡ PUSHED {cid:08d} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
                     else:
-                        s.log(f"FAILED to upload {cid:08d}")
+                        s.log(f"FAILED {cid:08d}")
                     
                     try: gz_path.unlink()
                     except: pass
@@ -263,7 +263,7 @@ jobs:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ PINNACLE Engine written"
+        echo "✓ GOD MODE Engine written"
 
     - name: Start rclone daemon
       run: |
@@ -290,7 +290,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM PINNACLE + NATIVE VNC + LIVE LOGS
+    - name: Boot VM GOD MODE + noVNC + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -311,18 +311,23 @@ jobs:
         WATCH_PID=$!
         sleep 2
 
+        # Start noVNC web proxy (Browser access on port 6080)
+        websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+        WEBSOCK_PID=$!
+
         echo "=================================================="
-        echo "VNC: $NB_IP:5900 (NATIVE QEMU VNC — zero X11 bottleneck)"
-        echo "MODE: PINNACLE storage + NATIVE VNC display"
+        echo "VNC CLIENT: $NB_IP:5900"
+        echo "WEB BROWSER: http://$NB_IP:6080/vnc.html (autoconnect)"
+        echo "MODE: GOD MODE (50ms scan + 24 workers + Death Scan)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # NATIVE VNC: QEMU streams its own framebuffer directly. No Xvfb, no x11vnc, no SDL.
-        # This is the fastest possible interactive path (1 hop).
+        # cache=writeback,aio=threads gives VM NVMe RAM speed without the aio=native error.
+        # lossy,tight compresses VNC frames instantly over the network.
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
-          -drive file="$RAW",format=raw,if=none,id=d0,cache=writeback,aio=native,discard=unmap \
+          -drive file="$RAW",format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
           -boot order=c,once=d \
@@ -330,14 +335,14 @@ jobs:
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial stdio \
           -display none \
-          -vnc 0.0.0.0:0,share=allow-exclusive &
+          -vnc 0.0.0.0:0,lossy,tight,share=allow-exclusive &
         QPID=$!
 
         wait $QPID
 
         echo "VM stopped — executing DEATH SCAN..."
         sudo python3 -u dlive_raw.py drain --accounts /tmp/dlive_accounts --cache "$CACHE" --raw "$RAW"
-        sudo kill $WATCH_PID 2>/dev/null
+        sudo kill $WATCH_PID $WEBSOCK_PID 2>/dev/null
         kill $TAIL_PID 2>/dev/null
         echo "--- FULL WATCH LOG ---"
         cat /tmp/watch.log
