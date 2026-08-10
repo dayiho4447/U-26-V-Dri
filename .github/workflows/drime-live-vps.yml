@@ -1,4 +1,4 @@
-name: DLIVE1 NVME MONSTER MASTER (Page-Cache Bypass)
+name: DLIVE1 NVME INSTANT (rclone rcd HTTP Push)
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 python3-inotify curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install latest rclone
@@ -71,29 +71,24 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NVME MONSTER engine
+    - name: Write DLIVE1 NVME INSTANT engine
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
-        # DLIVE1 NVME MONSTER MASTER
+        # DLIVE1 NVME INSTANT
         # 1. VM writes to RAM (cache=writeback) for NVMe speed.
-        # 2. Python fsync thread forces RAM to SSD every 1s (1s RPO).
-        # 3. SEEK_DATA reads ONLY changed blocks directly from SSD.
-        # 4. 4MB Blocks + A/B Double Buffer saturates Drime API.
-        import os, json, zlib, subprocess, sys, argparse, threading, traceback, time
+        # 2. Python scanner forces fsync every 1s, uses SEEK_DATA to find changed blocks.
+        # 3. Instantly pushes via HTTP to persistent rclone rcd daemon.
+        # ZERO Batching. ZERO Process Spawn Overhead.
+        import os, json, zlib, subprocess, sys, argparse, threading, traceback, time, queue, urllib.request
         from pathlib import Path
 
         B = 4 * 1024 * 1024  # 4MB BLOCKS
-        RC_FLAGS = ["--retries", "3", "--low-level-retries", "10", "--contimeout", "30s", "--timeout", "3600s"]
-
-        def rc(*args, timeout=3700):
-            try: return subprocess.run(["rclone"] + list(args) + RC_FLAGS, capture_output=True, timeout=timeout)
-            except Exception as e:
-                return subprocess.CompletedProcess(args, 1, b"", str(e).encode())
 
         class Engine:
             def __init__(s, accounts_file, cache):
                 s.cache = Path(cache); s.cache.mkdir(parents=True, exist_ok=True)
+                (s.cache / "staging").mkdir(exist_ok=True)
                 s.accounts = []
                 for line in open(accounts_file):
                     p = line.split()
@@ -102,30 +97,16 @@ jobs:
                 s.anchor = s.accounts[0][0]
                 
                 s.running = True
-                s.stats = {"mb": 0.0, "scans": 0}
+                s.stats = {"mb": 0.0}
                 s.pushed_hashes = {}
-                
-                s.stage_lock = threading.Lock()
-                s.stage_dirs = [s.cache / "stage_A", s.cache / "stage_B"]
-                for d in s.stage_dirs: d.mkdir(exist_ok=True)
-                s.current_stage_idx = 0
-                s.pending_bytes = 0
-                
-                s.upload_event = threading.Event()
-                s.upload_in_progress = False
-                s.upload_done_cond = threading.Condition()
-                
-                s.scan_needed = False
-                s.scan_lock = threading.Lock()
-                s.scan_cond = threading.Condition(s.scan_lock)
-                
+                s.upload_queue = queue.Queue()
                 s.raw_fd = -1
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
             def load(s):
                 sb = s.cache / "superblock.json"
-                r = rc("copyto", f"{s.anchor}:dlive/v2/superblock.json", str(sb))
+                r = subprocess.run(["rclone", "copyto", f"{s.anchor}:dlive/v2/superblock.json", str(sb)], capture_output=True)
                 if r.returncode == 0 and sb.exists():
                     try:
                         data = json.load(open(sb))
@@ -133,158 +114,111 @@ jobs:
                             s.accounts = data["accounts"]
                             s.log(f"Loaded existing v2 disk: {len(s.accounts)} accounts")
                         else:
-                            s.log("Block size changed, creating new v2 disk..."); s._create_superblock()
+                            s._create_superblock()
                     except Exception: s._create_superblock()
                 else:
-                    s.log("Creating new v2 disk..."); s._create_superblock()
+                    s._create_superblock()
                 s.ranges = []; off = 0
                 for name, size in s.accounts:
                     nb = size // B; s.ranges.append((name, off, off + nb)); off += nb
                 s.size = off * B
-                s.log(f"Disk size: {s.size // 1024**3}GB ({off} blocks of 4MB)")
+                s.total_blocks = s.size // B
+                s.log(f"Disk size: {s.size // 1024**3}GB ({s.total_blocks} blocks of 4MB)")
 
             def _create_superblock(s):
+                s.log("Creating new v2 disk...")
                 sb = {"magic": "DLIVE1", "version": 2, "block_size": B, "accounts": s.accounts}
                 with open(s.cache / "superblock.json", "w") as f: json.dump(sb, f)
-                rc("copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v2/superblock.json")
+                subprocess.run(["rclone", "copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v2/superblock.json"], capture_output=True)
 
             def start_workers(s):
-                threading.Thread(target=s._uploader, daemon=True).start()
-                threading.Thread(target=s._scanner_loop, daemon=True).start()
-                threading.Thread(target=s._sync_loop, daemon=True).start()
+                for i in range(8):
+                    threading.Thread(target=s.uploader_worker, daemon=True).start()
+                threading.Thread(target=s.scan_loop, daemon=True).start()
 
-            def _sync_loop(s):
-                """MONSTER HACK: Forces RAM page cache to SSD every 1s so SEEK_DATA sees it instantly"""
-                while s.running:
-                    time.sleep(1)
-                    try:
-                        if s.raw_fd >= 0:
-                            os.fsync(s.raw_fd)
-                            with s.scan_cond:
-                                s.scan_needed = True
-                                s.scan_cond.notify()
+            def rcd_upload(s, gz_path, dest):
+                url = "http://127.0.0.1:5572/operations/copyfile"
+                data = json.dumps({"src": str(gz_path), "dst": dest}).encode()
+                req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                try:
+                    urllib.request.urlopen(req, timeout=60)
+                    return True
+                except Exception:
+                    return False
+
+            def fallback_upload(s, gz_path, dest):
+                r = subprocess.run(["rclone", "copyto", str(gz_path), dest, "--retries", "2"], capture_output=True)
+                return r.returncode == 0
+
+            def uploader_worker(s):
+                while s.running or not s.upload_queue.empty():
+                    try: cid, gz_path = s.upload_queue.get(timeout=1)
+                    except queue.Empty: continue
+                    
+                    dest = f"{s.anchor}:dlive/v2/blocks/{cid:08d}.gz"
+                    ok = s.rcd_upload(gz_path, dest)
+                    if not ok:
+                        ok = s.fallback_upload(gz_path, dest)
+                    
+                    if ok:
+                        s.stats["mb"] += B / (1024*1024)
+                        s.log(f"⚡ INSTANT PUSHED {cid:08d} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
+                    else:
+                        s.log(f"FAILED to upload {cid:08d}")
+                    
+                    try: gz_path.unlink()
                     except: pass
 
-            def _uploader(s):
+            def scan_loop(s):
+                fd = os.open(s.raw_path, os.O_RDONLY)
+                s.raw_fd = fd
+                s.log(f"⚡ NVME MONSTER ACTIVE (1s RPO + INSTANT rcd HTTP push)")
                 while s.running:
-                    s.upload_event.wait()
-                    s.upload_event.clear()
-                    
-                    with s.stage_lock:
-                        upload_dir = s.stage_dirs[s.current_stage_idx]
-                        s.current_stage_idx = 1 - s.current_stage_idx
-                        bytes_to_upload = s.pending_bytes
-                        s.pending_bytes = 0
-                        
-                    files = list(upload_dir.glob("*.gz"))
-                    if not files:
-                        with s.upload_done_cond: s.upload_done_cond.notify_all()
-                        continue
-                        
-                    with s.upload_done_cond: s.upload_in_progress = True
-                    
-                    r = rc("copy", str(upload_dir), f"{s.anchor}:dlive/v2/blocks/", "--transfers", "8", "--checkers", "8")
-                    
-                    if r.returncode == 0:
-                        s.stats["mb"] += bytes_to_upload / (1024*1024)
-                        s.log(f"⚡ UPLOADED {bytes_to_upload/(1024*1024):.1f}MB ({len(files)} files) — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
-                    else:
-                        s.log(f"Upload failed! stderr: {r.stderr.decode()[:200]}")
-                        
-                    for f in files:
-                        try: f.unlink()
-                        except: pass
-                    
-                    with s.upload_done_cond:
-                        s.upload_in_progress = False
-                        s.upload_done_cond.notify_all()
-
-            def _scanner_loop(s):
-                while s.running:
-                    with s.scan_cond:
-                        while not s.scan_needed and s.running:
-                            s.scan_cond.wait()
-                        s.scan_needed = False
-                    if s.running:
-                        s.sync_sparse_file()
-
-            def sync_sparse_file(s):
-                try:
                     pos = 0
-                    files_ready = 0
-                    s.stats["scans"] += 1
-                    
                     while True:
-                        try: data_start = os.lseek(s.raw_fd, pos, os.SEEK_DATA)
+                        try: data_start = os.lseek(fd, pos, os.SEEK_DATA)
                         except OSError: break
-                        try: data_end = os.lseek(s.raw_fd, data_start, os.SEEK_HOLE)
-                        except OSError: data_end = os.lseek(s.raw_fd, 0, os.SEEK_END)
+                        try: data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
+                        except OSError: data_end = os.lseek(fd, 0, os.SEEK_END)
                         
                         start_cid = data_start // B
                         end_cid = (data_end + B - 1) // B
                         
                         for cid in range(start_cid, end_cid):
-                            os.lseek(s.raw_fd, cid * B, os.SEEK_SET)
-                            d = os.read(s.raw_fd, B)
+                            os.lseek(fd, cid * B, os.SEEK_SET)
+                            d = os.read(fd, B)
                             if len(d) < B: d += b"\x00" * (B - len(d))
                             if not any(d): continue
                             
                             h = zlib.crc32(d)
                             if s.pushed_hashes.get(cid) == h: continue
                             
-                            with s.stage_lock:
-                                gz_path = s.stage_dirs[s.current_stage_idx] / f"{cid:08d}.gz"
-                                gz_path.write_bytes(zlib.compress(d, 1))
-                                s.pending_bytes += len(d)
-                            
+                            gz_path = s.cache / "staging" / f"{cid:08d}.gz"
+                            gz_path.write_bytes(zlib.compress(d, 1))
                             s.pushed_hashes[cid] = h
-                            files_ready += 1
-                            
-                            if files_ready >= 16:
-                                s.upload_event.set()
-                                files_ready = 0
-                                
+                            s.upload_queue.put((cid, gz_path))
+                        
                         pos = data_end
                     
-                    if files_ready > 0:
-                        s.upload_event.set()
-                except Exception as e:
-                    s.log(f"sync error: {e}")
+                    os.fsync(fd) # Force RAM page cache to SSD
+                    time.sleep(1) # 1 sec RPO
+                os.close(fd)
 
             def watch(s, raw_path):
                 s.raw_path = raw_path
-                # Open persistent raw FD for fsync and SEEK_DATA
-                s.raw_fd = os.open(raw_path, os.O_RDWR)
                 s.start_workers()
-                try:
-                    import inotify.adapters
-                    i = inotify.adapters.Inotify()
-                    i.add_watch(str(raw_path), mask=inotify.constants.IN_MODIFY | inotify.constants.IN_CLOSE_WRITE)
-                    s.log(f"⚡ NVME MONSTER ACTIVE (Page-Cache Bypass + 1s fsync + 4MB Blocks)")
-                    for event in i.event_gen(yield_nones=False):
-                        if not s.running: break
-                        (_, type_names, path, filename) = event
-                        if 'IN_MODIFY' in type_names or 'IN_CLOSE_WRITE' in type_names:
-                            with s.scan_cond:
-                                s.scan_needed = True
-                                s.scan_cond.notify()
-                except Exception as e:
-                    s.log(f"inotify failed: {e}")
+                while s.running:
+                    time.sleep(1)
 
             def drain(s):
                 s.running = False
+                # Force one last fsync and scan to catch the final shutdown flush
                 if s.raw_fd >= 0:
                     os.fsync(s.raw_fd)
-                    os.close(s.raw_fd)
-                with s.scan_cond:
-                    s.scan_needed = True
-                    s.scan_cond.notify()
-                time.sleep(2) # Let scanner finish
-                if s.pending_bytes > 0:
-                    s.upload_event.set()
-                with s.upload_done_cond:
-                    while s.upload_in_progress or s.pending_bytes > 0:
-                        s.upload_done_cond.wait()
+                
+                # Wait for queue to empty
+                while not s.upload_queue.empty():
+                    time.sleep(0.5)
                 s.log(f"Final: TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
 
         if __name__ == "__main__":
@@ -304,7 +238,13 @@ jobs:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ NVME MONSTER Engine written"
+        echo "✓ NVME INSTANT Engine written"
+
+    - name: Start rclone daemon (Persistent HTTP connections)
+      run: |
+        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
+        sleep 2
+        curl -s http://127.0.0.1:5572/rc/noop && echo "✓ rclone rcd ready (instant HTTP push enabled)"
 
     - name: Prepare cache dir
       run: |
@@ -334,7 +274,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM NVME MONSTER + LIVE LOGS
+    - name: Boot VM NVME INSTANT + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -357,11 +297,10 @@ jobs:
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: NVME MONSTER (cache=writeback + 1s fsync)"
+        echo "MODE: NVME INSTANT (rcd HTTP push + 1s RPO)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # cache=writeback gives VM NVMe RAM speed. aio=threads prevents stalls. discard=unmap handles TRIM.
         DISPLAY=:1 SDL_VIDEO_WINDOW_POS=center qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
