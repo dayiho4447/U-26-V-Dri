@@ -1,4 +1,4 @@
-name: DLIVE1 NVME INSTANT (rclone rcd HTTP Push)
+name: DLIVE1 PINNACLE + NATIVE VNC (Zero Bottleneck)
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install latest rclone
@@ -71,15 +71,10 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NVME INSTANT engine
+    - name: Write DLIVE1 PINNACLE engine
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
-        # DLIVE1 NVME INSTANT
-        # 1. VM writes to RAM (cache=writeback) for NVMe speed.
-        # 2. Python scanner forces fsync every 1s, uses SEEK_DATA to find changed blocks.
-        # 3. Instantly pushes via HTTP to persistent rclone rcd daemon.
-        # ZERO Batching. ZERO Process Spawn Overhead.
         import os, json, zlib, subprocess, sys, argparse, threading, traceback, time, queue, urllib.request
         from pathlib import Path
 
@@ -99,7 +94,9 @@ jobs:
                 s.running = True
                 s.stats = {"mb": 0.0}
                 s.pushed_hashes = {}
-                s.upload_queue = queue.Queue()
+                s.compress_queue = queue.Queue(maxsize=200)
+                s.upload_queue = queue.Queue(maxsize=200)
+                s.lock = threading.Lock()
                 s.raw_fd = -1
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
@@ -113,17 +110,14 @@ jobs:
                         if data.get("block_size") == B:
                             s.accounts = data["accounts"]
                             s.log(f"Loaded existing v2 disk: {len(s.accounts)} accounts")
-                        else:
-                            s._create_superblock()
+                        else: s._create_superblock()
                     except Exception: s._create_superblock()
-                else:
-                    s._create_superblock()
+                else: s._create_superblock()
                 s.ranges = []; off = 0
                 for name, size in s.accounts:
                     nb = size // B; s.ranges.append((name, off, off + nb)); off += nb
                 s.size = off * B
-                s.total_blocks = s.size // B
-                s.log(f"Disk size: {s.size // 1024**3}GB ({s.total_blocks} blocks of 4MB)")
+                s.log(f"Disk size: {s.size // 1024**3}GB ({s.size // B} blocks of 4MB)")
 
             def _create_superblock(s):
                 s.log("Creating new v2 disk...")
@@ -132,9 +126,10 @@ jobs:
                 subprocess.run(["rclone", "copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v2/superblock.json"], capture_output=True)
 
             def start_workers(s):
-                for i in range(8):
-                    threading.Thread(target=s.uploader_worker, daemon=True).start()
-                threading.Thread(target=s.scan_loop, daemon=True).start()
+                threading.Thread(target=s.flusher_loop, daemon=True).start()
+                threading.Thread(target=s.scanner_loop, daemon=True).start()
+                for _ in range(8): threading.Thread(target=s.compress_worker, daemon=True).start()
+                for _ in range(8): threading.Thread(target=s.upload_worker, daemon=True).start()
 
             def rcd_upload(s, gz_path, dest):
                 url = "http://127.0.0.1:5572/operations/copyfile"
@@ -143,36 +138,23 @@ jobs:
                 try:
                     urllib.request.urlopen(req, timeout=60)
                     return True
-                except Exception:
-                    return False
+                except Exception: return False
 
             def fallback_upload(s, gz_path, dest):
                 r = subprocess.run(["rclone", "copyto", str(gz_path), dest, "--retries", "2"], capture_output=True)
                 return r.returncode == 0
 
-            def uploader_worker(s):
-                while s.running or not s.upload_queue.empty():
-                    try: cid, gz_path = s.upload_queue.get(timeout=1)
-                    except queue.Empty: continue
-                    
-                    dest = f"{s.anchor}:dlive/v2/blocks/{cid:08d}.gz"
-                    ok = s.rcd_upload(gz_path, dest)
-                    if not ok:
-                        ok = s.fallback_upload(gz_path, dest)
-                    
-                    if ok:
-                        s.stats["mb"] += B / (1024*1024)
-                        s.log(f"⚡ INSTANT PUSHED {cid:08d} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
-                    else:
-                        s.log(f"FAILED to upload {cid:08d}")
-                    
-                    try: gz_path.unlink()
+            def flusher_loop(s):
+                while s.running:
+                    try:
+                        if s.raw_fd >= 0: os.fsync(s.raw_fd)
                     except: pass
+                    time.sleep(0.5)
 
-            def scan_loop(s):
+            def scanner_loop(s):
                 fd = os.open(s.raw_path, os.O_RDONLY)
                 s.raw_fd = fd
-                s.log(f"⚡ NVME MONSTER ACTIVE (1s RPO + INSTANT rcd HTTP push)")
+                s.log(f"⚡ PINNACLE ACTIVE (0.5s fsync + 0.1s scan + 8x compress + 8x upload)")
                 while s.running:
                     pos = 0
                     while True:
@@ -192,32 +174,75 @@ jobs:
                             
                             h = zlib.crc32(d)
                             if s.pushed_hashes.get(cid) == h: continue
-                            
-                            gz_path = s.cache / "staging" / f"{cid:08d}.gz"
-                            gz_path.write_bytes(zlib.compress(d, 1))
-                            s.pushed_hashes[cid] = h
-                            s.upload_queue.put((cid, gz_path))
+                            s.compress_queue.put((cid, d, h))
                         
                         pos = data_end
+                    time.sleep(0.1)
+
+            def compress_worker(s):
+                while s.running or not s.compress_queue.empty():
+                    try: cid, d, h = s.compress_queue.get(timeout=0.5)
+                    except queue.Empty: continue
+                    gz_data = zlib.compress(d, 1)
+                    s.upload_queue.put((cid, gz_data, h))
+
+            def upload_worker(s):
+                while s.running or not s.upload_queue.empty():
+                    try: cid, gz_data, h = s.upload_queue.get(timeout=0.5)
+                    except queue.Empty: continue
                     
-                    os.fsync(fd) # Force RAM page cache to SSD
-                    time.sleep(1) # 1 sec RPO
-                os.close(fd)
+                    gz_path = s.cache / "staging" / f"{cid:08d}.gz"
+                    gz_path.write_bytes(gz_data)
+                    
+                    dest = f"{s.anchor}:dlive/v2/blocks/{cid:08d}.gz"
+                    ok = s.rcd_upload(gz_path, dest)
+                    if not ok: ok = s.fallback_upload(gz_path, dest)
+                    
+                    if ok:
+                        with s.lock:
+                            s.pushed_hashes[cid] = h
+                            s.stats["mb"] += B / (1024*1024)
+                        s.log(f"⚡ INSTANT PUSHED {cid:08d} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
+                    else:
+                        s.log(f"FAILED to upload {cid:08d}")
+                    
+                    try: gz_path.unlink()
+                    except: pass
 
             def watch(s, raw_path):
                 s.raw_path = raw_path
                 s.start_workers()
-                while s.running:
-                    time.sleep(1)
+                while s.running: time.sleep(1)
 
             def drain(s):
+                s.log("Draining: executing DEATH SCAN...")
                 s.running = False
-                # Force one last fsync and scan to catch the final shutdown flush
+                time.sleep(0.2)
+                
                 if s.raw_fd >= 0:
                     os.fsync(s.raw_fd)
+                    pos = 0
+                    while True:
+                        try: data_start = os.lseek(s.raw_fd, pos, os.SEEK_DATA)
+                        except OSError: break
+                        try: data_end = os.lseek(s.raw_fd, data_start, os.SEEK_HOLE)
+                        except OSError: data_end = os.lseek(s.raw_fd, 0, os.SEEK_END)
+                        
+                        start_cid = data_start // B
+                        end_cid = (data_end + B - 1) // B
+                        
+                        for cid in range(start_cid, end_cid):
+                            os.lseek(s.raw_fd, cid * B, os.SEEK_SET)
+                            d = os.read(s.raw_fd, B)
+                            if len(d) < B: d += b"\x00" * (B - len(d))
+                            if not any(d): continue
+                            h = zlib.crc32(d)
+                            if s.pushed_hashes.get(cid) == h: continue
+                            s.compress_queue.put((cid, d, h))
+                        pos = data_end
+                    os.close(s.raw_fd)
                 
-                # Wait for queue to empty
-                while not s.upload_queue.empty():
+                while not s.compress_queue.empty() or not s.upload_queue.empty():
                     time.sleep(0.5)
                 s.log(f"Final: TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
 
@@ -238,13 +263,13 @@ jobs:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ NVME INSTANT Engine written"
+        echo "✓ PINNACLE Engine written"
 
-    - name: Start rclone daemon (Persistent HTTP connections)
+    - name: Start rclone daemon
       run: |
         nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
         sleep 2
-        curl -s http://127.0.0.1:5572/rc/noop && echo "✓ rclone rcd ready (instant HTTP push enabled)"
+        curl -s http://127.0.0.1:5572/rc/noop && echo "✓ rclone rcd ready"
 
     - name: Prepare cache dir
       run: |
@@ -265,16 +290,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Start VNC
-      run: |
-        sudo pkill -f Xvfb || true; sudo pkill -f x11vnc || true; sleep 2
-        sudo Xvfb :1 -screen 0 1920x1080x24 & sleep 2
-        DISPLAY=:1 sudo xhost + 2>/dev/null || true
-        sudo x11vnc -display :1 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
-        sleep 2
-        sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
-
-    - name: Boot VM NVME INSTANT + LIVE LOGS
+    - name: Boot VM PINNACLE + NATIVE VNC + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -296,27 +312,30 @@ jobs:
         sleep 2
 
         echo "=================================================="
-        echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: NVME INSTANT (rcd HTTP push + 1s RPO)"
+        echo "VNC: $NB_IP:5900 (NATIVE QEMU VNC — zero X11 bottleneck)"
+        echo "MODE: PINNACLE storage + NATIVE VNC display"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        DISPLAY=:1 SDL_VIDEO_WINDOW_POS=center qemu-system-x86_64 $ACCEL -machine pc $CPU \
-          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+        # NATIVE VNC: QEMU streams its own framebuffer directly. No Xvfb, no x11vnc, no SDL.
+        # This is the fastest possible interactive path (1 hop).
+        sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
+          -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
-          -drive file="$RAW",format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
+          -drive file="$RAW",format=raw,if=none,id=d0,cache=writeback,aio=native,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
           -boot order=c,once=d \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial stdio \
-          -display sdl &
+          -display none \
+          -vnc 0.0.0.0:0,share=allow-exclusive &
         QPID=$!
 
         wait $QPID
 
-        echo "VM stopped — final sync..."
+        echo "VM stopped — executing DEATH SCAN..."
         sudo python3 -u dlive_raw.py drain --accounts /tmp/dlive_accounts --cache "$CACHE" --raw "$RAW"
         sudo kill $WATCH_PID 2>/dev/null
         kill $TAIL_PID 2>/dev/null
