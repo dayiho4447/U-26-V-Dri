@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN
+name: DLIVE1 ENTERPRISE SAN (STRICT FUTURE-PROOF)
 
 on:
   push:
@@ -18,10 +18,20 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install packages
+    - name: Install ALL required packages (STRICT MODE - NO SILENT FAILURES)
       run: |
+        # Explicitly enable universe where nbdkit and websockify live
+        sudo add-apt-repository -y universe
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-python-plugin || true
+        
+        # REMOVED || true. If a package name is wrong, we MUST fail immediately.
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-python-plugin
+        
+        # FUTURE-PROOF VERIFICATION: Check every critical binary exists before proceeding
+        command -v nbdkit >/dev/null 2>&1 || { echo "❌ FATAL: nbdkit binary missing after install"; exit 1; }
+        command -v websockify >/dev/null 2>&1 || { echo "❌ FATAL: websockify binary missing after install"; exit 1; }
+        command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ FATAL: qemu missing after install"; exit 1; }
+        
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install latest rclone
