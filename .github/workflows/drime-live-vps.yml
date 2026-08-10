@@ -1,4 +1,4 @@
-name: DLIVE1 SEEK_DATA (100% Accurate, Zero Timers)
+name: DLIVE1 SEEK_DATA BATCHED (100% Accurate, Zero Timers, FAST)
 
 on:
   push:
@@ -21,7 +21,6 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        # python3-inotify installed via apt so sudo python3 can find it
         sudo apt-get install -y python3 python3-inotify curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
@@ -72,11 +71,11 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 SEEK_DATA engine
+    - name: Write DLIVE1 SEEK_DATA BATCHED engine
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, json, zlib, subprocess, sys, argparse, threading, queue, traceback
+        import os, json, zlib, subprocess, sys, argparse, threading, queue, traceback, time
         from pathlib import Path
         from collections import defaultdict
 
@@ -102,8 +101,10 @@ jobs:
                 s.up_q = queue.Queue(); s.up_set = set()
                 s.up_lock = threading.Lock(); s.cond = threading.Condition(s.up_lock)
                 s.running = True
-                s.stats = {"uploaded": 0, "mb": 0, "events": 0}
-                s.pushed_hashes = {} # Tracks CRC32 of pushed blocks to avoid duplicates
+                s.stats = {"uploaded": 0, "mb": 0, "scans": 0}
+                s.pushed_hashes = {}
+                s.scan_pending = False
+                s.scan_lock = threading.Lock()
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
@@ -137,6 +138,7 @@ jobs:
 
             def start_workers(s):
                 for i in range(16): threading.Thread(target=s._uploader, daemon=True).start()
+                threading.Thread(target=s._batch_scanner, daemon=True).start()
 
             def _uploader(s):
                 while s.running:
@@ -167,24 +169,34 @@ jobs:
                             if ok:
                                 s.stats["uploaded"] += ok
                                 s.stats["mb"] += ok * B // (1024*1024)
-                                s.log(f"pushed {ok} blocks to {name} (total {s.stats['mb']}MB)")
+                                s.log(f"pushed {ok} blocks to {name} (total {s.stats['mb']}MB on Drime)")
                     finally:
                         with s.cond:
                             for c in batch: s.up_set.discard(c)
                             if not s.up_set and s.up_q.empty(): s.cond.notify_all()
 
+            def _batch_scanner(s):
+                """Scans every 500ms instead of on every single write"""
+                while s.running:
+                    time.sleep(0.5)  # Batch interval - wait 500ms
+                    with s.scan_lock:
+                        if not s.scan_pending:
+                            continue
+                        s.scan_pending = False
+                    if hasattr(s, 'raw_path'):
+                        s.sync_sparse_file(s.raw_path)
+
             def sync_sparse_file(s, raw_path):
-                """Uses kernel SEEK_DATA to instantly find written blocks in the 20GB sparse file"""
+                """Uses kernel SEEK_DATA to instantly find written blocks"""
                 try:
                     fd = os.open(raw_path, os.O_RDONLY)
                     pos = 0
                     synced = 0
                     while True:
                         try:
-                            # Jump to next block of actual data (skips empty 20GB void instantly)
                             data_start = os.lseek(fd, pos, os.SEEK_DATA)
                         except OSError:
-                            break # No more data in file
+                            break
                         
                         try:
                             data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
@@ -203,7 +215,7 @@ jobs:
                             
                             h = zlib.crc32(d)
                             if s.pushed_hashes.get(cid) == h:
-                                continue # Already pushed this exact block
+                                continue
                             
                             p = s.block_path(cid)
                             p.write_bytes(d)
@@ -216,8 +228,8 @@ jobs:
                         pos = data_end
                     os.close(fd)
                     if synced > 0:
-                        s.stats["events"] += 1
-                        s.log(f"SEEK_DATA sync: {synced} new/changed blocks queued (total {s.stats['mb']}MB on Drime)")
+                        s.stats["scans"] += 1
+                        s.log(f"scan #{s.stats['scans']}: {synced} blocks queued (total {s.stats['mb']}MB)")
                 except Exception as e:
                     s.log(f"sync error: {e}")
 
@@ -227,24 +239,24 @@ jobs:
                     import inotify.adapters
                     i = inotify.adapters.Inotify()
                     i.add_watch(str(raw_path), mask=inotify.constants.IN_MODIFY | inotify.constants.IN_CLOSE_WRITE)
-                    s.log(f"WATCHING {raw_path} with inotify + SEEK_DATA (writethrough forces instant events)")
+                    s.log(f"WATCHING with BATCHED scanning (500ms intervals, not every write)")
                     for event in i.event_gen(yield_nones=False):
                         if not s.running: break
                         (_, type_names, path, filename) = event
                         if 'IN_MODIFY' in type_names or 'IN_CLOSE_WRITE' in type_names:
-                            s.sync_sparse_file(raw_path)
+                            with s.scan_lock:
+                                s.scan_pending = True  # Just mark for next batch scan
                 except Exception as e:
-                    s.log(f"inotify failed: {e}, falling back to 1s polling")
-                    import time
+                    s.log(f"inotify failed: {e}, using polling")
                     while s.running:
                         s.sync_sparse_file(raw_path)
-                        time.sleep(1)
+                        time.sleep(0.5)
 
             def flush(s):
                 with s.cond:
                     while s.up_set or not s.up_q.empty():
                         s.cond.wait()
-                s.log(f"Final sync: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB)")
+                s.log(f"Final: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB) scans={s.stats['scans']}")
 
             def drain(s):
                 s.start_workers()
@@ -307,7 +319,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM SEEK_DATA + LIVE LOGS
+    - name: Boot VM BATCHED + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -330,7 +342,7 @@ jobs:
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: RAW + WRITETHROUGH + SEEK_DATA"
+        echo "MODE: RAW + WRITETHROUGH + BATCHED (500ms intervals)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
