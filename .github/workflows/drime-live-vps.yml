@@ -18,19 +18,15 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install ALL required packages (STRICT MODE - NO SILENT FAILURES)
+    - name: Install ALL required packages (STRICT MODE)
       run: |
-        # Explicitly enable universe where nbdkit and websockify live
         sudo add-apt-repository -y universe
         sudo apt-get update -y
-        
-        # FIXED: nbdkit-plugin-python is the correct name for Ubuntu 24.04
         sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-plugin-python
         
-        # FUTURE-PROOF VERIFICATION: Check every critical binary exists before proceeding
-        command -v nbdkit >/dev/null 2>&1 || { echo "❌ FATAL: nbdkit binary missing after install"; exit 1; }
-        command -v websockify >/dev/null 2>&1 || { echo "❌ FATAL: websockify binary missing after install"; exit 1; }
-        command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ FATAL: qemu missing after install"; exit 1; }
+        command -v nbdkit >/dev/null 2>&1 || { echo "❌ FATAL: nbdkit missing"; exit 1; }
+        command -v websockify >/dev/null 2>&1 || { echo "❌ FATAL: websockify missing"; exit 1; }
+        command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ FATAL: qemu missing"; exit 1; }
         
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
@@ -81,11 +77,16 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NBDKIT Plugin
+    - name: Write DLIVE1 NBDKIT Plugin (FIXED PYTHON SHADOWING BUG)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit
-        import os, zlib, subprocess, threading, queue, urllib.request, json, sys, time
+        import os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
+        from pathlib import Path
+
+        # FIX: Alias Python's true open() because nbdkit requires us to define an open() callback,
+        # which accidentally shadows the built-in open() and causes TypeError: 'int' object is not iterable.
+        _builtin_open = builtins.open
 
         API_VERSION = 2
         B = 4 * 1024 * 1024
@@ -103,13 +104,14 @@ jobs:
         flush_cond = threading.Condition(pending_lock)
 
         def log(msg):
-            with open("/tmp/nbdkit.log", "a") as f:
+            with _builtin_open("/tmp/nbdkit.log", "a") as f:
                 f.write(f"[DLIVE] {msg}\n")
 
         def config(key, value):
             global accounts, anchor
             if key == "accounts":
-                for line in open(value):
+                # FIX: Use pathlib to read text to completely avoid the shadowed open()
+                for line in Path(str(value)).read_text().splitlines():
                     p = line.split()
                     if len(p) >= 2: accounts.append([p[0], int(p[1])])
                 if accounts: anchor = accounts[0][0]
@@ -159,8 +161,8 @@ jobs:
             try:
                 r = subprocess.run(["rclone", "copyto", f"{name}:dlive/v6/blocks/{lid:08d}.gz", tmp], capture_output=True, timeout=60)
                 if r.returncode == 0 and os.path.exists(tmp):
-                    with open(tmp, "rb") as f:
-                        d = zlib.decompress(f.read())
+                    # FIX: Use pathlib to read bytes
+                    d = zlib.decompress(Path(tmp).read_bytes())
                     os.unlink(tmp)
                     with ram_lock:
                         ram_cache[cid] = d
@@ -229,7 +231,7 @@ jobs:
                     continue
                 gz = f"/tmp/dlive_up_{cid}_{threading.get_ident()}.gz"
                 try:
-                    with open(gz, "wb") as f:
+                    with _builtin_open(gz, "wb") as f:
                         f.write(zlib.compress(data, 1))
                     url = "http://127.0.0.1:5572/operations/copyfile"
                     req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode()
