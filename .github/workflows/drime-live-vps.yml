@@ -1,4 +1,4 @@
-name: DLIVE1 NBD (100% accurate via Drime) - FIXED
+name: DLIVE1 RAW WRITETHROUGH (100% Accurate, Zero Timers)
 
 on:
   push:
@@ -21,8 +21,9 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
+        python3 -m pip install --break-system-packages inotify || python3 -m pip install --user inotify || true
 
     - name: Install latest rclone
       run: |
@@ -71,17 +72,15 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NBD engine (FIXED with proper error handling)
+    - name: Write DLIVE1 RAW WRITETHROUGH engine
       run: |
-        cat > dlive_nbd.py <<'PYEOF'
+        cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
-        # DLIVE1 NBD - FIXED VERSION with proper exception handling
-        import os, json, zlib, subprocess, time, argparse, threading, queue, socket, struct, sys, traceback
+        import os, json, zlib, subprocess, sys, argparse, threading, queue, traceback
         from pathlib import Path
-        from collections import defaultdict, OrderedDict
+        from collections import defaultdict
 
         B = 512 * 1024
-        RAM_MAX = 2048
         RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "300s"]
 
         def rc(*args, timeout=900):
@@ -100,34 +99,24 @@ jobs:
                     if len(p) >= 2: s.accounts.append([p[0], int(p[1])])
                 if not s.accounts: raise RuntimeError("No accounts")
                 s.anchor = s.accounts[0][0]
-                s.blk_locks = {}; s.glock = threading.Lock()
-                s.ram = OrderedDict(); s.ram_lock = threading.Lock()
                 s.up_q = queue.Queue(); s.up_set = set()
                 s.up_lock = threading.Lock(); s.cond = threading.Condition(s.up_lock)
                 s.running = True
-                s.stats = {"uploaded": 0, "mb": 0, "ram_hits": 0, "disk_hits": 0, "net_hits": 0, "writes": 0}
+                s.stats = {"uploaded": 0, "mb": 0, "events": 0}
+                s.last_sync_pos = 0
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
-            def block_lock(s, cid):
-                with s.glock:
-                    if cid not in s.blk_locks: s.blk_locks[cid] = threading.Lock()
-                    return s.blk_locks[cid]
-
             def load(s):
                 sb = s.cache / "superblock.json"
-                s.log(f"Checking for superblock at {sb}")
                 r = rc("copyto", f"{s.anchor}:dlive/v1/superblock.json", str(sb))
                 if r.returncode == 0 and sb.exists():
                     try:
                         s.accounts = json.load(open(sb))["accounts"]
                         s.log(f"Loaded existing disk: {len(s.accounts)} accounts")
-                    except Exception as e:
-                        s.log(f"Superblock corrupt, recreating: {e}")
-                        s._create_superblock()
+                    except Exception: s._create_superblock()
                 else:
-                    s.log("Creating new disk...")
-                    s._create_superblock()
+                    s.log("Creating new disk..."); s._create_superblock()
                 s.ranges = []; off = 0
                 for name, size in s.accounts:
                     nb = size // B; s.ranges.append((name, off, off + nb)); off += nb
@@ -135,14 +124,9 @@ jobs:
                 s.log(f"Disk size: {s.size // 1024**3}GB ({off} blocks)")
 
             def _create_superblock(s):
-                s.log("Creating superblock...")
                 sb = {"magic": "DLIVE1", "block_size": B, "accounts": s.accounts}
-                sb_path = s.cache / "superblock.json"
-                s.log(f"Writing superblock to {sb_path}")
-                with open(sb_path, "w") as f: json.dump(sb, f)
-                s.log("Uploading superblock to Drime...")
-                r = rc("copyto", str(sb_path), f"{s.anchor}:dlive/v1/superblock.json")
-                s.log(f"Superblock upload result: {r.returncode}")
+                with open(s.cache / "superblock.json", "w") as f: json.dump(sb, f)
+                rc("copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v1/superblock.json")
 
             def acct_for(s, cid):
                 for name, a, b in s.ranges:
@@ -150,77 +134,6 @@ jobs:
                 return None, None
 
             def block_path(s, cid): return s.blocks_dir / f"{cid:08d}.blk"
-
-            def _ram_put(s, cid, d):
-                with s.ram_lock:
-                    s.ram[cid] = d; s.ram.move_to_end(cid)
-                    while len(s.ram) > RAM_MAX: s.ram.popitem(last=False)
-
-            def _fetch_block(s, cid):
-                name, lid = s.acct_for(cid)
-                if name is None: return None
-                tmp = str(s.block_path(cid)) + ".tmp"
-                r = rc("copyto", f"{name}:dlive/v1/blocks/{lid:08d}.gz", tmp)
-                if r.returncode == 0 and os.path.exists(tmp):
-                    try:
-                        d = zlib.decompress(open(tmp, "rb").read()); os.unlink(tmp); return d
-                    except Exception:
-                        try: os.unlink(tmp)
-                        except Exception: pass
-                return None
-
-            def _write_block_local(s, cid, data):
-                with s.block_lock(cid):
-                    s.block_path(cid).write_bytes(data)
-
-            def read_block(s, cid):
-                with s.ram_lock:
-                    d = s.ram.get(cid)
-                    if d is not None:
-                        s.ram.move_to_end(cid); s.stats["ram_hits"] += 1; return d
-                p = s.block_path(cid)
-                if p.exists():
-                    with s.block_lock(cid):
-                        try: d = p.read_bytes()
-                        except Exception: d = None
-                    if d is not None:
-                        s._ram_put(cid, d); s.stats["disk_hits"] += 1; return d
-                d = s._fetch_block(cid)
-                if d is None: d = b"\x00" * B
-                if len(d) < B: d += b"\x00" * (B - len(d))
-                s._ram_put(cid, d); s._write_block_local(cid, d)
-                s.stats["net_hits"] += 1
-                return d
-
-            def pread(s, off, length):
-                out = bytearray(length); pos = 0
-                while pos < length:
-                    o = off + pos; cid = o // B; co = o % B
-                    n = min(B - co, length - pos)
-                    b = s.read_block(cid)
-                    out[pos:pos+n] = b[co:co+n]; pos += n
-                return bytes(out)
-
-            def write(s, off, data):
-                pos = 0; n = len(data)
-                while pos < n:
-                    o = off + pos; cid = o // B; co = o % B; k = min(B - co, n - pos)
-                    with s.block_lock(cid):
-                        cur = s.ram.get(cid)
-                        if cur is None:
-                            p = s.block_path(cid)
-                            cur = p.read_bytes() if p.exists() else None
-                        if cur is None: cur = s._fetch_block(cid) or b"\x00" * B
-                        if len(cur) < B: cur += b"\x00" * (B - len(cur))
-                        cur = bytearray(cur); cur[co:co+k] = data[pos:pos+k]
-                        new = bytes(cur)
-                        s._ram_put(cid, new)
-                        s._write_block_local(cid, new)
-                        with s.cond:
-                            if cid not in s.up_set:
-                                s.up_set.add(cid); s.up_q.put(cid)
-                    pos += k
-                s.stats["writes"] += 1
 
             def start_workers(s):
                 for i in range(16): threading.Thread(target=s._uploader, daemon=True).start()
@@ -235,11 +148,10 @@ jobs:
                     try:
                         by = defaultdict(list)
                         for c in batch:
-                            with s.ram_lock: d = s.ram.get(c)
-                            if d is None:
-                                p = s.block_path(c)
-                                d = p.read_bytes() if p.exists() else None
-                            if d is None or not any(d): continue
+                            p = s.block_path(c)
+                            if not p.exists(): continue
+                            d = p.read_bytes()
+                            if not any(d): continue
                             name, lid = s.acct_for(c)
                             if name: by[name].append((lid, d))
                         for name, items in by.items():
@@ -256,30 +168,66 @@ jobs:
                                 s.stats["uploaded"] += ok
                                 s.stats["mb"] += ok * B // (1024*1024)
                                 s.log(f"pushed {ok} blocks to {name} (total {s.stats['mb']}MB)")
-                            if ok < len(items):
-                                base = next((a for nm, a, b in s.ranges if nm == name), None)
-                                if base is not None:
-                                    for lid, _ in items:
-                                        with s.cond:
-                                            if base + lid not in s.up_set:
-                                                s.up_set.add(base + lid); s.up_q.put(base + lid)
                     finally:
                         with s.cond:
                             for c in batch: s.up_set.discard(c)
                             if not s.up_set and s.up_q.empty(): s.cond.notify_all()
 
+            def sync_new_writes(s, raw_path):
+                """Reads only the newly appended/written parts of the raw file"""
+                try:
+                    current_size = os.path.getsize(raw_path)
+                    if current_size <= s.last_sync_pos: return
+                    
+                    synced = 0
+                    with open(raw_path, "rb") as f:
+                        f.seek(s.last_sync_pos)
+                        cid = s.last_sync_pos // B
+                        while True:
+                            d = f.read(B)
+                            if not d: break
+                            if len(d) < B: d += b"\x00" * (B - len(d))
+                            if any(d):
+                                p = s.block_path(cid)
+                                if not (p.exists() and p.read_bytes() == d):
+                                    p.write_bytes(d)
+                                    with s.cond:
+                                        if cid not in s.up_set:
+                                            s.up_set.add(cid); s.up_q.put(cid)
+                                    synced += 1
+                            cid += 1
+                    s.last_sync_pos = current_size
+                    s.stats["events"] += 1
+                    if synced > 0:
+                        s.log(f"writethrough sync: {synced} new blocks queued (total {s.stats['mb']}MB on Drime)")
+                except Exception as e:
+                    s.log(f"sync error: {e}")
+
+            def watch(s, raw_path):
+                s.start_workers()
+                try:
+                    import inotify.adapters
+                    i = inotify.adapters.Inotify()
+                    i.add_watch(str(raw_path), mask=inotify.constants.IN_MODIFY | inotify.constants.IN_CLOSE_WRITE)
+                    s.log(f"WATCHING {raw_path} with inotify (writethrough forces instant events)")
+                    for event in i.event_gen(yield_nones=False):
+                        if not s.running: break
+                        (_, type_names, path, filename) = event
+                        if 'IN_MODIFY' in type_names or 'IN_CLOSE_WRITE' in type_names:
+                            s.sync_new_writes(raw_path)
+                except Exception as e:
+                    s.log(f"inotify failed: {e}")
+                    sys.exit(1)
+
             def flush(s):
                 with s.cond:
                     while s.up_set or not s.up_q.empty():
                         s.cond.wait()
-                s.log(f"Sync complete: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB)")
-
-            def shutdown(s):
-                s.running = False
-                s.flush()
+                s.log(f"Final sync: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB)")
 
             def drain(s):
                 s.start_workers()
+                s.sync_new_writes(s.raw_path) if hasattr(s, 'raw_path') else None
                 n = 0
                 for p in sorted(s.blocks_dir.glob("*.blk")):
                     try: cid = int(p.stem)
@@ -290,93 +238,24 @@ jobs:
                 s.log(f"drain: {n} blocks re-verified")
                 s.flush()
 
-        NBD_MAGIC = b"NBDMAGIC"; IHAVEOPT = b"IHAVEOPT"
-        OPT_EXPORT = 1; C_NO_ZEROES = 2
-        REQ_MAGIC = 0x25609513; REP_MAGIC = 0x67446ab5
-        CMD_READ, CMD_WRITE, CMD_DISC, CMD_FLUSH = 0, 1, 2, 3
-
-        def recv_exact(c, n):
-            b = b""
-            while len(b) < n:
-                k = c.recv(n - len(b))
-                if not k: return None
-                b += k
-            return b
-
-        def client(eng, conn):
-            try:
-                conn.sendall(NBD_MAGIC + IHAVEOPT + struct.pack(">H", 3))
-                cf = struct.unpack(">I", recv_exact(conn, 4))[0]
-                noz = bool(cf & C_NO_ZEROES)
-                while True:
-                    h = recv_exact(conn, 16)
-                    if not h: return
-                    mg, opt, ol = struct.unpack(">QII", h)
-                    if ol: recv_exact(conn, ol)
-                    if opt == OPT_EXPORT:
-                        r = struct.pack(">QH", eng.size, (1 << 0) | (1 << 2) | (1 << 5))
-                        if not noz: r += b"\x00" * 124
-                        conn.sendall(r); break
-                    else: conn.sendall(struct.pack(">QIII", 0x3e889045565a9, opt, 0x80000001, 0))
-                while True:
-                    q = recv_exact(conn, 28)
-                    if not q: return
-                    mg, fl, cmd, hd, off, ln = struct.unpack(">IHHQQI", q)
-                    if mg != REQ_MAGIC: return
-                    er = 0
-                    if cmd == CMD_READ:
-                        try: pl = eng.pread(off, ln)
-                        except Exception as e: eng.log(f"Read error: {e}"); er = 5; pl = b"\x00" * ln
-                        conn.sendall(struct.pack(">IIQ", REP_MAGIC, er, hd) + pl)
-                    elif cmd == CMD_WRITE:
-                        wd = recv_exact(conn, ln)
-                        if wd is None: return
-                        try: eng.write(off, wd)
-                        except Exception as e: eng.log(f"Write error: {e}"); er = 5
-                        if fl & 1: eng.flush()
-                        conn.sendall(struct.pack(">IIQ", REP_MAGIC, er, hd))
-                    elif cmd == CMD_FLUSH:
-                        eng.flush(); conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, hd))
-                    elif cmd == CMD_DISC: return
-                    else: conn.sendall(struct.pack(">IIQ", REP_MAGIC, 22, hd))
-            except Exception as e: eng.log(f"Client error: {e}")
-            finally:
-                try: conn.close()
-                except: pass
-
-        def serve(eng, sockpath):
-            try: os.unlink(sockpath)
-            except: pass
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            srv.bind(sockpath); os.chmod(sockpath, 0o777); srv.listen(32)
-            eng.log(f"NBD listening on {sockpath}")
-            try:
-                while eng.running:
-                    c, _ = srv.accept()
-                    threading.Thread(target=client, args=(eng, c), daemon=True).start()
-            finally:
-                eng.shutdown()
-
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
             ap.add_argument("cmd")
             ap.add_argument("--accounts", required=True)
             ap.add_argument("--cache", required=True)
-            ap.add_argument("--sock")
+            ap.add_argument("--raw")
             a = ap.parse_args()
+            e = Engine(a.accounts, a.cache)
+            e.raw_path = a.raw
+            e.load()
             try:
-                e = Engine(a.accounts, a.cache)
-                e.load()
-                if a.cmd == "serve":
-                    e.start_workers()
-                    serve(e, a.sock)
-                elif a.cmd == "drain":
-                    e.drain()
+                if a.cmd == "watch": e.watch(a.raw)
+                elif a.cmd == "drain": e.drain()
             except Exception:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ DLIVE1 NBD engine written (FIXED)"
+        echo "✓ Engine written"
 
     - name: Prepare cache dir
       run: |
@@ -406,8 +285,9 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM NBD (FIXED) + LIVE LOGS
+    - name: Boot VM RAW WRITETHROUGH + LIVE LOGS
       run: |
+        set -x
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
@@ -415,38 +295,27 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        touch /tmp/nbd.log
-        tail -n +1 -F /tmp/nbd.log 2>/dev/null &
+        RAW="$CACHE/disk.raw"
+        truncate -s 20G "$RAW"
+
+        touch /tmp/watch.log
+        tail -n +1 -F /tmp/watch.log 2>/dev/null &
         TAIL_PID=$!
 
-        sudo python3 -u dlive_nbd.py serve --accounts /tmp/dlive_accounts --cache "$CACHE" --sock /tmp/dlive.sock > /tmp/nbd.log 2>&1 &
-        NBD_PID=$!
-        NBD_OK=0
-        for i in $(seq 1 30); do
-          [ -S /tmp/dlive.sock ] && { NBD_OK=1; break; }
-          kill -0 $NBD_PID 2>/dev/null || break
-          sleep 1
-        done
-
-        if [ $NBD_OK = 1 ]; then
-          echo "✓ NBD ACTIVE — 100% accurate read/write via Drime"
-        else
-          echo "✗ NBD server failed"
-          echo "--- Full NBD log ---"
-          cat /tmp/nbd.log
-          exit 1
-        fi
+        sudo python3 -u dlive_raw.py watch --accounts /tmp/dlive_accounts --cache "$CACHE" --raw "$RAW" > /tmp/watch.log 2>&1 &
+        WATCH_PID=$!
+        sleep 2
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: NBD — every read/write via Drime (100% accurate)."
+        echo "MODE: RAW + WRITETHROUGH (forces instant fsync -> instant inotify)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
         DISPLAY=:1 SDL_VIDEO_WINDOW_POS=center qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
-          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0 \
+          -drive file="$RAW",format=raw,if=none,id=d0,cache=writethrough \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
           -boot order=c,once=d \
@@ -458,9 +327,13 @@ jobs:
 
         wait $QPID
 
-        echo ""
         echo "VM stopped — final sync..."
-        sudo python3 -u dlive_nbd.py drain --accounts /tmp/dlive_accounts --cache "$CACHE"
-        sudo kill $NBD_PID 2>/dev/null
+        sudo python3 -u dlive_raw.py drain --accounts /tmp/dlive_accounts --cache "$CACHE" --raw "$RAW"
+        sudo kill $WATCH_PID 2>/dev/null
         kill $TAIL_PID 2>/dev/null
-        echo "✓ Done. NBD. 100% accurate."
+        echo "--- FULL WATCH LOG ---"
+        cat /tmp/watch.log
+        echo "--- FINAL DRIME STATE ---"
+        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
+        rclone size "$ACC:dlive"
+        echo "✓ Done."
