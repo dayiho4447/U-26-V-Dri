@@ -24,8 +24,8 @@ jobs:
         sudo add-apt-repository -y universe
         sudo apt-get update -y
         
-        # REMOVED || true. If a package name is wrong, we MUST fail immediately.
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-python-plugin
+        # FIXED: nbdkit-plugin-python is the correct name for Ubuntu 24.04
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-plugin-python
         
         # FUTURE-PROOF VERIFICATION: Check every critical binary exists before proceeding
         command -v nbdkit >/dev/null 2>&1 || { echo "❌ FATAL: nbdkit binary missing after install"; exit 1; }
