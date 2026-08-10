@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE (Fixed Dependencies)
+name: DLIVE1 ENTERPRISE SAN
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install ALL required packages (FIXED: added nbdkit, websockify, novnc)
+    - name: Install packages
       run: |
         sudo apt-get update -y
         sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-python-plugin || true
@@ -78,7 +78,7 @@ jobs:
         import os, zlib, subprocess, threading, queue, urllib.request, json, sys, time
 
         API_VERSION = 2
-        B = 4 * 1024 * 1024  # 4MB blocks
+        B = 4 * 1024 * 1024
         DISK_SIZE = 20 * 1024 * 1024 * 1024
 
         ram_cache = {}
@@ -121,7 +121,7 @@ jobs:
 
         def can_flush(h):
             return True
-            
+
         def can_trim(h):
             return True
 
@@ -167,7 +167,6 @@ jobs:
                 cid = block_id(o)
                 co = o % B
                 n = min(B - co, count - pos)
-                
                 blk = get_block(cid)
                 out[pos:pos+n] = blk[co:co+n]
                 pos += n
@@ -182,17 +181,14 @@ jobs:
                 cid = block_id(o)
                 co = o % B
                 k = min(B - co, n - pos)
-                
                 with ram_lock:
                     if cid in ram_cache:
                         cur = bytearray(ram_cache[cid])
                     else:
                         cur = bytearray(get_block(cid))
-                    
                     cur[co:co+k] = buf[pos:pos+k]
                     new = bytes(cur)
                     ram_cache[cid] = new
-                
                 with pending_lock:
                     pending_uploads += 1
                 upload_queue.put((cid, new))
@@ -221,12 +217,10 @@ jobs:
                         pending_uploads -= 1
                         if pending_uploads == 0: flush_cond.notify_all()
                     continue
-                
                 gz = f"/tmp/dlive_up_{cid}_{threading.get_ident()}.gz"
                 try:
                     with open(gz, "wb") as f:
                         f.write(zlib.compress(data, 1))
-                    
                     url = "http://127.0.0.1:5572/operations/copyfile"
                     req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode()
                     req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'})
@@ -238,7 +232,6 @@ jobs:
                         log(f"rcd failed {cid}: {e}, fallback")
                         r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v6/blocks/{lid:08d}.gz", "--retries", "2"], capture_output=True, timeout=120)
                         if r.returncode == 0: ok = True
-                    
                     if ok:
                         log(f"⚡ PUSHED {cid:08d} to {name}")
                     else:
@@ -248,7 +241,6 @@ jobs:
                 finally:
                     try: os.unlink(gz)
                     except: pass
-                    
                     with pending_lock:
                         pending_uploads -= 1
                         if pending_uploads == 0:
@@ -294,11 +286,9 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        # Start noVNC web proxy
         websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
         WEBSOCK_PID=$!
 
-        # Start NBDKIT server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock &
         NBD_PID=$!
         sleep 2
@@ -307,7 +297,7 @@ jobs:
         echo "=================================================="
         echo "VNC CLIENT: $NB_IP:5900"
         echo "WEB BROWSER: http://$NB_IP:6080/vnc.html?autoconnect=true"
-        echo "MODE: ENTERPRISE (Fixed Dependencies)"
+        echo "MODE: ENTERPRISE"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
