@@ -1,4 +1,4 @@
-name: DLIVE1 RAW WRITETHROUGH (100% Accurate, Zero Timers)
+name: DLIVE1 SEEK_DATA (100% Accurate, Zero Timers)
 
 on:
   push:
@@ -21,9 +21,9 @@ jobs:
     - name: Install packages
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools || true
+        # python3-inotify installed via apt so sudo python3 can find it
+        sudo apt-get install -y python3 python3-inotify curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools xvfb x11vnc inotify-tools || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
-        python3 -m pip install --break-system-packages inotify || python3 -m pip install --user inotify || true
 
     - name: Install latest rclone
       run: |
@@ -72,7 +72,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 RAW WRITETHROUGH engine
+    - name: Write DLIVE1 SEEK_DATA engine
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -103,7 +103,7 @@ jobs:
                 s.up_lock = threading.Lock(); s.cond = threading.Condition(s.up_lock)
                 s.running = True
                 s.stats = {"uploaded": 0, "mb": 0, "events": 0}
-                s.last_sync_pos = 0
+                s.pushed_hashes = {} # Tracks CRC32 of pushed blocks to avoid duplicates
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
@@ -173,33 +173,51 @@ jobs:
                             for c in batch: s.up_set.discard(c)
                             if not s.up_set and s.up_q.empty(): s.cond.notify_all()
 
-            def sync_new_writes(s, raw_path):
-                """Reads only the newly appended/written parts of the raw file"""
+            def sync_sparse_file(s, raw_path):
+                """Uses kernel SEEK_DATA to instantly find written blocks in the 20GB sparse file"""
                 try:
-                    current_size = os.path.getsize(raw_path)
-                    if current_size <= s.last_sync_pos: return
-                    
+                    fd = os.open(raw_path, os.O_RDONLY)
+                    pos = 0
                     synced = 0
-                    with open(raw_path, "rb") as f:
-                        f.seek(s.last_sync_pos)
-                        cid = s.last_sync_pos // B
-                        while True:
-                            d = f.read(B)
-                            if not d: break
+                    while True:
+                        try:
+                            # Jump to next block of actual data (skips empty 20GB void instantly)
+                            data_start = os.lseek(fd, pos, os.SEEK_DATA)
+                        except OSError:
+                            break # No more data in file
+                        
+                        try:
+                            data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
+                        except OSError:
+                            data_end = os.lseek(fd, 0, os.SEEK_END)
+                        
+                        start_cid = data_start // B
+                        end_cid = (data_end + B - 1) // B
+                        
+                        for cid in range(start_cid, end_cid):
+                            offset = cid * B
+                            os.lseek(fd, offset, os.SEEK_SET)
+                            d = os.read(fd, B)
                             if len(d) < B: d += b"\x00" * (B - len(d))
-                            if any(d):
-                                p = s.block_path(cid)
-                                if not (p.exists() and p.read_bytes() == d):
-                                    p.write_bytes(d)
-                                    with s.cond:
-                                        if cid not in s.up_set:
-                                            s.up_set.add(cid); s.up_q.put(cid)
-                                    synced += 1
-                            cid += 1
-                    s.last_sync_pos = current_size
-                    s.stats["events"] += 1
+                            if not any(d): continue
+                            
+                            h = zlib.crc32(d)
+                            if s.pushed_hashes.get(cid) == h:
+                                continue # Already pushed this exact block
+                            
+                            p = s.block_path(cid)
+                            p.write_bytes(d)
+                            with s.cond:
+                                if cid not in s.up_set:
+                                    s.up_set.add(cid); s.up_q.put(cid)
+                            s.pushed_hashes[cid] = h
+                            synced += 1
+                        
+                        pos = data_end
+                    os.close(fd)
                     if synced > 0:
-                        s.log(f"writethrough sync: {synced} new blocks queued (total {s.stats['mb']}MB on Drime)")
+                        s.stats["events"] += 1
+                        s.log(f"SEEK_DATA sync: {synced} new/changed blocks queued (total {s.stats['mb']}MB on Drime)")
                 except Exception as e:
                     s.log(f"sync error: {e}")
 
@@ -209,15 +227,18 @@ jobs:
                     import inotify.adapters
                     i = inotify.adapters.Inotify()
                     i.add_watch(str(raw_path), mask=inotify.constants.IN_MODIFY | inotify.constants.IN_CLOSE_WRITE)
-                    s.log(f"WATCHING {raw_path} with inotify (writethrough forces instant events)")
+                    s.log(f"WATCHING {raw_path} with inotify + SEEK_DATA (writethrough forces instant events)")
                     for event in i.event_gen(yield_nones=False):
                         if not s.running: break
                         (_, type_names, path, filename) = event
                         if 'IN_MODIFY' in type_names or 'IN_CLOSE_WRITE' in type_names:
-                            s.sync_new_writes(raw_path)
+                            s.sync_sparse_file(raw_path)
                 except Exception as e:
-                    s.log(f"inotify failed: {e}")
-                    sys.exit(1)
+                    s.log(f"inotify failed: {e}, falling back to 1s polling")
+                    import time
+                    while s.running:
+                        s.sync_sparse_file(raw_path)
+                        time.sleep(1)
 
             def flush(s):
                 with s.cond:
@@ -227,7 +248,8 @@ jobs:
 
             def drain(s):
                 s.start_workers()
-                s.sync_new_writes(s.raw_path) if hasattr(s, 'raw_path') else None
+                if hasattr(s, 'raw_path'):
+                    s.sync_sparse_file(s.raw_path)
                 n = 0
                 for p in sorted(s.blocks_dir.glob("*.blk")):
                     try: cid = int(p.stem)
@@ -285,7 +307,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM RAW WRITETHROUGH + LIVE LOGS
+    - name: Boot VM SEEK_DATA + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -308,7 +330,7 @@ jobs:
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: RAW + WRITETHROUGH (forces instant fsync -> instant inotify)"
+        echo "MODE: RAW + WRITETHROUGH + SEEK_DATA"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
