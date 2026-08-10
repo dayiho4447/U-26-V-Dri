@@ -1,4 +1,4 @@
-name: DLIVE1 NBD (100% accurate via Drime)
+name: DLIVE1 NBD (100% accurate via Drime) - FIXED
 
 on:
   push:
@@ -71,11 +71,11 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NBD engine (100% accurate, fixed)
+    - name: Write DLIVE1 NBD engine (FIXED with proper error handling)
       run: |
         cat > dlive_nbd.py <<'PYEOF'
         #!/usr/bin/env python3
-        # DLIVE1 NBD - the VM disk IS Drime. Every read/write goes through Drime.
+        # DLIVE1 NBD - FIXED VERSION with proper exception handling
         import os, json, zlib, subprocess, time, argparse, threading, queue, socket, struct, sys, traceback
         from pathlib import Path
         from collections import defaultdict, OrderedDict
@@ -116,15 +116,18 @@ jobs:
 
             def load(s):
                 sb = s.cache / "superblock.json"
+                s.log(f"Checking for superblock at {sb}")
                 r = rc("copyto", f"{s.anchor}:dlive/v1/superblock.json", str(sb))
                 if r.returncode == 0 and sb.exists():
                     try:
                         s.accounts = json.load(open(sb))["accounts"]
                         s.log(f"Loaded existing disk: {len(s.accounts)} accounts")
-                    except Exception:
+                    except Exception as e:
+                        s.log(f"Superblock corrupt, recreating: {e}")
                         s._create_superblock()
                 else:
-                    s.log("Creating new disk..."); s._create_superblock()
+                    s.log("Creating new disk...")
+                    s._create_superblock()
                 s.ranges = []; off = 0
                 for name, size in s.accounts:
                     nb = size // B; s.ranges.append((name, off, off + nb)); off += nb
@@ -132,9 +135,14 @@ jobs:
                 s.log(f"Disk size: {s.size // 1024**3}GB ({off} blocks)")
 
             def _create_superblock(s):
+                s.log("Creating superblock...")
                 sb = {"magic": "DLIVE1", "block_size": B, "accounts": s.accounts}
-                with open(s.cache / "superblock.json", "w") as f: json.dump(sb, f)
-                rc("copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v1/superblock.json")
+                sb_path = s.cache / "superblock.json"
+                s.log(f"Writing superblock to {sb_path}")
+                with open(sb_path, "w") as f: json.dump(sb, f)
+                s.log("Uploading superblock to Drime...")
+                r = rc("copyto", str(sb_path), f"{s.anchor}:dlive/v1/superblock.json")
+                s.log(f"Superblock upload result: {r.returncode}")
 
             def acct_for(s, cid):
                 for name, a, b in s.ranges:
@@ -264,7 +272,7 @@ jobs:
                 with s.cond:
                     while s.up_set or not s.up_q.empty():
                         s.cond.wait()
-                s.log(f"Sync complete: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB) ram={s.stats['ram_hits']} disk={s.stats['disk_hits']} net={s.stats['net_hits']} writes={s.stats['writes']}")
+                s.log(f"Sync complete: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB)")
 
             def shutdown(s):
                 s.running = False
@@ -356,9 +364,9 @@ jobs:
             ap.add_argument("--cache", required=True)
             ap.add_argument("--sock")
             a = ap.parse_args()
-            e = Engine(a.accounts, a.cache)
-            e.load()
             try:
+                e = Engine(a.accounts, a.cache)
+                e.load()
                 if a.cmd == "serve":
                     e.start_workers()
                     serve(e, a.sock)
@@ -368,7 +376,7 @@ jobs:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ DLIVE1 NBD engine written (100% accurate via Drime)"
+        echo "✓ DLIVE1 NBD engine written (FIXED)"
 
     - name: Prepare cache dir
       run: |
@@ -398,7 +406,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM NBD (100% accurate) + LIVE LOGS
+    - name: Boot VM NBD (FIXED) + LIVE LOGS
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
@@ -421,17 +429,18 @@ jobs:
         done
 
         if [ $NBD_OK = 1 ]; then
-          echo "✓ NBD ACTIVE — the VM disk IS Drime. 100% accurate read/write."
+          echo "✓ NBD ACTIVE — 100% accurate read/write via Drime"
         else
-          echo "✗ NBD server failed"; cat /tmp/nbd.log; exit 1
+          echo "✗ NBD server failed"
+          echo "--- Full NBD log ---"
+          cat /tmp/nbd.log
+          exit 1
         fi
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "OS: Ubuntu 26.04 LTS Server only."
         echo "MODE: NBD — every read/write via Drime (100% accurate)."
         echo "Install: entire disk, NO LVM."
-        echo "ALL LOGS BELOW ARE LIVE."
         echo "=================================================="
 
         DISPLAY=:1 SDL_VIDEO_WINDOW_POS=center qemu-system-x86_64 $ACCEL -machine pc $CPU \
@@ -454,9 +463,4 @@ jobs:
         sudo python3 -u dlive_nbd.py drain --accounts /tmp/dlive_accounts --cache "$CACHE"
         sudo kill $NBD_PID 2>/dev/null
         kill $TAIL_PID 2>/dev/null
-        echo "---------------- FULL NBD LOG ----------------"
-        cat /tmp/nbd.log 2>/dev/null || true
-        echo "---------------- FINAL DRIME STATE ----------------"
-        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        rclone size "$ACC:dlive" 2>/dev/null || true
-        echo "✓ Done. NBD. 100% accurate read/write via Drime."
+        echo "✓ Done. NBD. 100% accurate."
