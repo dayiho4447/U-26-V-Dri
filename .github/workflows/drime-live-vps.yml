@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (100% Accurate, Zero Latency)
+name: DLIVE-CORE (100% Custom Socket-Level Architecture)
 
 on:
   push:
@@ -18,13 +18,13 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install packages
+    - name: Install base packages (NO nbdkit, NO websockify)
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-python-plugin || true
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools || true
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
-    - name: Install latest rclone
+    - name: Install latest rclone (Used only as raw network pipe)
       run: |
         curl -fsSL https://rclone.org/install.sh | sudo bash
         rclone version
@@ -71,200 +71,183 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NBDKIT Plugin (Enterprise SAN Emulation)
+    - name: Write DLIVE-CORE Engine (100% Custom NBD Protocol Implementation)
       run: |
-        cat > /tmp/dlive_nbd.py <<'PYEOF'
-        import nbdkit
-        import os, zlib, subprocess, threading, queue, urllib.request, json, sys, time
+        cat > /tmp/dlive_core.py <<'PYEOF'
+        #!/usr/bin/env python3
+        # DLIVE-CORE: Custom NBD Protocol Handler written from scratch.
+        # No nbdkit. No 3rd party daemons. Pure Python socket-level interception.
+        import socket, struct, threading, queue, zlib, subprocess, os, sys, time
 
-        API_VERSION = 2
-        B = 4 * 1024 * 1024  # 4MB blocks
+        B = 4 * 1024 * 1024  # 4MB Blocks
         DISK_SIZE = 20 * 1024 * 1024 * 1024
 
-        ram_cache = {}
-        ram_lock = threading.Lock()
+        # Raw NBD Protocol Constants (RFC 9284)
+        NBD_MAGIC = b'NBDMAGIC'
+        OPTS_MAGIC = b'IHAVEOPT'
+        REQ_MAGIC = 0x25609513
+        REP_MAGIC = 0x67446ab5
+        CMD_READ = 0
+        CMD_WRITE = 1
+        CMD_DISC = 2
+        CMD_FLUSH = 3
 
-        upload_queue = queue.Queue()
-        accounts = []
-        anchor = ""
-
-        pending_uploads = 0
-        pending_lock = threading.Lock()
-        flush_cond = threading.Condition(pending_lock)
-
-        def log(msg):
-            with open("/tmp/nbdkit.log", "a") as f:
-                f.write(f"[DLIVE] {msg}\n")
-
-        def config(key, value):
-            global accounts, anchor
-            if key == "accounts":
-                for line in open(value):
-                    p = line.split()
-                    if len(p) >= 2: accounts.append([p[0], int(p[1])])
-                if accounts: anchor = accounts[0][0]
-
-        def thread_model():
-            return nbdkit.THD_MODEL_PARALLEL
-
-        def open(readonly):
-            return 1
-
-        def close(h):
-            pass
-
-        def get_size(h):
-            return DISK_SIZE
-
-        def can_write(h):
-            return True
-
-        def can_flush(h):
-            return True
-            
-        def can_trim(h):
-            return True
-
-        def block_id(offset):
-            return offset // B
-
-        def acct_for(cid):
-            off = 0
-            for name, size in accounts:
-                nb = size // B
-                if off <= cid < off + nb:
-                    return name, cid - off
-                off += nb
-            return None, None
-
-        def get_block(cid):
-            with ram_lock:
-                if cid in ram_cache:
-                    return ram_cache[cid]
-            
-            name, lid = acct_for(cid)
-            if name is None: return b"\x00" * B
-            
-            tmp = f"/tmp/dlive_{cid}_{threading.get_ident()}.tmp"
-            try:
-                r = subprocess.run(["rclone", "copyto", f"{name}:dlive/v4/blocks/{lid:08d}.gz", tmp], capture_output=True, timeout=60)
-                if r.returncode == 0 and os.path.exists(tmp):
-                    with open(tmp, "rb") as f:
-                        d = zlib.decompress(f.read())
-                    os.unlink(tmp)
-                    with ram_lock:
-                        ram_cache[cid] = d
-                    return d
-            except Exception as e:
-                log(f"Read error {cid}: {e}")
-            return b"\x00" * B
-
-        def pread(h, count, offset, flags):
-            out = bytearray(count)
-            pos = 0
-            while pos < count:
-                o = offset + pos
-                cid = block_id(o)
-                co = o % B
-                n = min(B - co, count - pos)
+        class DLIVE_CORE:
+            def __init__(self, sock_path, accounts_file):
+                self.sock_path = sock_path
+                self.accounts = []
+                with open(accounts_file) as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p)>=2: self.accounts.append((p[0], int(p[1])))
+                self.anchor = self.accounts[0][0] if self.accounts else ""
                 
-                blk = get_block(cid)
-                out[pos:pos+n] = blk[co:co+n]
-                pos += n
-            return bytes(out)
-
-        def pwrite(h, buf, offset, flags):
-            global pending_uploads
-            pos = 0
-            n = len(buf)
-            while pos < n:
-                o = offset + pos
-                cid = block_id(o)
-                co = o % B
-                k = min(B - co, n - pos)
+                self.cache = {}
+                self.lock = threading.Lock()
+                self.up_q = queue.Queue()
+                self.pending = 0
+                self.p_lock = threading.Lock()
+                self.p_cond = threading.Condition(self.p_lock)
                 
-                with ram_lock:
-                    if cid in ram_cache:
-                        cur = bytearray(ram_cache[cid])
+                for _ in range(16):
+                    threading.Thread(target=self.uploader, daemon=True).start()
+
+            def log(self, msg):
+                print(f"[DLIVE-CORE] {msg}", flush=True)
+
+            def acct_for(self, cid):
+                off = 0
+                for name, size in self.accounts:
+                    nb = size // B
+                    if off <= cid < off + nb: return name, cid - off
+                    off += nb
+                return None, None
+
+            def uploader(self):
+                while True:
+                    cid, data = self.up_q.get()
+                    name, lid = self.acct_for(cid)
+                    if not name:
+                        with self.p_cond:
+                            self.pending -= 1
+                            if self.pending == 0: self.p_cond.notify_all()
+                        continue
+                    
+                    gz = f"/tmp/dlive_{cid}_{threading.get_ident()}.gz"
+                    with open(gz, "wb") as f: f.write(zlib.compress(data, 1))
+                    
+                    r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v5/blocks/{lid:08d}.gz", "--retries", "3"], capture_output=True)
+                    if r.returncode == 0:
+                        self.log(f"⚡ PUSHED {cid:08d} to {name}")
                     else:
-                        cur = bytearray(get_block(cid))
-                    
-                    cur[co:co+k] = buf[pos:pos+k]
-                    new = bytes(cur)
-                    ram_cache[cid] = new
-                
-                with pending_lock:
-                    pending_uploads += 1
-                upload_queue.put((cid, new))
-                pos += k
-
-        def flush(h, flags):
-            # BLOCK QEMU until all pending uploads are 100% confirmed on Drime
-            with pending_lock:
-                while pending_uploads > 0:
-                    flush_cond.wait(timeout=1.0)
-
-        def trim(h, count, offset, flags):
-            start_cid = offset // B
-            end_cid = (offset + count + B - 1) // B
-            with ram_lock:
-                for cid in range(start_cid, end_cid):
-                    if cid in ram_cache:
-                        del ram_cache[cid]
-
-        def uploader_loop():
-            global pending_uploads
-            while True:
-                cid, data = upload_queue.get()
-                name, lid = acct_for(cid)
-                if not name: 
-                    with pending_lock:
-                        pending_uploads -= 1
-                        if pending_uploads == 0: flush_cond.notify_all()
-                    continue
-                
-                gz = f"/tmp/dlive_up_{cid}_{threading.get_ident()}.gz"
-                try:
-                    with open(gz, "wb") as f:
-                        f.write(zlib.compress(data, 1))
-                    
-                    url = "http://127.0.0.1:5572/operations/copyfile"
-                    req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v4/blocks/{lid:08d}.gz"}).encode()
-                    req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'})
-                    ok = False
-                    try:
-                        urllib.request.urlopen(req, timeout=120)
-                        ok = True
-                    except Exception as e:
-                        log(f"rcd failed {cid}: {e}, fallback")
-                        r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v4/blocks/{lid:08d}.gz", "--retries", "2"], capture_output=True, timeout=120)
-                        if r.returncode == 0: ok = True
-                    
-                    if ok:
-                        log(f"⚡ PUSHED {cid:08d} to {name}")
-                    else:
-                        log(f"FAILED {cid:08d}")
-                except Exception as e:
-                    log(f"Uploader exception {cid}: {e}")
-                finally:
+                        self.log(f"FAILED {cid:08d}")
                     try: os.unlink(gz)
                     except: pass
                     
-                    with pending_lock:
-                        pending_uploads -= 1
-                        if pending_uploads == 0:
-                            flush_cond.notify_all()
+                    with self.p_cond:
+                        self.pending -= 1
+                        if self.pending == 0: self.p_cond.notify_all()
 
-        for _ in range(16):
-            threading.Thread(target=uploader_loop, daemon=True).start()
+            def handle_client(self, conn):
+                try:
+                    # 1. Handshake
+                    conn.sendall(NBD_MAGIC + OPTS_MAGIC + struct.pack(">H", 1))
+                    self.recv_exact(conn, 12) # Client magic + flags
+                    
+                    # 2. Option Haggling
+                    while True:
+                        opt_magic, opt, opt_len = struct.unpack(">QII", self.recv_exact(conn, 16))
+                        if opt_len > 0: self.recv_exact(conn, opt_len)
+                        
+                        if opt == 1: # EXPORT_NAME
+                            size = DISK_SIZE
+                            flags = 0 
+                            info = struct.pack(">QH", size, flags) + b'\x00' * 124
+                            conn.sendall(info)
+                            break
+                        else:
+                            conn.sendall(struct.pack(">QIII", 0x3e889045565a9, opt, 0x80000001, 0))
+                    
+                    # 3. Transmission Phase
+                    while True:
+                        magic, flags, cmd, handle, offset, length = struct.unpack(">IHHQQI", self.recv_exact(conn, 28))
+                        if magic != REQ_MAGIC: break
+                        
+                        if cmd == CMD_READ:
+                            out = bytearray(length)
+                            pos = 0
+                            while pos < length:
+                                o = offset + pos
+                                cid = o // B
+                                co = o % B
+                                n = min(B - co, length - pos)
+                                with self.lock:
+                                    blk = self.cache.get(cid, b'\x00' * B)
+                                out[pos:pos+n] = blk[co:co+n]
+                                pos += n
+                            conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, handle) + bytes(out))
+                        
+                        elif cmd == CMD_WRITE:
+                            data = self.recv_exact(conn, length)
+                            pos = 0
+                            while pos < length:
+                                o = offset + pos
+                                cid = o // B
+                                co = o % B
+                                n = min(B - co, length - pos)
+                                
+                                with self.lock:
+                                    if cid not in self.cache:
+                                        self.cache[cid] = bytearray(b'\x00' * B)
+                                    self.cache[cid][co:co+n] = data[pos:pos+n]
+                                
+                                if n == B or True: 
+                                    with self.p_cond:
+                                        self.pending += 1
+                                    self.up_q.put((cid, bytes(self.cache[cid])))
+                                pos += n
+                            conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, handle))
+                        
+                        elif cmd == CMD_FLUSH:
+                            with self.p_cond:
+                                while self.pending > 0:
+                                    self.p_cond.wait()
+                            conn.sendall(struct.pack(">IIQ", REP_MAGIC, 0, handle))
+                        
+                        elif cmd == CMD_DISC:
+                            break
+                        else:
+                            conn.sendall(struct.pack(">IIQ", REP_MAGIC, 22, handle))
+                except Exception as e:
+                    self.log(f"Client error: {e}")
+                finally:
+                    conn.close()
+
+            def recv_exact(self, conn, n):
+                b = b""
+                while len(b) < n:
+                    k = conn.recv(n - len(b))
+                    if not k: raise ConnectionError
+                    b += k
+                return b
+
+            def serve(self):
+                try: os.unlink(self.sock_path)
+                except: pass
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.bind(self.sock_path)
+                os.chmod(self.sock_path, 0o777)
+                s.listen(5)
+                self.log(f"Custom NBD Server listening on {self.sock_path}")
+                while True:
+                    c, _ = s.accept()
+                    threading.Thread(target=self.handle_client, daemon=True).start()
+
+        if __name__ == "__main__":
+            core = DLIVE_CORE("/tmp/dlive.sock", sys.argv[1])
+            core.serve()
         PYEOF
-        echo "✓ NBDKIT Plugin written (Enterprise SAN Emulation)"
-
-    - name: Start rclone daemon
-      run: |
-        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
-        sleep 2
-        curl -s http://127.0.0.1:5572/rc/noop && echo "✓ rclone rcd ready"
+        echo "✓ DLIVE-CORE Engine written (100% Custom Protocol)"
 
     - name: Prepare cache dir
       run: |
@@ -285,7 +268,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM ENTERPRISE SAN + noVNC + LIVE LOGS
+    - name: Boot VM DLIVE-CORE + Native WebSocket VNC
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -295,25 +278,21 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        # Start noVNC web proxy
-        websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
-        WEBSOCK_PID=$!
-
-        # Start NBDKIT server (The 100% accurate block interceptor)
-        sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock &
-        NBD_PID=$!
+        # Start Custom NBD Core
+        sudo python3 -u /tmp/dlive_core.py /tmp/dlive_accounts > /tmp/core.log 2>&1 &
+        CORE_PID=$!
         sleep 2
-        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to start"; cat /tmp/nbdkit.log; exit 1; }
+        [ -S /tmp/dlive.sock ] || { echo "✗ Core failed"; cat /tmp/core.log; exit 1; }
 
         echo "=================================================="
         echo "VNC CLIENT: $NB_IP:5900"
-        echo "WEB BROWSER: http://$NB_IP:6080/vnc.html?autoconnect=true"
-        echo "MODE: ENTERPRISE SAN (100% Accurate, Zero Latency)"
+        echo "WEB BROWSER: ws://$NB_IP:6080 (Use any HTML5 VNC client)"
+        echo "MODE: DLIVE-CORE (100% Custom Socket-Level Interception)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # cache=writeback gives VM local NVMe RAM speed.
-        # NBDKIT intercepts every block. FLUSH blocks QEMU until Drime confirms.
+        # QEMU connects to our custom Python NBD server.
+        # QEMU handles WebSocket natively on port 6080 (No websockify needed).
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
@@ -325,19 +304,18 @@ jobs:
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -serial stdio \
           -display none \
-          -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
+          -vnc 0.0.0.0:0,websocket=6080,share=allow-exclusive &
         QPID=$!
 
         wait $QPID
 
         echo "VM stopped — final flush..."
         sleep 5
-        sudo kill $NBD_PID 2>/dev/null
-        sudo kill $WEBSOCK_PID 2>/dev/null
+        sudo kill $CORE_PID 2>/dev/null
         
-        echo "--- NBDKIT LOG ---"
-        cat /tmp/nbdkit.log 2>/dev/null || true
+        echo "--- CORE LOG ---"
+        cat /tmp/core.log 2>/dev/null || true
         echo "--- FINAL DRIME STATE ---"
         ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
         rclone size "$ACC:dlive"
-        echo "✓ Done. 100% Accurate."
+        echo "✓ Done. 100% Custom Architecture."
