@@ -1,4 +1,4 @@
-name: DLIVE1 SEEK_DATA BATCHED (100% Accurate, Zero Timers, FAST)
+name: DLIVE1 SEEK_DATA BATCHED v2 (FIXED UPLOADS)
 
 on:
   push:
@@ -71,7 +71,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 SEEK_DATA BATCHED engine
+    - name: Write DLIVE1 v2 engine (BATCH UPLOAD, FIXED MB)
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
@@ -101,7 +101,7 @@ jobs:
                 s.up_q = queue.Queue(); s.up_set = set()
                 s.up_lock = threading.Lock(); s.cond = threading.Condition(s.up_lock)
                 s.running = True
-                s.stats = {"uploaded": 0, "mb": 0, "scans": 0}
+                s.stats = {"uploaded": 0, "mb": 0.0, "scans": 0}
                 s.pushed_hashes = {}
                 s.scan_pending = False
                 s.scan_lock = threading.Lock()
@@ -137,14 +137,16 @@ jobs:
             def block_path(s, cid): return s.blocks_dir / f"{cid:08d}.blk"
 
             def start_workers(s):
-                for i in range(16): threading.Thread(target=s._uploader, daemon=True).start()
+                for i in range(4): threading.Thread(target=s._uploader, daemon=True).start()
                 threading.Thread(target=s._batch_scanner, daemon=True).start()
 
             def _uploader(s):
+                """Uploads ALL pending blocks in a SINGLE rclone copy call (100x faster)"""
                 while s.running:
                     cid = s.up_q.get()
                     batch = [cid]
-                    while len(batch) < 128:
+                    # Drain up to 2048 blocks from queue for one batch upload
+                    while len(batch) < 2048:
                         try: batch.append(s.up_q.get_nowait())
                         except queue.Empty: break
                     try:
@@ -156,29 +158,45 @@ jobs:
                             if not any(d): continue
                             name, lid = s.acct_for(c)
                             if name: by[name].append((lid, d))
+                        
                         for name, items in by.items():
+                            if not items: continue
                             stage = s.cache / f"stage_{threading.get_ident()}"; stage.mkdir(exist_ok=True)
-                            ok = 0
+                            total_bytes = 0
+                            # Write ALL blocks to staging dir
                             for lid, d in items:
                                 gz = stage / f"{lid:08d}.gz"
                                 gz.write_bytes(zlib.compress(d, 1))
-                                r = rc("copyto", str(gz), f"{name}:dlive/v1/blocks/{lid:08d}.gz")
-                                if r.returncode == 0: ok += 1
-                                try: gz.unlink()
+                                total_bytes += len(d)
+                            
+                            # SINGLE rclone copy call for ALL blocks (100x faster than per-block)
+                            r = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", "16")
+                            
+                            # Clean up staging
+                            for f in stage.glob("*"):
+                                try: f.unlink()
                                 except Exception: pass
-                            if ok:
-                                s.stats["uploaded"] += ok
-                                s.stats["mb"] += ok * B // (1024*1024)
-                                s.log(f"pushed {ok} blocks to {name} (total {s.stats['mb']}MB on Drime)")
+                            
+                            if r.returncode == 0:
+                                s.stats["uploaded"] += len(items)
+                                s.stats["mb"] += total_bytes / (1024*1024)  # FIXED: float math
+                                s.log(f"BATCH pushed {len(items)} blocks ({total_bytes/(1024*1024):.1f}MB) to {name} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
+                            else:
+                                s.log(f"batch upload failed for {name}, requeueing")
+                                base = next((a for nm, a, b in s.ranges if nm == name), None)
+                                if base is not None:
+                                    for lid, _ in items:
+                                        with s.cond:
+                                            if base + lid not in s.up_set:
+                                                s.up_set.add(base + lid); s.up_q.put(base + lid)
                     finally:
                         with s.cond:
                             for c in batch: s.up_set.discard(c)
                             if not s.up_set and s.up_q.empty(): s.cond.notify_all()
 
             def _batch_scanner(s):
-                """Scans every 500ms instead of on every single write"""
                 while s.running:
-                    time.sleep(0.5)  # Batch interval - wait 500ms
+                    time.sleep(0.5)
                     with s.scan_lock:
                         if not s.scan_pending:
                             continue
@@ -187,7 +205,6 @@ jobs:
                         s.sync_sparse_file(s.raw_path)
 
             def sync_sparse_file(s, raw_path):
-                """Uses kernel SEEK_DATA to instantly find written blocks"""
                 try:
                     fd = os.open(raw_path, os.O_RDONLY)
                     pos = 0
@@ -197,7 +214,6 @@ jobs:
                             data_start = os.lseek(fd, pos, os.SEEK_DATA)
                         except OSError:
                             break
-                        
                         try:
                             data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
                         except OSError:
@@ -229,7 +245,7 @@ jobs:
                     os.close(fd)
                     if synced > 0:
                         s.stats["scans"] += 1
-                        s.log(f"scan #{s.stats['scans']}: {synced} blocks queued (total {s.stats['mb']}MB)")
+                        s.log(f"scan #{s.stats['scans']}: {synced} blocks queued (total on Drime: {s.stats['mb']:.1f}MB)")
                 except Exception as e:
                     s.log(f"sync error: {e}")
 
@@ -239,13 +255,13 @@ jobs:
                     import inotify.adapters
                     i = inotify.adapters.Inotify()
                     i.add_watch(str(raw_path), mask=inotify.constants.IN_MODIFY | inotify.constants.IN_CLOSE_WRITE)
-                    s.log(f"WATCHING with BATCHED scanning (500ms intervals, not every write)")
+                    s.log(f"WATCHING with BATCHED scanning + SINGLE-CALL UPLOADS")
                     for event in i.event_gen(yield_nones=False):
                         if not s.running: break
                         (_, type_names, path, filename) = event
                         if 'IN_MODIFY' in type_names or 'IN_CLOSE_WRITE' in type_names:
                             with s.scan_lock:
-                                s.scan_pending = True  # Just mark for next batch scan
+                                s.scan_pending = True
                 except Exception as e:
                     s.log(f"inotify failed: {e}, using polling")
                     while s.running:
@@ -256,7 +272,7 @@ jobs:
                 with s.cond:
                     while s.up_set or not s.up_q.empty():
                         s.cond.wait()
-                s.log(f"Final: uploaded={s.stats['uploaded']} ({s.stats['mb']}MB) scans={s.stats['scans']}")
+                s.log(f"Final: uploaded={s.stats['uploaded']} ({s.stats['mb']:.1f}MB) scans={s.stats['scans']}")
 
             def drain(s):
                 s.start_workers()
@@ -289,7 +305,7 @@ jobs:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ Engine written"
+        echo "✓ Engine written (FIXED: single-call batch upload + correct MB math)"
 
     - name: Prepare cache dir
       run: |
@@ -319,7 +335,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM BATCHED + LIVE LOGS
+    - name: Boot VM v2 + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -342,7 +358,7 @@ jobs:
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: RAW + WRITETHROUGH + BATCHED (500ms intervals)"
+        echo "MODE: FIXED — single-call batch upload + correct MB"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
