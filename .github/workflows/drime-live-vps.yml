@@ -1,4 +1,4 @@
-name: DLIVE1 SEEK_DATA BATCHED v2 (FIXED UPLOADS)
+name: DLIVE1 ULTIMATE MAX SPEED (64MB Double-Buffered)
 
 on:
   push:
@@ -71,16 +71,15 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 v2 engine (BATCH UPLOAD, FIXED MB)
+    - name: Write DLIVE1 ULTIMATE engine (64MB Double-Buffered, Zero Timers)
       run: |
         cat > dlive_raw.py <<'PYEOF'
         #!/usr/bin/env python3
-        import os, json, zlib, subprocess, sys, argparse, threading, queue, traceback, time
+        import os, json, zlib, subprocess, sys, argparse, threading, traceback, time
         from pathlib import Path
-        from collections import defaultdict
 
         B = 512 * 1024
-        RC_FLAGS = ["--retries", "2", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "300s"]
+        RC_FLAGS = ["--retries", "3", "--low-level-retries", "10", "--contimeout", "15s", "--timeout", "300s"]
 
         def rc(*args, timeout=900):
             try: return subprocess.run(["rclone"] + list(args) + RC_FLAGS, capture_output=True, timeout=timeout)
@@ -91,20 +90,32 @@ jobs:
         class Engine:
             def __init__(s, accounts_file, cache):
                 s.cache = Path(cache); s.cache.mkdir(parents=True, exist_ok=True)
-                s.blocks_dir = s.cache / "blocks"; s.blocks_dir.mkdir(exist_ok=True)
                 s.accounts = []
                 for line in open(accounts_file):
                     p = line.split()
                     if len(p) >= 2: s.accounts.append([p[0], int(p[1])])
                 if not s.accounts: raise RuntimeError("No accounts")
                 s.anchor = s.accounts[0][0]
-                s.up_q = queue.Queue(); s.up_set = set()
-                s.up_lock = threading.Lock(); s.cond = threading.Condition(s.up_lock)
+                
                 s.running = True
-                s.stats = {"uploaded": 0, "mb": 0.0, "scans": 0}
+                s.stats = {"mb": 0.0, "scans": 0}
                 s.pushed_hashes = {}
-                s.scan_pending = False
+                
+                # Double-buffered staging directories
+                s.stage_lock = threading.Lock()
+                s.stage_dir = s.cache / "stage_A"
+                s.stage_dir.mkdir(exist_ok=True)
+                s.pending_bytes = 0
+                
+                # Event-driven upload trigger (ZERO TIMERS)
+                s.upload_event = threading.Event()
+                s.upload_in_progress = False
+                s.upload_done_cond = threading.Condition()
+                
+                # Scanner coordination
+                s.scan_needed = False
                 s.scan_lock = threading.Lock()
+                s.scan_cond = threading.Condition(s.scan_lock)
 
             def log(s, *a): print("[DLIVE]", *a, flush=True)
 
@@ -129,164 +140,134 @@ jobs:
                 with open(s.cache / "superblock.json", "w") as f: json.dump(sb, f)
                 rc("copyto", str(s.cache / "superblock.json"), f"{s.anchor}:dlive/v1/superblock.json")
 
-            def acct_for(s, cid):
-                for name, a, b in s.ranges:
-                    if a <= cid < b: return name, cid - a
-                return None, None
-
-            def block_path(s, cid): return s.blocks_dir / f"{cid:08d}.blk"
-
             def start_workers(s):
-                for i in range(4): threading.Thread(target=s._uploader, daemon=True).start()
-                threading.Thread(target=s._batch_scanner, daemon=True).start()
+                threading.Thread(target=s._uploader, daemon=True).start()
+                threading.Thread(target=s._scanner_loop, daemon=True).start()
 
             def _uploader(s):
-                """Uploads ALL pending blocks in a SINGLE rclone copy call (100x faster)"""
                 while s.running:
-                    cid = s.up_q.get()
-                    batch = [cid]
-                    # Drain up to 2048 blocks from queue for one batch upload
-                    while len(batch) < 2048:
-                        try: batch.append(s.up_q.get_nowait())
-                        except queue.Empty: break
-                    try:
-                        by = defaultdict(list)
-                        for c in batch:
-                            p = s.block_path(c)
-                            if not p.exists(): continue
-                            d = p.read_bytes()
-                            if not any(d): continue
-                            name, lid = s.acct_for(c)
-                            if name: by[name].append((lid, d))
+                    s.upload_event.wait()  # ZERO TIMERS: blocks until 64MB ready
+                    s.upload_event.clear()
+                    
+                    with s.stage_lock:
+                        upload_dir = s.stage_dir
+                        s.stage_dir = s.cache / f"stage_{int(time.time()*1000000)}"
+                        s.stage_dir.mkdir(exist_ok=True)
+                        bytes_to_upload = s.pending_bytes
+                        s.pending_bytes = 0
                         
-                        for name, items in by.items():
-                            if not items: continue
-                            stage = s.cache / f"stage_{threading.get_ident()}"; stage.mkdir(exist_ok=True)
-                            total_bytes = 0
-                            # Write ALL blocks to staging dir
-                            for lid, d in items:
-                                gz = stage / f"{lid:08d}.gz"
-                                gz.write_bytes(zlib.compress(d, 1))
-                                total_bytes += len(d)
-                            
-                            # SINGLE rclone copy call for ALL blocks (100x faster than per-block)
-                            r = rc("copy", str(stage), f"{name}:dlive/v1/blocks/", "--transfers", "16")
-                            
-                            # Clean up staging
-                            for f in stage.glob("*"):
-                                try: f.unlink()
-                                except Exception: pass
-                            
-                            if r.returncode == 0:
-                                s.stats["uploaded"] += len(items)
-                                s.stats["mb"] += total_bytes / (1024*1024)  # FIXED: float math
-                                s.log(f"BATCH pushed {len(items)} blocks ({total_bytes/(1024*1024):.1f}MB) to {name} — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
-                            else:
-                                s.log(f"batch upload failed for {name}, requeueing")
-                                base = next((a for nm, a, b in s.ranges if nm == name), None)
-                                if base is not None:
-                                    for lid, _ in items:
-                                        with s.cond:
-                                            if base + lid not in s.up_set:
-                                                s.up_set.add(base + lid); s.up_q.put(base + lid)
-                    finally:
-                        with s.cond:
-                            for c in batch: s.up_set.discard(c)
-                            if not s.up_set and s.up_q.empty(): s.cond.notify_all()
+                    files = list(upload_dir.glob("*.gz"))
+                    if not files:
+                        with s.upload_done_cond: s.upload_done_cond.notify_all()
+                        continue
+                        
+                    with s.upload_done_cond: s.upload_in_progress = True
+                    
+                    # MASSIVE parallel upload (32 transfers)
+                    r = rc("copy", str(upload_dir), f"{s.anchor}:dlive/v1/blocks/", "--transfers", "32", "--checkers", "32")
+                    
+                    if r.returncode == 0:
+                        s.stats["mb"] += bytes_to_upload / (1024*1024)
+                        s.log(f"⚡ UPLOADED {bytes_to_upload/(1024*1024):.1f}MB ({len(files)} files) — TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
+                    else:
+                        s.log(f"Upload failed! stderr: {r.stderr.decode()[:200]}")
+                        
+                    for f in files:
+                        try: f.unlink()
+                        except: pass
+                    try: upload_dir.rmdir()
+                    except: pass
+                    
+                    with s.upload_done_cond:
+                        s.upload_in_progress = False
+                        s.upload_done_cond.notify_all()
 
-            def _batch_scanner(s):
+            def _scanner_loop(s):
                 while s.running:
-                    time.sleep(0.5)
-                    with s.scan_lock:
-                        if not s.scan_pending:
-                            continue
-                        s.scan_pending = False
-                    if hasattr(s, 'raw_path'):
-                        s.sync_sparse_file(s.raw_path)
+                    with s.scan_cond:
+                        while not s.scan_needed and s.running:
+                            s.scan_cond.wait()  # ZERO TIMERS: sleeps until inotify wakes
+                        s.scan_needed = False
+                    if s.running:
+                        s.sync_sparse_file()
 
-            def sync_sparse_file(s, raw_path):
+            def sync_sparse_file(s):
                 try:
-                    fd = os.open(raw_path, os.O_RDONLY)
+                    fd = os.open(s.raw_path, os.O_RDONLY)
                     pos = 0
-                    synced = 0
+                    files_ready = 0
+                    s.stats["scans"] += 1
+                    
                     while True:
-                        try:
-                            data_start = os.lseek(fd, pos, os.SEEK_DATA)
-                        except OSError:
-                            break
-                        try:
-                            data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
-                        except OSError:
-                            data_end = os.lseek(fd, 0, os.SEEK_END)
+                        try: data_start = os.lseek(fd, pos, os.SEEK_DATA)
+                        except OSError: break
+                        try: data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
+                        except OSError: data_end = os.lseek(fd, 0, os.SEEK_END)
                         
                         start_cid = data_start // B
                         end_cid = (data_end + B - 1) // B
                         
                         for cid in range(start_cid, end_cid):
-                            offset = cid * B
-                            os.lseek(fd, offset, os.SEEK_SET)
+                            os.lseek(fd, cid * B, os.SEEK_SET)
                             d = os.read(fd, B)
                             if len(d) < B: d += b"\x00" * (B - len(d))
                             if not any(d): continue
                             
                             h = zlib.crc32(d)
-                            if s.pushed_hashes.get(cid) == h:
-                                continue
+                            if s.pushed_hashes.get(cid) == h: continue
                             
-                            p = s.block_path(cid)
-                            p.write_bytes(d)
-                            with s.cond:
-                                if cid not in s.up_set:
-                                    s.up_set.add(cid); s.up_q.put(cid)
+                            with s.stage_lock:
+                                gz_path = s.stage_dir / f"{cid:08d}.gz"
+                                gz_path.write_bytes(zlib.compress(d, 1))
+                                s.pending_bytes += len(d)
+                            
                             s.pushed_hashes[cid] = h
-                            synced += 1
-                        
+                            files_ready += 1
+                            
+                            # Trigger upload every 64MB (128 blocks)
+                            if files_ready >= 128:
+                                s.upload_event.set()
+                                files_ready = 0
+                                
                         pos = data_end
                     os.close(fd)
-                    if synced > 0:
-                        s.stats["scans"] += 1
-                        s.log(f"scan #{s.stats['scans']}: {synced} blocks queued (total on Drime: {s.stats['mb']:.1f}MB)")
+                    
+                    if files_ready > 0:
+                        s.upload_event.set()
                 except Exception as e:
                     s.log(f"sync error: {e}")
 
             def watch(s, raw_path):
+                s.raw_path = raw_path
                 s.start_workers()
                 try:
                     import inotify.adapters
                     i = inotify.adapters.Inotify()
                     i.add_watch(str(raw_path), mask=inotify.constants.IN_MODIFY | inotify.constants.IN_CLOSE_WRITE)
-                    s.log(f"WATCHING with BATCHED scanning + SINGLE-CALL UPLOADS")
+                    s.log(f"⚡ WATCHING with 64MB DOUBLE-BUFFERED UPLOADS (MAX SPEED)")
                     for event in i.event_gen(yield_nones=False):
                         if not s.running: break
                         (_, type_names, path, filename) = event
                         if 'IN_MODIFY' in type_names or 'IN_CLOSE_WRITE' in type_names:
-                            with s.scan_lock:
-                                s.scan_pending = True
+                            with s.scan_cond:
+                                s.scan_needed = True
+                                s.scan_cond.notify()
                 except Exception as e:
-                    s.log(f"inotify failed: {e}, using polling")
-                    while s.running:
-                        s.sync_sparse_file(raw_path)
-                        time.sleep(0.5)
-
-            def flush(s):
-                with s.cond:
-                    while s.up_set or not s.up_q.empty():
-                        s.cond.wait()
-                s.log(f"Final: uploaded={s.stats['uploaded']} ({s.stats['mb']:.1f}MB) scans={s.stats['scans']}")
+                    s.log(f"inotify failed: {e}")
 
             def drain(s):
-                s.start_workers()
-                if hasattr(s, 'raw_path'):
-                    s.sync_sparse_file(s.raw_path)
-                n = 0
-                for p in sorted(s.blocks_dir.glob("*.blk")):
-                    try: cid = int(p.stem)
-                    except Exception: continue
-                    with s.cond:
-                        if cid not in s.up_set:
-                            s.up_set.add(cid); s.up_q.put(cid); n += 1
-                s.log(f"drain: {n} blocks re-verified")
-                s.flush()
+                with s.scan_cond:
+                    s.scan_needed = True
+                    s.scan_cond.notify()
+                with s.scan_cond:
+                    while s.scan_needed:
+                        s.scan_cond.wait()
+                if s.pending_bytes > 0:
+                    s.upload_event.set()
+                with s.upload_done_cond:
+                    while s.upload_in_progress or s.pending_bytes > 0:
+                        s.upload_done_cond.wait()
+                s.log(f"Final: TOTAL ON DRIME: {s.stats['mb']:.1f}MB")
 
         if __name__ == "__main__":
             ap = argparse.ArgumentParser()
@@ -305,7 +286,7 @@ jobs:
                 traceback.print_exc()
                 sys.exit(1)
         PYEOF
-        echo "✓ Engine written (FIXED: single-call batch upload + correct MB math)"
+        echo "✓ Engine written (ULTIMATE: 64MB Double-Buffered, Zero Timers)"
 
     - name: Prepare cache dir
       run: |
@@ -335,7 +316,7 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep 5900 && echo "✓ VNC ready on 5900"
 
-    - name: Boot VM v2 + LIVE LOGS
+    - name: Boot VM ULTIMATE + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -358,7 +339,7 @@ jobs:
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900 (no password)"
-        echo "MODE: FIXED — single-call batch upload + correct MB"
+        echo "MODE: ULTIMATE — 64MB Double-Buffered, Zero Timers"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
