@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (NATIVE VNC + RNG FIX)
+name: DLIVE1 ENTERPRISE SAN (KERNEL-EXTRACT + APPARMOR FIX)
 
 on:
   push:
@@ -76,7 +76,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NBDKIT Plugin (BULLETPROOF TYPE CASTING)
+    - name: Write DLIVE1 NBDKIT Plugin (BULLETPROOF)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit
@@ -296,7 +296,19 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM ENTERPRISE + NATIVE VNC + RNG FIX
+    - name: Extract kernel + initrd (to inject apparmor=0 cmdline)
+      run: |
+        set -x
+        CACHE=$(cat /tmp/dlive_cache)
+        ISO=$(cat /tmp/dlive_iso)
+        sudo mkdir -p /mnt/iso
+        sudo mount -o loop,ro "$ISO" /mnt/iso
+        cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
+        cp /mnt/iso/casper/initrd "$CACHE/initrd"
+        sudo umount /mnt/iso
+        ls -lh "$CACHE/vmlinuz" "$CACHE/initrd"
+
+    - name: Boot VM (KERNEL-EXTRACT + APPARMOR FIX) + NATIVE VNC
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -314,20 +326,20 @@ jobs:
 
         echo "=================================================="
         echo "NATIVE VNC CLIENT: $NB_IP:5900"
-        echo "(Use RealVNC, TigerVNC, TightVNC, or macOS Screen Sharing)"
-        echo "MODE: ENTERPRISE"
+        echo "MODE: ENTERPRISE (kernel-extract + apparmor=0)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # FIX: Added -device virtio-rng-pci to provide entropy for systemd sandboxing.
-        # FIX: Added -no-fd-bootchk to stop the harmless floppy disk error.
+        # PHASE 1 (INSTALL): Boot extracted kernel/initrd with apparmor=0 to bypass the
+        # systemd 259 live-CD sandboxing "Protocol error" freeze.
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
-          -boot order=c,once=d \
+          -kernel "$CACHE/vmlinuz" -initrd "$CACHE/initrd" \
+          -append "boot=casper quiet splash apparmor=0 selinux=0 ---" \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
@@ -339,12 +351,12 @@ jobs:
 
         wait $QPID
 
-        echo "VM stopped — final flush..."
+        echo "Install phase done — final flush..."
         sleep 5
         sudo kill $NBD_PID 2>/dev/null
         
-        echo "--- NBDKIT LOG ---"
-        cat /tmp/nbdkit.log 2>/dev/null || true
+        echo "--- NBDKIT LOG (tail) ---"
+        tail -n 50 /tmp/nbdkit.log 2>/dev/null || true
         echo "--- FINAL DRIME STATE ---"
         ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
         rclone size "$ACC:dlive"
