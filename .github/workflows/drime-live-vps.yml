@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (STRICT FUTURE-PROOF)
+name: DLIVE1 ENTERPRISE SAN (NATIVE VNC)
 
 on:
   push:
@@ -18,14 +18,14 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install ALL required packages (STRICT MODE)
+    - name: Install ALL required packages (STRICT MODE - NO BROWSER TOOLS)
       run: |
         sudo add-apt-repository -y universe
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools novnc websockify nbdkit nbdkit-plugin-python
+        # Removed novnc and websockify
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python
         
         command -v nbdkit >/dev/null 2>&1 || { echo "❌ FATAL: nbdkit missing"; exit 1; }
-        command -v websockify >/dev/null 2>&1 || { echo "❌ FATAL: websockify missing"; exit 1; }
         command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ FATAL: qemu missing"; exit 1; }
         
         sudo chmod 666 /dev/kvm 2>/dev/null || true
@@ -168,7 +168,6 @@ jobs:
             return b"\x00" * B
 
         def pread(h, count, offset, flags):
-            # BULLETPROOF FIX: Force cast to int to handle nbdkit memoryview API quirk
             try: count = int(count)
             except: count = len(count) if hasattr(count, '__len__') else 4096
             try: offset = int(offset)
@@ -188,7 +187,6 @@ jobs:
 
         def pwrite(h, buf, offset, flags):
             global pending_uploads
-            # BULLETPROOF FIX: Force cast offset to int
             try: offset = int(offset)
             except: offset = 0
             
@@ -299,7 +297,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM ENTERPRISE + noVNC + LIVE LOGS
+    - name: Boot VM ENTERPRISE + NATIVE VNC + LIVE LOGS
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -309,21 +307,20 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
-        WEBSOCK_PID=$!
-
+        # Start NBDKIT Server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock &
         NBD_PID=$!
         sleep 2
         [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to start"; cat /tmp/nbdkit.log; exit 1; }
 
         echo "=================================================="
-        echo "VNC CLIENT: $NB_IP:5900"
-        echo "WEB BROWSER: http://$NB_IP:6080/vnc.html?autoconnect=true"
+        echo "NATIVE VNC CLIENT: $NB_IP:5900"
+        echo "(Use RealVNC, TigerVNC, TightVNC, or macOS Screen Sharing)"
         echo "MODE: ENTERPRISE"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
+        # QEMU uses native VNC on port 5900. No websockify needed.
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
@@ -343,7 +340,6 @@ jobs:
         echo "VM stopped — final flush..."
         sleep 5
         sudo kill $NBD_PID 2>/dev/null
-        sudo kill $WEBSOCK_PID 2>/dev/null
         
         echo "--- NBDKIT LOG ---"
         cat /tmp/nbdkit.log 2>/dev/null || true
