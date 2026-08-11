@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (NATIVE VNC)
+name: DLIVE1 ENTERPRISE SAN (NATIVE VNC + RNG FIX)
 
 on:
   push:
@@ -18,11 +18,10 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install ALL required packages (STRICT MODE - NO BROWSER TOOLS)
+    - name: Install ALL required packages (STRICT MODE)
       run: |
         sudo add-apt-repository -y universe
         sudo apt-get update -y
-        # Removed novnc and websockify
         sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python
         
         command -v nbdkit >/dev/null 2>&1 || { echo "❌ FATAL: nbdkit missing"; exit 1; }
@@ -297,7 +296,7 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Boot VM ENTERPRISE + NATIVE VNC + LIVE LOGS
+    - name: Boot VM ENTERPRISE + NATIVE VNC + RNG FIX
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -320,7 +319,8 @@ jobs:
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # QEMU uses native VNC on port 5900. No websockify needed.
+        # FIX: Added -device virtio-rng-pci to provide entropy for systemd sandboxing.
+        # FIX: Added -no-fd-bootchk to stop the harmless floppy disk error.
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
@@ -330,6 +330,8 @@ jobs:
           -boot order=c,once=d \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -device virtio-rng-pci \
+          -no-fd-bootchk \
           -serial stdio \
           -display none \
           -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
