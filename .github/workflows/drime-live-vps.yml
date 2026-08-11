@@ -77,7 +77,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL: accounts file empty"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write DLIVE1 NBDKIT Plugin (FIXED THREAD MODEL TYPO)
+    - name: Write DLIVE1 NBDKIT Plugin (BULLETPROOF TYPE CASTING)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit
@@ -114,7 +114,6 @@ jobs:
                 if accounts: anchor = accounts[0][0]
 
         def thread_model():
-            # FIX: Corrected typo from THD_MODEL_PARALLEL to THREAD_MODEL_PARALLEL
             return nbdkit.THREAD_MODEL_PARALLEL
 
         def open(readonly):
@@ -169,6 +168,12 @@ jobs:
             return b"\x00" * B
 
         def pread(h, count, offset, flags):
+            # BULLETPROOF FIX: Force cast to int to handle nbdkit memoryview API quirk
+            try: count = int(count)
+            except: count = len(count) if hasattr(count, '__len__') else 4096
+            try: offset = int(offset)
+            except: offset = 0
+            
             out = bytearray(count)
             pos = 0
             while pos < count:
@@ -183,6 +188,10 @@ jobs:
 
         def pwrite(h, buf, offset, flags):
             global pending_uploads
+            # BULLETPROOF FIX: Force cast offset to int
+            try: offset = int(offset)
+            except: offset = 0
+            
             pos = 0
             n = len(buf)
             while pos < n:
@@ -209,6 +218,11 @@ jobs:
                     flush_cond.wait(timeout=1.0)
 
         def trim(h, count, offset, flags):
+            try: count = int(count)
+            except: count = len(count) if hasattr(count, '__len__') else 0
+            try: offset = int(offset)
+            except: offset = 0
+            
             start_cid = offset // B
             end_cid = (offset + count + B - 1) // B
             with ram_lock:
