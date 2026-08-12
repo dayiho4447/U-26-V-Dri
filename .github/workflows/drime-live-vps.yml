@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (26.04 ISO - MAX ANTI-FREEZE)
+name: DLIVE1 ENTERPRISE SAN (24.04 ISO MANUAL INSTALL - BOOTS)
 
 on:
   push:
@@ -219,37 +219,24 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download Ubuntu 26.04 ISO (FORCE fresh)
+    - name: Download Ubuntu 24.04 LTS SERVER ISO (boots in nested KVM)
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO="$CACHE/ubuntu.iso"
         rm -f "$ISO"
-        wget --tries=5 --timeout=60 --continue -O "$ISO" "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
+        wget --tries=5 --timeout=60 --continue -O "$ISO" "https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Extract kernel + initrd from 26.04 ISO
-      run: |
-        set -x
-        CACHE=$(cat /tmp/dlive_cache)
-        ISO=$(cat /tmp/dlive_iso)
-        sudo mkdir -p /mnt/iso
-        sudo mount -o loop,ro "$ISO" /mnt/iso
-        cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
-        cp /mnt/iso/casper/initrd "$CACHE/initrd"
-        sudo umount /mnt/iso
-        ls -lh "$CACHE/vmlinuz" "$CACHE/initrd"
-
-    - name: Boot 26.04 ISO (MAX ANTI-FREEZE)
+    - name: Boot 24.04 ISO (MANUAL INSTALL)
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
-        # Force qemu64 CPU (avoids host CPU feature that triggers the freeze); keep KVM for speed
         ACCEL=""; CPU="-cpu qemu64"
-        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; }
+        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         NBD_PID=$!
@@ -269,8 +256,7 @@ jobs:
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
-          -kernel "$CACHE/vmlinuz" -initrd "$CACHE/initrd" \
-          -append "boot=casper quiet splash systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0 ---" \
+          -boot order=d \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
