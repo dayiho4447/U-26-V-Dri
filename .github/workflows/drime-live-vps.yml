@@ -1,4 +1,4 @@
-name: DRIME TWO‑STAGE BOOT (FIXED)
+name: DRIME TWO‑STAGE BOOT (FINAL)
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
         sudo chown runner:runner /var/lib/dlive
         wget -O "$IMG" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
 
-        # Create a simple synchronous NBD plugin with all imports
+        # Create a simple synchronous NBD plugin with correct thread model
         cat > /tmp/sync_nbd.py <<'EOF'
         import nbdkit, os, zlib, subprocess, sys, time, threading, builtins
         _builtin_open = builtins.open
@@ -64,7 +64,6 @@ jobs:
         ram_lock = threading.Lock()
 
         def log(msg):
-            # Write to a separate log file
             try:
                 with _builtin_open("/tmp/sync_plugin.log", "a") as f:
                     f.write(f"[SYNC] {time.ctime()} {msg}\n")
@@ -72,7 +71,7 @@ jobs:
                 sys.stderr.write(f"[SYNC] {msg}\n")
 
         def config(key, value): pass
-        def thread_model(): return nbdkit.THREAD_MODEL_SERIAL
+        def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
         def open(readonly): return 1
         def close(h): pass
         def get_size(h): return DISK_SIZE
@@ -123,7 +122,6 @@ jobs:
                 co = o % BLOCK_SIZE
                 k = min(BLOCK_SIZE - co, n - pos)
 
-                # Update the in‑memory block
                 with ram_lock:
                     if cid in ram_cache:
                         cur = bytearray(ram_cache[cid])
@@ -133,7 +131,6 @@ jobs:
                     new = bytes(cur)
                     ram_cache[cid] = new
 
-                # Upload immediately – if it fails, raise an exception
                 compressed = zlib.compress(new, 1)
                 remote_path = f"{REMOTE_BASE}/{cid:08d}.gz"
                 tmp = f"/tmp/dlive_sync_{cid}.gz"
@@ -145,7 +142,7 @@ jobs:
                     log(f"✅ SYNC UPLOADED {cid:08d}")
                 except Exception as e:
                     log(f"❌ SYNC FAILED {cid:08d}: {e}")
-                    raise  # This will cause an I/O error, which is correct
+                    raise
                 finally:
                     try: os.unlink(tmp)
                     except: pass
