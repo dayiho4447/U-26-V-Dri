@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (26.04 LTS SERVER)
+name: DLIVE1 ENTERPRISE SAN (26.04 ISO MANUAL INSTALL)
 
 on:
   push:
@@ -18,11 +18,11 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install ALL required packages
+    - name: Install packages
       run: |
         sudo add-apt-repository -y universe
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python xorriso
         command -v nbdkit >/dev/null 2>&1 || { echo "❌ nbdkit missing"; exit 1; }
         command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ qemu missing"; exit 1; }
         sudo chmod 666 /dev/kvm 2>/dev/null || true
@@ -219,7 +219,7 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download Ubuntu 26.04 LTS SERVER (FORCE)
+    - name: Download Ubuntu 26.04 ISO
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO="$CACHE/ubuntu.iso"
@@ -228,19 +228,28 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Extract kernel + initrd
+    - name: Rebuild ISO GRUB with anti-freeze flags (fallback to stock ISO)
       run: |
-        set -x
+        set +e
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
-        sudo mkdir -p /mnt/iso
-        sudo mount -o loop,ro "$ISO" /mnt/iso
-        cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
-        cp /mnt/iso/casper/initrd "$CACHE/initrd"
-        sudo umount /mnt/iso
-        ls -lh "$CACHE/vmlinuz" "$CACHE/initrd"
+        FIXED="$CACHE/ubuntu-fixed.iso"
+        rm -rf /tmp/isowork; mkdir -p /tmp/isowork
+        xorriso -osirrox on -indev "$ISO" -extract / /tmp/isowork 2>/dev/null
+        if [ -f /tmp/isowork/boot/grub/grub.cfg ]; then
+          sed -i 's|quiet splash|quiet splash systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0|g' /tmp/isowork/boot/grub/grub.cfg
+          sed -i 's|---|systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0 ---|g' /tmp/isowork/boot/grub/grub.cfg
+          xorriso -as mkisofs -o "$FIXED" \
+            -isohybrid-mbr /tmp/isowork/boot/grub/i386-pc/boot.img \
+            -b boot/grub/i386-pc/eltorito.img -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat \
+            -J -R /tmp/isowork 2>/dev/null
+          if [ -s "$FIXED" ]; then echo "$FIXED" > /tmp/dlive_iso; echo "✓ using fixed ISO"; else echo "$ISO" > /tmp/dlive_iso; echo "using stock ISO"; fi
+        else
+          echo "$ISO" > /tmp/dlive_iso; echo "using stock ISO"
+        fi
 
-    - name: Boot 26.04 SERVER (MAXIMUM ANTI-FREEZE)
+    - name: Boot 26.04 ISO (MANUAL INSTALL)
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -256,8 +265,7 @@ jobs:
         [ -S /tmp/dlive.sock ] || { cat /tmp/nbdkit.log; exit 1; }
 
         echo "=================================================="
-        echo "VNC: $NB_IP:5900"
-        echo "26.04 LTS SERVER - BOOTING"
+        echo "VNC: $NB_IP:5900  (install manually)"
         echo "=================================================="
 
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
@@ -266,8 +274,7 @@ jobs:
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
-          -kernel "$CACHE/vmlinuz" -initrd "$CACHE/initrd" \
-          -append "boot=casper apparmor=0 security=none systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=1 selinux=0 quiet splash ---" \
+          -boot order=d \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
