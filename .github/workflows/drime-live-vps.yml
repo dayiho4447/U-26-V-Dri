@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (26.04 PRIMARY DRIME BOOT - ULTIMATE)
+name: DLIVE1 ENTERPRISE SAN (26.04 PRIMARY DRIME BOOT - S3 FIX)
 
 on:
   push:
@@ -42,7 +42,7 @@ jobs:
         sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}" || { echo "NetBird failed"; exit 1; }
         sudo netbird status
 
-    - name: Configure Drime accounts & ensure directories exist
+    - name: Configure Drime accounts (using S3 remote)
       env:
         DRIME: ${{ secrets.DRIME }}
         DRIME_ACCOUNTS: ${{ secrets.DRIME_ACCOUNTS }}
@@ -66,18 +66,32 @@ jobs:
             print("ERROR: No Drime accounts!", file=sys.stderr); sys.exit(1)
         with open("/tmp/dlive_accounts", "w") as out:
             for name, tok, size in accounts:
+                # Delete any existing config
                 subprocess.run(["rclone", "config", "delete", name], capture_output=True)
-                c = subprocess.run(["rclone", "config", "create", name, "drime", f"access_token={tok}"], capture_output=True)
+                # Create S3 remote (assume Drime is S3-compatible)
+                # Adjust endpoint and region if needed
+                cmd = [
+                    "rclone", "config", "create", name, "s3",
+                    f"access_key_id={tok}",
+                    f"secret_access_key={tok}",
+                    "endpoint=https://drime.cloud",
+                    "provider=Other",
+                    "force_path_style=true"
+                ]
+                c = subprocess.run(cmd, capture_output=True)
                 if c.returncode == 0:
-                    out.write(f"{name} {size}\n"); print(f"✓ {name} ({size//1024**3}GB)")
-                    # Create remote directory tree so uploads succeed
+                    out.write(f"{name} {size}\n")
+                    print(f"✓ {name} ({size//1024**3}GB)")
+                    # Create directory structure
                     subprocess.run(["rclone", "mkdir", f"{name}:dlive/v6/blocks"], capture_output=True)
+                else:
+                    print(f"Failed to create remote {name}: {c.stderr.decode()}", file=sys.stderr)
         print(f"Total: {len(accounts)}")
         PY
         [ -s /tmp/dlive_accounts ] || { echo "FATAL"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write NBD Plugin (with explicit flush on close)
+    - name: Write NBD Plugin (with debug logging)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit, os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
@@ -204,6 +218,8 @@ jobs:
                         log(f"rcd failed {cid}: {e}, fallback")
                         r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v6/blocks/{lid:08d}.gz", "--retries", "2"], capture_output=True, timeout=120)
                         if r.returncode == 0: ok = True
+                        else:
+                            log(f"fallback copyto failed: {r.stderr.decode()}")
                     if ok: log(f"⚡ PUSHED {cid:08d} to {name}")
                     else: log(f"FAILED {cid:08d}")
                 except Exception as e: log(f"Uploader exception {cid}: {e}")
@@ -239,7 +255,7 @@ jobs:
         echo "$IMG" > /tmp/dlive_img
         ls -lh "$IMG"
 
-    - name: Write cloud image to Drime disk and ensure durability
+    - name: Write cloud image to Drime disk and flush
       run: |
         set -e
         IMG=$(cat /tmp/dlive_img)
@@ -276,7 +292,7 @@ jobs:
         IMG_SIZE=$(stat -c%s "$IMG" 2>/dev/null || echo "0")
         echo "Image size: $IMG_SIZE bytes"
         echo "Waiting for Drime to show data..."
-        for i in $(seq 1 120); do
+        for i in $(seq 1 60); do
           SIZE=$(rclone size "$ACC:dlive" 2>/dev/null | grep -oP 'Total size: \K[0-9]+' || echo "0")
           if [ "$SIZE" -ge "$IMG_SIZE" ]; then
             echo "✓ Upload complete: $SIZE bytes on Drime"
@@ -285,7 +301,6 @@ jobs:
           echo "Attempt $i: Drime shows $SIZE bytes, waiting..."
           sleep 5
         done
-        # Final check
         rclone size "$ACC:dlive" || true
         echo "Drime disk is ready."
 
