@@ -36,7 +36,7 @@ jobs:
         rclone config create DRIME drime access_token="$DRIME_TOKEN"
         rclone mkdir DRIME:dlive/v6/blocks || true
 
-    - name: Create NBD plugin (adaptive sync – corrected open)
+    - name: Create NBD plugin (adaptive sync – fixed log)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit, os, zlib, subprocess, threading, queue, sys, time, builtins
@@ -48,7 +48,7 @@ jobs:
         BLOCK_SIZE = 8 * 1024 * 1024
         DISK_SIZE = 20 * 1024 * 1024 * 1024
         UPLOADER_THREADS = 64
-        AUTO_FLUSH_INTERVAL = 5        # seconds
+        AUTO_FLUSH_INTERVAL = 5
         RCLONE_FLAGS = [
             "--transfers=64",
             "--checkers=64",
@@ -69,8 +69,13 @@ jobs:
         flush_cond = threading.Condition(pending_lock)
 
         def log(msg):
-            with _builtin_open("/tmp/nbdkit.log", "a") as f:
-                f.write(f"[DLIVE] {time.ctime()} {msg}\n")
+            # Write to a separate log file to avoid permission issues
+            try:
+                with _builtin_open("/tmp/dlive_plugin.log", "a") as f:
+                    f.write(f"[DLIVE] {time.ctime()} {msg}\n")
+            except:
+                # Fallback to stderr
+                sys.stderr.write(f"[DLIVE] {time.ctime()} {msg}\n")
 
         def config(key, value):
             pass
