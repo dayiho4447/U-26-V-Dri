@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (26.04 CLOUD IMAGE - FAST SEED)
+name: DLIVE1 ENTERPRISE SAN (26.04 ISO - FIXED)
 
 on:
   push:
@@ -74,7 +74,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write NBD Plugin (reads FROM Drime, writes TO Drime)
+    - name: Write NBD Plugin
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit, os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
@@ -182,7 +182,7 @@ jobs:
                     continue
                 gz = f"/tmp/dlive_up_{cid}_{threading.get_ident()}.gz"
                 try:
-                    with _builtin_open(gz, "wb") as f: f.write(zlib.compress(data, 0))
+                    with _builtin_open(gz, "wb") as f: f.write(zlib.compress(data, 1))
                     url = "http://127.0.0.1:5572/operations/copyfile"
                     req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode()
                     req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'})
@@ -206,9 +206,9 @@ jobs:
         for _ in range(16): threading.Thread(target=uploader_loop, daemon=True).start()
         PYEOF
 
-    - name: Start rclone daemon (high transfers)
+    - name: Start rclone daemon
       run: |
-        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=64 --checkers=64 > /tmp/rcd.log 2>&1 &
+        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
         sleep 2
 
     - name: Prepare cache dir
@@ -219,87 +219,79 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download + convert 26.04 cloud image
+    # ********************** DOWNLOAD THE CORRECT 26.04 ISO **********************
+    - name: Download Ubuntu 26.04 server ISO & extract kernel/initrd
       run: |
+        set -e
         CACHE=$(cat /tmp/dlive_cache)
-        IMG="$CACHE/ubuntu.raw"
-        rm -f "$IMG" "$IMG.qcow2"
-        wget --tries=5 --timeout=60 --continue -O "$IMG.qcow2" "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img" || { echo "✗ img failed"; exit 1; }
-        qemu-img convert -f qcow2 -O raw "$IMG.qcow2" "$IMG"
-        qemu-img resize "$IMG" 20G
-        echo "$IMG" > /tmp/dlive_img
-        ls -lh "$IMG"
+        ISO="$CACHE/ubuntu.iso"
 
-    - name: Seed Drime (FAST - single rclone copy, 64 transfers)
+        # Use the official 26.04 LTS server ISO
+        wget --tries=5 --timeout=60 -O "$ISO" "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"
+        test -f "$ISO" || { echo "✗ ISO download failed"; exit 1; }
+        echo "$ISO" > /tmp/dlive_iso
+        ls -lh "$ISO"
+
+        # Mount and extract kernel+initrd from /casper/ (live server uses this)
+        sudo mkdir -p /mnt/iso
+        sudo mount -o loop,ro "$ISO" /mnt/iso
+        cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
+        cp /mnt/iso/casper/initrd "$CACHE/initrd"
+        sudo umount /mnt/iso
+
+        # Verify they are non-empty
+        test -s "$CACHE/vmlinuz" || { echo "✗ vmlinuz empty"; exit 1; }
+        test -s "$CACHE/initrd" || { echo "✗ initrd empty"; exit 1; }
+        echo "✓ Kernel and initrd extracted successfully"
+
+    - name: Boot 26.04 ISO (2 cores, 4 threads, 16GB, KVM, anti‑freeze)
       run: |
         set -x
-        IMG=$(cat /tmp/dlive_img)
-        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        STAGE=/dev/shm/seedstage
-        rm -rf "$STAGE"; mkdir -p "$STAGE"
-        # Write all non-zero 4MB blocks as gz (level 0) to RAM staging
-        python3 - "$IMG" "$STAGE" <<'PY'
-        import sys, zlib, os
-        B = 4 * 1024 * 1024
-        raw, stage = sys.argv[1], sys.argv[2]
-        n = 0
-        with open(raw, "rb") as f:
-            cid = 0
-            while True:
-                d = f.read(B)
-                if not d: break
-                if len(d) < B: d = d + b"\x00" * (B - len(d))
-                if any(d):
-                    with open(f"{stage}/{cid:08d}.gz", "wb") as g:
-                        g.write(zlib.compress(d, 0))
-                    n += 1
-                cid += 1
-        print(f"staged {n} blocks")
-        PY
-        # ONE rclone copy with 64 parallel transfers = saturates bandwidth
-        time rclone copy "$STAGE" "$ACC:dlive/v6/blocks/" --transfers=64 --checkers=64
-        rm -rf "$STAGE"
-
-    - name: Boot 26.04 from DRIME (VNC)
-      run: |
-        set -x
+        CACHE=$(cat /tmp/dlive_cache)
+        ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
-        ACCEL=""; CPU="-cpu qemu64"
-        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
+        # Start NBD server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         NBD_PID=$!
-        for i in $(seq 1 10); do
+        for i in $(seq 1 15); do
           [ -S /tmp/dlive.sock ] && break
           sleep 1
         done
-        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed"; cat /tmp/nbdkit.log; exit 1; }
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to bind socket"; cat /tmp/nbdkit.log; exit 1; }
 
         echo "=================================================="
-        echo "VNC: $NB_IP:5900  (login: ubuntu / ubuntu)"
-        echo "Disk source: DRIME (reads FROM Drime, writes TO Drime)"
+        echo "VNC: $NB_IP:5900  (install manually)"
         echo "=================================================="
 
-        sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
-          -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
+        ACCEL=""; CPU="-cpu qemu64"
+        [ -e /dev/kvm ] && ACCEL="-enable-kvm"
+
+        sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
+          -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
+          -kernel "$CACHE/vmlinuz" -initrd "$CACHE/initrd" \
+          -append "boot=casper quiet splash systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0 systemd.machine_id= nohpet" \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
           -no-fd-bootchk \
-          -serial stdio \
+          -serial file:/tmp/qemu.log \
           -display none \
           -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
         QPID=$!
 
         wait $QPID
 
+        echo "--- QEMU serial log ---"
+        cat /tmp/qemu.log 2>/dev/null || true
         echo "--- NBD LOG ---"
         tail -n 50 /tmp/nbdkit.log 2>/dev/null || true
         echo "--- DRIME ---"
         ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        rclone size "$ACC:dlive"
+        rclone size "$ACC:dlive" 2>/dev/null || true
         echo "✓ Done."
