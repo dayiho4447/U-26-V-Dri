@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (24.04 ISO MANUAL INSTALL - BOOTS)
+name: DLIVE1 ENTERPRISE SAN (26.04 CLOUD IMAGE - BOOTS)
 
 on:
   push:
@@ -219,20 +219,22 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download Ubuntu 24.04.4 LTS SERVER ISO
+    - name: Download 26.04 CLOUD IMAGE (boots, real ext4 root)
       run: |
         CACHE=$(cat /tmp/dlive_cache)
-        ISO="$CACHE/ubuntu.iso"
-        rm -f "$ISO"
-        wget --tries=5 --timeout=60 --continue -O "$ISO" "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
-        echo "$ISO" > /tmp/dlive_iso
-        ls -lh "$ISO"
+        IMG="$CACHE/ubuntu.raw"
+        rm -f "$IMG" "$IMG.qcow2"
+        wget --tries=5 --timeout=60 --continue -O "$IMG.qcow2" "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img" || { echo "✗ img failed"; exit 1; }
+        qemu-img convert -f qcow2 -O raw "$IMG.qcow2" "$IMG"
+        qemu-img resize "$IMG" 20G
+        echo "$IMG" > /tmp/dlive_img
+        ls -lh "$IMG"
 
-    - name: Boot 24.04 ISO (MANUAL INSTALL)
+    - name: Boot 26.04 CLOUD IMAGE (VNC + Drime sync)
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
-        ISO=$(cat /tmp/dlive_iso)
+        IMG=$(cat /tmp/dlive_img)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
         ACCEL=""; CPU="-cpu qemu64"
@@ -247,7 +249,8 @@ jobs:
         [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to bind socket"; cat /tmp/nbdkit.log; exit 1; }
 
         echo "=================================================="
-        echo "VNC: $NB_IP:5900  (install manually)"
+        echo "VNC: $NB_IP:5900  (login: ubuntu / ubuntu)"
+        echo "26.04 LTS SERVER - boots to login prompt"
         echo "=================================================="
 
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
@@ -255,8 +258,6 @@ jobs:
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
-          -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
-          -boot order=d \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
