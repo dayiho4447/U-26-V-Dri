@@ -259,10 +259,15 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock &
+        sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         NBD_PID=$!
-        sleep 2
-        [ -S /tmp/dlive.sock ] || { cat /tmp/nbdkit.log; exit 1; }
+        
+        # Poll for socket (fixes the race condition)
+        for i in $(seq 1 10); do
+          [ -S /tmp/dlive.sock ] && break
+          sleep 1
+        done
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to bind socket"; cat /tmp/nbdkit.log; exit 1; }
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900  (install manually)"
