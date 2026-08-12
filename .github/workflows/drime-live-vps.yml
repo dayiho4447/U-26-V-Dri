@@ -137,7 +137,6 @@ jobs:
 
           apt-get update -y || fail PKG APT_UPDATE_FAILED ubuntu
           
-          # Install core dependencies (Removed rclone from apt to avoid outdated v1.60)
           apt-get install -y \
             qemu-system-x86 \
             qemu-utils \
@@ -154,7 +153,8 @@ jobs:
             openssh-server || fail PKG INSTALL_FAILED core-packages
 
           # Install latest rclone (v1.73+ REQUIRED for native Drime API support)
-          curl -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL_FAILED rclone
+          log INFO RCLONE "Installing latest rclone..."
+          curl --retry 5 --retry-delay 3 -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL_FAILED rclone
           log INFO RCLONE "Installed version: $(rclone version | head -n1)"
 
           modprobe kvm || true
@@ -182,13 +182,31 @@ jobs:
 
           [[ -n "${NETBIRD_SETUP_KEY:-}" ]] || fail NETBIRD MISSING_SETUP_KEY NETBIRD_SETUP_KEY
 
-          curl -fsSL "$NETBIRD_INSTALL_URL" | sh || fail NETBIRD INSTALL_FAILED netbird
+          # Robust NetBird installation with retries
+          NETBIRD_INSTALL_OK=false
+          for i in {1..5}; do
+            log INFO NETBIRD "Installation attempt $i..."
+            if curl --retry 5 --retry-delay 3 --retry-connrefused -fsSL "$NETBIRD_INSTALL_URL" | sh; then
+              NETBIRD_INSTALL_OK=true
+              break
+            fi
+            log WARN NETBIRD "Install attempt $i failed. Retrying in 5s..."
+            sleep 5
+          done
+          $NETBIRD_INSTALL_OK || fail NETBIRD INSTALL_FAILED netbird
 
-          netbird up --setup-key "$NETBIRD_SETUP_KEY" \
-            --log-file "$ENGINE_LOG_DIR/netbird.log" \
-            --log-level debug || \
-          netbird up --setup-key "$NETBIRD_SETUP_KEY" || \
-          fail NETBIRD UP_FAILED netbird-interface
+          # Robust NetBird connection with retries
+          NETBIRD_UP_OK=false
+          for i in {1..5}; do
+            log INFO NETBIRD "Connection attempt $i..."
+            if netbird up --setup-key "$NETBIRD_SETUP_KEY" --log-file "$ENGINE_LOG_DIR/netbird.log" --log-level debug; then
+              NETBIRD_UP_OK=true
+              break
+            fi
+            log WARN NETBIRD "Connection attempt $i failed. Retrying in 5s..."
+            sleep 5
+          done
+          $NETBIRD_UP_OK || fail NETBIRD UP_FAILED netbird-interface
 
           for i in {1..30}; do
             if ip link show 2>/dev/null | grep -Eq 'wt[0-9]+|netbird'; then
@@ -249,7 +267,7 @@ jobs:
 
             local mount_src="$remote:"
 
-            # Optimized VFS for QEMU True Storage performance (Low latency, random write buffering)
+            # Optimized VFS for QEMU True Storage performance
             rclone mount "$mount_src" "$mnt" \
               --config "$RCLONE_CONFIG" \
               --vfs-cache-mode writes \
