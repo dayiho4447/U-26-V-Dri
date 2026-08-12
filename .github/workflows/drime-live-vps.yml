@@ -1,4 +1,4 @@
-name: DRIME TWO‑STAGE BOOT
+name: DRIME TWO‑STAGE BOOT (FIXED)
 
 on:
   push:
@@ -44,9 +44,10 @@ jobs:
         sudo chown runner:runner /var/lib/dlive
         wget -O "$IMG" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
 
-        # Create a simple synchronous NBD plugin
+        # Create a simple synchronous NBD plugin with all imports
         cat > /tmp/sync_nbd.py <<'EOF'
-        import nbdkit, os, zlib, subprocess, sys, time
+        import nbdkit, os, zlib, subprocess, sys, time, threading, builtins
+        _builtin_open = builtins.open
 
         BLOCK_SIZE = 16 * 1024 * 1024
         DISK_SIZE = 20 * 1024 * 1024 * 1024
@@ -62,9 +63,13 @@ jobs:
         ram_cache = {}
         ram_lock = threading.Lock()
 
-        # Force log to stderr so we can see it
         def log(msg):
-            sys.stderr.write(f"[SYNC] {msg}\n")
+            # Write to a separate log file
+            try:
+                with _builtin_open("/tmp/sync_plugin.log", "a") as f:
+                    f.write(f"[SYNC] {time.ctime()} {msg}\n")
+            except:
+                sys.stderr.write(f"[SYNC] {msg}\n")
 
         def config(key, value): pass
         def thread_model(): return nbdkit.THREAD_MODEL_SERIAL
@@ -86,13 +91,14 @@ jobs:
             try:
                 cmd = ["rclone", "copyto"] + RCLONE_FLAGS + [remote_path, tmp]
                 subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-                with open(tmp, 'rb') as f:
+                with _builtin_open(tmp, 'rb') as f:
                     data = zlib.decompress(f.read())
                 os.unlink(tmp)
                 with ram_lock:
                     ram_cache[cid] = data
                 return data
-            except:
+            except Exception as e:
+                log(f"Download block {cid} failed: {e}")
                 return b"\x00" * BLOCK_SIZE
 
         def pread(h, count, offset, flags):
@@ -109,7 +115,6 @@ jobs:
             return bytes(out)
 
         def pwrite(h, buf, offset, flags):
-            # Synchronous write: upload immediately and wait
             pos = 0
             n = len(buf)
             while pos < n:
@@ -128,19 +133,19 @@ jobs:
                     new = bytes(cur)
                     ram_cache[cid] = new
 
-                # Upload immediately
+                # Upload immediately – if it fails, raise an exception
                 compressed = zlib.compress(new, 1)
                 remote_path = f"{REMOTE_BASE}/{cid:08d}.gz"
                 tmp = f"/tmp/dlive_sync_{cid}.gz"
                 try:
-                    with open(tmp, 'wb') as f:
+                    with _builtin_open(tmp, 'wb') as f:
                         f.write(compressed)
                     cmd = ["rclone", "copyto"] + RCLONE_FLAGS + [tmp, remote_path]
                     subprocess.run(cmd, check=True, capture_output=True, timeout=60)
                     log(f"✅ SYNC UPLOADED {cid:08d}")
                 except Exception as e:
                     log(f"❌ SYNC FAILED {cid:08d}: {e}")
-                    raise  # Let nbdkit know the write failed
+                    raise  # This will cause an I/O error, which is correct
                 finally:
                     try: os.unlink(tmp)
                     except: pass
@@ -178,6 +183,8 @@ jobs:
         if [ $RESULT -ne 0 ]; then
             echo "qemu-img failed. Showing nbdkit log:"
             cat /tmp/nbdkit.log
+            echo "Synchronous plugin log:"
+            cat /tmp/sync_plugin.log 2>/dev/null || echo "No sync plugin log"
             exit 1
         fi
         echo "✅ Image written successfully (synchronous)."
@@ -188,9 +195,6 @@ jobs:
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         echo "VNC: $NB_IP:5900"
 
-        # Now use the full adaptive plugin for boot (already in tmp/dlive_nbd.py from previous step)
-        # If not, recreate it. But we can reuse the same plugin as before with async.
-        # We'll create it again here.
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit, os, zlib, subprocess, threading, queue, sys, time, builtins
         _builtin_open = builtins.open
@@ -227,6 +231,7 @@ jobs:
         def config(key, value): pass
         def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
         def open(readonly): return 1
+
         def close(h):
             log("Close: flushing...")
             with pending_lock:
