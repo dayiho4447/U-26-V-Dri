@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (26.04 CLOUD - ALWAYS ON)
+name: DLIVE1 ENTERPRISE SAN (26.04 PRIMARY DRIME BOOT)
 
 on:
   push:
@@ -22,9 +22,10 @@ jobs:
       run: |
         sudo add-apt-repository -y universe
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python nbd-client
         command -v nbdkit >/dev/null 2>&1 || { echo "❌ nbdkit missing"; exit 1; }
         command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ qemu missing"; exit 1; }
+        command -v nbd-client >/dev/null 2>&1 || { echo "❌ nbd-client missing"; exit 1; }
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install rclone
@@ -229,13 +230,10 @@ jobs:
         echo "$IMG" > /tmp/dlive_img
         ls -lh "$IMG"
 
-    - name: Boot 26.04 cloud image with NVMe Drime disk (always on)
+    - name: Write cloud image to Drime disk (primary boot)
       run: |
-        set -x
-        CACHE=$(cat /tmp/dlive_cache)
+        set -e
         IMG=$(cat /tmp/dlive_img)
-        NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
-        [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
 
         # Start NBD server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
@@ -244,24 +242,58 @@ jobs:
           [ -S /tmp/dlive.sock ] && break
           sleep 1
         done
-        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed"; cat /tmp/nbdkit.log; exit 1; }
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to start"; cat /tmp/nbdkit.log; exit 1; }
+
+        # Connect to NBD as /dev/nbd0
+        sudo modprobe nbd
+        sudo nbd-client -u /tmp/dlive.sock /dev/nbd0
+        # Wait for device to appear
+        for i in $(seq 1 10); do
+          if [ -b /dev/nbd0 ]; then break; fi
+          sleep 1
+        done
+        [ -b /dev/nbd0 ] || { echo "✗ nbd-client failed"; exit 1; }
+
+        # Write the cloud image directly to the device (convert from qcow2 to raw)
+        sudo qemu-img convert -f qcow2 -O raw "$IMG" /dev/nbd0
+
+        # Flush and disconnect
+        sync
+        sudo nbd-client -d /dev/nbd0
+
+        # Keep nbdkit running for later boot
+        echo "Drime disk now contains the OS image."
+
+    - name: Boot 26.04 from primary Drime disk (always on)
+      run: |
+        set -x
+        NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
+        [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
+
+        # nbdkit is already running from previous step (if not, restart it)
+        if ! [ -S /tmp/dlive.sock ]; then
+          sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
+          for i in $(seq 1 15); do
+            [ -S /tmp/dlive.sock ] && break
+            sleep 1
+          done
+        fi
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT not running"; exit 1; }
 
         echo "=================================================="
         echo "VNC: $NB_IP:5900  (connect with a VNC client)"
-        echo "Drime disk appears as /dev/nvme1n1 (20GB)"
-        echo "Cloud image root is /dev/nvme0n1"
+        echo "The entire OS is on the Drime disk (primary NVMe)"
         echo "=================================================="
 
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && ACCEL="-enable-kvm"
 
+        # Boot ONLY from the Drime disk – no secondary
         sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
           -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
-          -drive file="$IMG",format=qcow2,if=none,id=d0,cache=none,aio=native,discard=unmap \
-          -device nvme,serial=deadbeef0,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
-          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d1,cache=none,aio=native,discard=unmap \
-          -device nvme,serial=deadbeef1,drive=d1,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
+          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
+          -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
           -boot order=c \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
@@ -274,7 +306,7 @@ jobs:
         QPID=$!
         echo "QEMU PID: $QPID"
 
-        # Keep the workflow alive forever
+        # Keep the workflow alive
         while true; do
           sleep 30
           echo "--- QEMU serial log (last 10 lines) ---"
