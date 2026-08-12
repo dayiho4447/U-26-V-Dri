@@ -219,12 +219,12 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download Ubuntu 24.04 LTS SERVER ISO (boots in nested KVM)
+    - name: Download Ubuntu 24.04.4 LTS SERVER ISO
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO="$CACHE/ubuntu.iso"
         rm -f "$ISO"
-        wget --tries=5 --timeout=60 --continue -O "$ISO" "https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
+        wget --tries=5 --timeout=60 --continue -O "$ISO" "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
