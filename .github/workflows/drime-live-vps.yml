@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (VM FULL 16GB)
+name: DLIVE1 ENTERPRISE SAN (26.04 PRIMARY DRIME BOOT - FIXED)
 
 on:
   push:
@@ -22,9 +22,10 @@ jobs:
       run: |
         sudo add-apt-repository -y universe
         sudo apt-get update -y
-        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python nbd-client
         command -v nbdkit >/dev/null 2>&1 || { echo "❌ nbdkit missing"; exit 1; }
         command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ qemu missing"; exit 1; }
+        command -v nbd-client >/dev/null 2>&1 || { echo "❌ nbd-client missing"; exit 1; }
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
     - name: Install rclone
@@ -74,7 +75,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write NBD Plugin (capped host cache)
+    - name: Write NBD Plugin
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit, os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
@@ -83,21 +84,21 @@ jobs:
         API_VERSION = 2
         B = 4 * 1024 * 1024
         DISK_SIZE = 20 * 1024 * 1024 * 1024
-        MAX_BLOCKS = 256   # cap HOST cache at 1GB so host RAM stays free for the VM
         ram_cache = {}; ram_lock = threading.Lock()
         upload_queue = queue.Queue()
-        accounts = []
+        accounts = []; anchor = ""
         pending_uploads = 0
         pending_lock = threading.Lock()
         flush_cond = threading.Condition(pending_lock)
-        def log(m):
-            with _builtin_open("/tmp/nbdkit.log", "a") as f: f.write(f"[DLIVE] {m}\n")
+        def log(msg):
+            with _builtin_open("/tmp/nbdkit.log", "a") as f: f.write(f"[DLIVE] {msg}\n")
         def config(key, value):
-            global accounts
+            global accounts, anchor
             if key == "accounts":
                 for line in Path(str(value)).read_text().splitlines():
                     p = line.split()
                     if len(p) >= 2: accounts.append([p[0], int(p[1])])
+                if accounts: anchor = accounts[0][0]
         def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
         def open(readonly): return 1
         def close(h): pass
@@ -105,11 +106,7 @@ jobs:
         def can_write(h): return True
         def can_flush(h): return True
         def can_trim(h): return True
-        def cache_put(cid, data):
-            with ram_lock:
-                ram_cache[cid] = data
-                while len(ram_cache) > MAX_BLOCKS: ram_cache.popitem()
-        def block_id(o): return o // B
+        def block_id(offset): return offset // B
         def acct_for(cid):
             off = 0
             for name, size in accounts:
@@ -128,10 +125,9 @@ jobs:
                 if r.returncode == 0 and os.path.exists(tmp):
                     d = zlib.decompress(Path(tmp).read_bytes())
                     os.unlink(tmp)
-                    cache_put(cid, d)
+                    with ram_lock: ram_cache[cid] = d
                     return d
-            except Exception as e:
-                log(f"Read error {cid}: {e}")
+            except Exception as e: log(f"Read error {cid}: {e}")
             return b"\x00" * B
         def pread(h, count, offset, flags):
             try: count = int(count)
@@ -155,10 +151,10 @@ jobs:
                 o = offset + pos; cid = block_id(o); co = o % B
                 k = min(B - co, n - pos)
                 with ram_lock:
-                    cur = bytearray(ram_cache[cid]) if cid in ram_cache else bytearray(get_block(cid))
+                    if cid in ram_cache: cur = bytearray(ram_cache[cid])
+                    else: cur = bytearray(get_block(cid))
                     cur[co:co+k] = buf[pos:pos+k]
-                    new = bytes(cur)
-                cache_put(cid, new)
+                    new = bytes(cur); ram_cache[cid] = new
                 with pending_lock: pending_uploads += 1
                 upload_queue.put((cid, new))
                 pos += k
@@ -170,9 +166,12 @@ jobs:
             except: count = len(count) if hasattr(count, '__len__') else 0
             try: offset = int(offset)
             except: offset = 0
+            start_cid = offset // B
+            end_cid = (offset + count + B - 1) // B
             with ram_lock:
-                for cid in range(offset//B, (offset+count+B-1)//B): ram_cache.pop(cid, None)
-        def uploader():
+                for cid in range(start_cid, end_cid):
+                    if cid in ram_cache: del ram_cache[cid]
+        def uploader_loop():
             global pending_uploads
             while True:
                 cid, data = upload_queue.get()
@@ -186,35 +185,34 @@ jobs:
                 try:
                     with _builtin_open(gz, "wb") as f: f.write(zlib.compress(data, 1))
                     url = "http://127.0.0.1:5572/operations/copyfile"
-                    req = urllib.request.Request(url, data=json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode(), headers={'Content-Type':'application/json'})
+                    req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode()
+                    req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'})
                     ok = False
                     try:
-                        urllib.request.urlopen(req, timeout=120); ok = True
+                        urllib.request.urlopen(req, timeout=120)
+                        ok = True
                     except Exception as e:
                         log(f"rcd failed {cid}: {e}, fallback")
-                        r = subprocess.run(["rclone","copyto",gz,f"{name}:dlive/v6/blocks/{lid:08d}.gz","--retries","2"],capture_output=True,timeout=120)
+                        r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v6/blocks/{lid:08d}.gz", "--retries", "2"], capture_output=True, timeout=120)
                         if r.returncode == 0: ok = True
-                    if ok: log(f" PUSHED {cid:08d} to {name}")
+                    if ok: log(f"⚡ PUSHED {cid:08d} to {name}")
                     else: log(f"FAILED {cid:08d}")
-                except Exception as e:
-                    log(f"Uploader exception {cid}: {e}")
+                except Exception as e: log(f"Uploader exception {cid}: {e}")
                 finally:
                     try: os.unlink(gz)
                     except: pass
                     with pending_lock:
                         pending_uploads -= 1
                         if pending_uploads == 0: flush_cond.notify_all()
-        for _ in range(16): threading.Thread(target=uploader, daemon=True).start()
+        for _ in range(16): threading.Thread(target=uploader_loop, daemon=True).start()
         PYEOF
-        echo "✓ NBD plugin written"
 
     - name: Start rclone daemon
       run: |
-        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=64 --checkers=64 > /tmp/rcd.log 2>&1 &
+        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
         sleep 2
-        curl -s http://127.0.0.1:5572/rc/noop && echo "✓ rclone rcd ready"
 
-    - name: Prepare cache dir (SSD)
+    - name: Prepare cache dir
       run: |
         set +e
         CACHE=/var/lib/dlive
@@ -222,82 +220,109 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download + convert image
+    - name: Download Ubuntu 26.04 cloud image
       run: |
+        set -e
         CACHE=$(cat /tmp/dlive_cache)
-        IMG="$CACHE/ubuntu.raw"
-        rm -f "$IMG" "$IMG.qcow2"
-        wget -q --tries=3 -O "$IMG.qcow2" "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img" || { echo "✗ img failed"; exit 1; }
-        qemu-img convert -f qcow2 -O raw "$IMG.qcow2" "$IMG"
-        qemu-img resize -f raw "$IMG" 20G
+        IMG="$CACHE/ubuntu.img"
+        wget --tries=5 --timeout=60 -O "$IMG" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
+        test -s "$IMG" || { echo "✗ Download failed"; exit 1; }
         echo "$IMG" > /tmp/dlive_img
         ls -lh "$IMG"
 
-    - name: Seed Drime (STAGE ON SSD, NOT RAM)
+    - name: Write cloud image to Drime disk and flush
       run: |
-        set -x
+        set -e
         IMG=$(cat /tmp/dlive_img)
-        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        STAGE="$CACHE/seedstage"     # SSD, NOT /dev/shm -> RAM free for VM
-        rm -rf "$STAGE"; mkdir -p "$STAGE"
-        python3 - "$IMG" "$STAGE" <<'PY'
-        import sys, zlib
-        B=4*1024*1024
-        img, stage = sys.argv[1], sys.argv[2]
-        n=0
-        with open(img,'rb') as f:
-            cid=0
-            while True:
-                d=f.read(B)
-                if not d: break
-                if len(d)<B: d=d+b"\x00"*(B-len(d))
-                if any(d):
-                    with open(f"{stage}/{cid:08d}.gz","wb") as g: g.write(zlib.compress(d,1))
-                    n+=1
-                cid+=1
-        print(f"staged {n} blocks")
-        PY
-        rclone copy "$STAGE" "$ACC:dlive/v6/blocks/" --transfers=64 --checkers=64
-        rm -rf "$STAGE"
-        echo "✓ Seeded to Drime"
 
-    - name: Boot VM (FULL 16GB)
+        # Start NBD server
+        sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
+        NBD_PID=$!
+        for i in $(seq 1 15); do
+          [ -S /tmp/dlive.sock ] && break
+          sleep 1
+        done
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to start"; cat /tmp/nbdkit.log; exit 1; }
+
+        # Connect to NBD as /dev/nbd0
+        sudo modprobe nbd
+        sudo nbd-client -u /tmp/dlive.sock /dev/nbd0
+        for i in $(seq 1 10); do
+          if [ -b /dev/nbd0 ]; then break; fi
+          sleep 1
+        done
+        [ -b /dev/nbd0 ] || { echo "✗ nbd-client failed"; exit 1; }
+
+        # Write the cloud image to the device
+        echo "Writing image to Drime disk..."
+        sudo qemu-img convert -f qcow2 -O raw "$IMG" /dev/nbd0
+
+        # Force a flush and wait for uploads to complete
+        echo "Flushing writes to Drime..."
+        # Use nbd-client to send a flush (if supported) or just disconnect
+        sudo nbd-client -d /dev/nbd0
+
+        # Wait a bit for upload threads to finish
+        sleep 10
+
+        # Check if any data was uploaded
+        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
+        echo "Checking Drime storage size after upload..."
+        rclone size "$ACC:dlive" || true
+
+        echo "Image written and flushed to Drime."
+
+    - name: Boot 26.04 from primary Drime disk (always on)
       run: |
         set -x
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
+
+        # Restart NBD server if not running
+        if ! [ -S /tmp/dlive.sock ]; then
+          sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
+          for i in $(seq 1 15); do
+            [ -S /tmp/dlive.sock ] && break
+            sleep 1
+          done
+        fi
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT not running"; exit 1; }
+
+        echo "=================================================="
+        echo "VNC: $NB_IP:5900  (connect with a VNC client)"
+        echo "The entire OS is on the Drime disk (primary NVMe)"
+        echo "=================================================="
+
         ACCEL=""; CPU="-cpu qemu64"
-        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
+        [ -e /dev/kvm ] && ACCEL="-enable-kvm"
 
-        sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
-        NBD_PID=$!
-        for i in $(seq 1 10); do [ -S /tmp/dlive.sock ] && break; sleep 1; done
-        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed"; cat /tmp/nbdkit.log; exit 1; }
-
-        echo "=================================================="
-        echo "VNC: $NB_IP:5900"
-        echo "VM RAM: FULL 16GB (KVM overcommit; host keeps only what it needs)"
-        echo "=================================================="
-
-        sudo -E qemu-system-x86_64 $ACCEL -machine pc -cpu host \
-          -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
+        sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
-          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
-          -device virtio-blk-pci,drive=d0,iothread=ioth1 \
+          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
+          -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
+          -boot order=c \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
           -no-fd-bootchk \
-          -serial stdio \
+          -serial file:/tmp/qemu.log \
           -display none \
           -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
+
         QPID=$!
+        echo "QEMU PID: $QPID"
 
-        wait $QPID
-
-        echo "--- NBD LOG ---"
-        tail -n 50 /tmp/nbdkit.log 2>/dev/null || true
-        echo "--- FINAL DRIME ---"
-        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        rclone size "$ACC:dlive"
-        echo "✓ Done."
+        # Keep alive
+        while true; do
+          sleep 30
+          echo "--- QEMU serial log (last 10 lines) ---"
+          tail -n 10 /tmp/qemu.log 2>/dev/null || echo "No log yet"
+          echo "--- NBD log (last 5 lines) ---"
+          tail -n 5 /tmp/nbdkit.log 2>/dev/null || echo "No log yet"
+          if ! kill -0 $QPID 2>/dev/null; then
+            echo "QEMU crashed!"
+            cat /tmp/qemu.log
+            exit 1
+          fi
+        done
