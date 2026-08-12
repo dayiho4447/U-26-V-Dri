@@ -1,4 +1,4 @@
-name: DRIME ADAPTIVE SYNC BOOT
+name: DRIME ADAPTIVE SYNC BOOT (FIXED)
 
 on:
   push:
@@ -29,20 +29,23 @@ jobs:
         sudo apt-get install -y netbird
         sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}" || exit 1
 
-    - name: Configure rclone
+    - name: Configure rclone with Drime
       env:
         DRIME_TOKEN: ${{ secrets.DRIME }}
       run: |
         rclone config create DRIME drime access_token="$DRIME_TOKEN"
         rclone mkdir DRIME:dlive/v6/blocks || true
 
-    - name: Create NBD plugin – adaptive (async + sync on flush)
+    - name: Create NBD plugin (adaptive sync – corrected open)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
-        import nbdkit, os, zlib, subprocess, threading, queue, sys, time
+        import nbdkit, os, zlib, subprocess, threading, queue, sys, time, builtins
+
+        # Use builtin open to avoid conflict with nbdkit's required 'open' function
+        _builtin_open = builtins.open
 
         # ========== CONFIG ==========
-        BLOCK_SIZE = 8 * 1024 * 1024   # 8 MB – good balance
+        BLOCK_SIZE = 8 * 1024 * 1024
         DISK_SIZE = 20 * 1024 * 1024 * 1024
         UPLOADER_THREADS = 64
         AUTO_FLUSH_INTERVAL = 5        # seconds
@@ -66,12 +69,17 @@ jobs:
         flush_cond = threading.Condition(pending_lock)
 
         def log(msg):
-            with open("/tmp/nbdkit.log", "a") as f:
+            with _builtin_open("/tmp/nbdkit.log", "a") as f:
                 f.write(f"[DLIVE] {time.ctime()} {msg}\n")
 
-        def config(key, value): pass
-        def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
-        def open(readonly): return 1
+        def config(key, value):
+            pass
+
+        def thread_model():
+            return nbdkit.THREAD_MODEL_PARALLEL
+
+        def open(readonly):
+            return 1
 
         def close(h):
             log("Close: flushing...")
@@ -81,12 +89,20 @@ jobs:
                     log(f"Waiting for uploads: {pending_uploads}")
             log("Close complete")
 
-        def get_size(h): return DISK_SIZE
-        def can_write(h): return True
-        def can_flush(h): return True
-        def can_trim(h): return True
+        def get_size(h):
+            return DISK_SIZE
 
-        def block_id(offset): return offset // BLOCK_SIZE
+        def can_write(h):
+            return True
+
+        def can_flush(h):
+            return True
+
+        def can_trim(h):
+            return True
+
+        def block_id(offset):
+            return offset // BLOCK_SIZE
 
         def get_block(cid):
             with ram_lock:
@@ -97,7 +113,7 @@ jobs:
             try:
                 cmd = ["rclone", "copyto"] + RCLONE_FLAGS + [remote_path, tmp]
                 subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-                with open(tmp, 'rb') as f:
+                with _builtin_open(tmp, 'rb') as f:
                     data = zlib.decompress(f.read())
                 os.unlink(tmp)
                 with ram_lock:
@@ -120,7 +136,6 @@ jobs:
                 pos += n
             return bytes(out)
 
-        # ========== ASYNC WRITE (queued) ==========
         def pwrite(h, buf, offset, flags):
             global pending_uploads
             pos = 0
@@ -145,7 +160,6 @@ jobs:
                 upload_queue.put((cid, new))
                 pos += k
 
-        # ========== FLUSH – waits for all uploads ==========
         def flush(h, flags):
             with pending_lock:
                 while pending_uploads > 0:
@@ -167,7 +181,7 @@ jobs:
                 remote_path = f"{REMOTE_BASE}/{cid:08d}.gz"
                 tmp = f"/tmp/dlive_up_{cid}.gz"
                 try:
-                    with open(tmp, 'wb') as f:
+                    with _builtin_open(tmp, 'wb') as f:
                         f.write(compressed)
                     cmd = ["rclone", "copyto"] + RCLONE_FLAGS + [tmp, remote_path]
                     subprocess.run(cmd, check=True, capture_output=True, timeout=60)
@@ -225,7 +239,6 @@ jobs:
         for i in {1..10}; do [ -b /dev/nbd0 ] && break; sleep 1; done
         [ -b /dev/nbd0 ] || exit 1
 
-        # This will trigger many async writes, but we flush at the end (nbd-client -d triggers close)
         sudo qemu-img convert -f qcow2 -O raw "$IMG" /dev/nbd0
         sudo nbd-client -d /dev/nbd0
 
