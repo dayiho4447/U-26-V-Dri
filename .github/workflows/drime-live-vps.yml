@@ -160,7 +160,7 @@ jobs:
             [[ -f /run/drime-vm.pid ]] && kill "$(cat /run/drime-vm.pid)" 2>/dev/null || true
             sleep 3
             [[ -n "$NBD_SUPERVISOR_PID" ]] && kill "$NBD_SUPERVISOR_PID" 2>/dev/null || true
-            pkill -f "nbdkit python3" 2>/dev/null || true
+            pkill -f "nbdkit python" 2>/dev/null || true
             rclone delete drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null || true
             log SHUTDOWN "All data safe on Drime"
           }
@@ -169,9 +169,10 @@ jobs:
           log INIT "DRIME LIVE VPS ENGINE"
 
           apt-get update -y || fail PKG apt-update
+          # CRITICAL FIX: Correct package name is 'nbdkit-plugin-python' NOT 'nbdkit-plugin-python3'
           apt-get install -y \
             qemu-system-x86 qemu-utils \
-            nbdkit nbdkit-plugin-python3 python3 \
+            nbdkit nbdkit-plugin-python python3 \
             jq curl ca-certificates iproute2 kmod fuse3 socat \
             || fail PKG install
 
@@ -247,7 +248,7 @@ jobs:
           rm -f "$NBD_SOCK"
           (
             while true; do
-              nbdkit python3 "$PLUGIN" --unix "$NBD_SOCK" --threads 16 --foreground 2>>"$LOG/nbdkit.log"
+              nbdkit python "$PLUGIN" --unix "$NBD_SOCK" --threads 16 --foreground 2>>"$LOG/nbdkit.log"
               log WARN "nbdkit crashed, restarting in 2s"
               sleep 2
             done
