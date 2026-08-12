@@ -12,15 +12,9 @@ on:
       vm_ram_gb:
         description: "RAM in GB"
         default: "16"
-      disk_size:
-        description: "auto or QEMU size, example: 18G"
-        default: "auto"
       vnc_bind:
         description: "VNC bind address"
         default: "0.0.0.0"
-      vm_password:
-        description: "Optional VM password. If empty, generated."
-        default: ""
 
 concurrency:
   group: drime-vm-engine
@@ -33,25 +27,19 @@ jobs:
 
     env:
       ENGINE_LOG_DIR: /var/log/drime
-      DRIME_ROOT: /mnt/drime
-      POOL: /mnt/drime/pool
-      DISK_IMG: /mnt/drime/pool/vm-primary.img
-      SEED_IMG: /var/tmp/seed.iso
-      PID_FILE: /run/drime-vm.pid
-      MON_SOCK: /run/drime-vm.monitor
       RCLONE_CONFIG: /root/.config/rclone/drime.conf
+      DRIME_POOL: /mnt/drime-pool
+      DISK_IMG: /mnt/drime-pool/vm-26.04.img
+      PID_FILE: /run/drime-vm.pid
 
       NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
-
       SECRETS_JSON: ${{ toJSON(secrets) }}
       VARS_JSON: ${{ toJSON(vars) }}
 
       INPUT_VM_CORES: ${{ github.event.inputs.vm_cores }}
       INPUT_VM_THREADS: ${{ github.event.inputs.vm_threads }}
       INPUT_VM_RAM_GB: ${{ github.event.inputs.vm_ram_gb }}
-      INPUT_DISK_SIZE: ${{ github.event.inputs.disk_size }}
       INPUT_VNC_BIND: ${{ github.event.inputs.vnc_bind }}
-      INPUT_VM_PASSWORD: ${{ github.event.inputs.vm_password }}
 
     steps:
       - name: Engine
@@ -66,415 +54,174 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
 
           ENGINE_LOG_DIR="${ENGINE_LOG_DIR:-/var/log/drime}"
-          DRIME_ROOT="${DRIME_ROOT:-/mnt/drime}"
-          POOL="${POOL:-$DRIME_ROOT/pool}"
-          DISK_IMG="${DISK_IMG:-$POOL/vm-primary.img}"
-          SEED_IMG="${SEED_IMG:-/var/tmp/seed.iso}"
-          PID_FILE="${PID_FILE:-/run/drime-vm.pid}"
-          MON_SOCK="${MON_SOCK:-/run/drime-vm.monitor}"
           RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/drime.conf}"
+          DRIME_POOL="${DRIME_POOL:-/mnt/drime-pool}"
+          DISK_IMG="${DISK_IMG:-/mnt/drime-pool/vm-26.04.img}"
+          PID_FILE="${PID_FILE:-/run/drime-vm.pid}"
 
           if [[ -z "${SECRETS_JSON:-}" ]]; then SECRETS_JSON='{}'; fi
           if [[ -z "${VARS_JSON:-}" ]]; then VARS_JSON='{}'; fi
 
-          mkdir -p "$ENGINE_LOG_DIR"
+          mkdir -p "$ENGINE_LOG_DIR" "$(dirname "$RCLONE_CONFIG")"
           exec > >(tee -a "$ENGINE_LOG_DIR/engine.log") 2>&1
 
           log() {
-            local level="$1"
-            local comp="$2"
-            shift 2
+            local level="$1" comp="$2"; shift 2
             printf '[%s] [%s] [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$comp" "$*"
           }
 
           fail() {
-            trap - ERR
-            local comp="$1"
-            local reason="$2"
-            local which="${3:-unknown}"
-            log ERROR "$comp" "FAILED reason=$reason which=$which"
-            exit 1
-          }
-
-          on_error() {
-            local rc=$?
-            trap - ERR
-            log ERROR TRAP "unhandled_command=$BASH_COMMAND exit_code=$rc line=$LINENO"
-            exit $rc
+            trap - ERR; local comp="$1" reason="$2" which="${3:-unknown}"
+            log ERROR "$comp" "FAILED reason=$reason which=$which"; exit 1
           }
 
           CLEANUP_DONE=0
           cleanup() {
-            if [[ "$CLEANUP_DONE" == "1" ]]; then
-              return 0
-            fi
+            [[ "$CLEANUP_DONE" == "1" ]] && return 0
             CLEANUP_DONE=1
-
-            if [[ -f "$PID_FILE" ]]; then
-              kill "$(cat "$PID_FILE")" 2>/dev/null || true
-            fi
-
-            if mountpoint -q "$POOL" 2>/dev/null; then
-              umount -l "$POOL" 2>/dev/null || true
-            fi
-
+            [[ -f "$PID_FILE" ]] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+            mountpoint -q "$DRIME_POOL" && umount -l "$DRIME_POOL" 2>/dev/null || true
             shopt -s nullglob
-            local m
-            for m in "$DRIME_ROOT"/d*; do
-              if mountpoint -q "$m" 2>/dev/null; then
-                fusermount3 -u "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
-              fi
+            for m in /mnt/drime*; do
+              mountpoint -q "$m" && fusermount3 -u "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
             done
-
-            chmod -R 777 "$ENGINE_LOG_DIR" 2>/dev/null || true
           }
-
-          trap on_error ERR
+          trap 'log ERROR TRAP "unhandled=$BASH_COMMAND exit=$?"; exit 1' ERR
           trap cleanup EXIT
           trap 'cleanup; exit 143' TERM INT
 
-          log INFO INIT "DRIME VM engine started"
+          log INFO INIT "DRIME VM engine started (Direct Drime Boot - No Cloud-Init)"
 
           apt-get update -y || fail PKG APT_UPDATE_FAILED ubuntu
-          
-          apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            cloud-image-utils \
-            lvm2 \
-            jq \
-            curl \
-            ca-certificates \
-            iproute2 \
-            kmod \
-            fuse3 \
-            socat \
-            openssl \
-            openssh-server || fail PKG INSTALL_FAILED core-packages
+          apt-get install -y qemu-system-x86 qemu-utils jq curl ca-certificates iproute2 kmod socat openssl openssh-server mergerfs fuse3 || fail PKG INSTALL_FAILED core-packages
 
-          # Install latest rclone (v1.73+ REQUIRED for native Drime API support)
           log INFO RCLONE "Installing latest rclone..."
-          curl --retry 5 --retry-delay 3 -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL_FAILED rclone
+          curl --retry 5 -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL_FAILED rclone
           log INFO RCLONE "Installed version: $(rclone version | head -n1)"
 
-          modprobe kvm || true
-          modprobe kvm_intel || modprobe kvm_amd || true
-
+          modprobe kvm || true; modprobe kvm_intel || modprobe kvm_amd || true
           [[ -e /dev/kvm ]] || fail KVM DEVICE_MISSING /dev/kvm
           chmod 666 /dev/kvm || fail KVM PERMISSION_FAILED /dev/kvm
           log INFO KVM "KVM device ready"
 
           get_secret_or_var() {
-            local name="$1"
-            local v=""
-            v=$(jq -r --arg k "$name" '.[$k] // empty' <<<"$SECRETS_JSON")
-            if [[ -z "$v" ]]; then
-              v=$(jq -r --arg k "$name" '.[$k] // empty' <<<"$VARS_JSON")
-            fi
+            local v=$(jq -r --arg k "$1" '.[$k] // empty' <<<"$SECRETS_JSON")
+            [[ -z "$v" ]] && v=$(jq -r --arg k "$1" '.[$k] // empty' <<<"$VARS_JSON")
             printf '%s' "$v"
           }
 
-          jq -e . >/dev/null 2>&1 <<<"$SECRETS_JSON" || fail STORAGE INVALID_SECRETS_JSON secrets
-          jq -e . >/dev/null 2>&1 <<<"$VARS_JSON" || fail STORAGE INVALID_VARS_JSON vars
-
           NETBIRD_INSTALL_URL="$(get_secret_or_var NETBIRD_INSTALL_URL)"
           NETBIRD_INSTALL_URL="${NETBIRD_INSTALL_URL:-https://pkgs.netbird.io/install.sh}"
-
           [[ -n "${NETBIRD_SETUP_KEY:-}" ]] || fail NETBIRD MISSING_SETUP_KEY NETBIRD_SETUP_KEY
 
-          # Robust NetBird installation with retries
-          NETBIRD_INSTALL_OK=false
           for i in {1..5}; do
             log INFO NETBIRD "Installation attempt $i..."
-            if curl --retry 5 --retry-delay 3 --retry-connrefused -fsSL "$NETBIRD_INSTALL_URL" | sh; then
-              NETBIRD_INSTALL_OK=true
-              break
-            fi
-            log WARN NETBIRD "Install attempt $i failed. Retrying in 5s..."
+            curl --retry 5 --retry-connrefused -fsSL "$NETBIRD_INSTALL_URL" | sh && break
             sleep 5
           done
-          $NETBIRD_INSTALL_OK || fail NETBIRD INSTALL_FAILED netbird
 
-          # Robust NetBird connection with retries
-          NETBIRD_UP_OK=false
           for i in {1..5}; do
             log INFO NETBIRD "Connection attempt $i..."
-            if netbird up --setup-key "$NETBIRD_SETUP_KEY" --log-file "$ENGINE_LOG_DIR/netbird.log" --log-level debug; then
-              NETBIRD_UP_OK=true
-              break
-            fi
-            log WARN NETBIRD "Connection attempt $i failed. Retrying in 5s..."
+            netbird up --setup-key "$NETBIRD_SETUP_KEY" --log-file "$ENGINE_LOG_DIR/netbird.log" && break
             sleep 5
           done
-          $NETBIRD_UP_OK || fail NETBIRD UP_FAILED netbird-interface
 
-          for i in {1..30}; do
-            if ip link show 2>/dev/null | grep -Eq 'wt[0-9]+|netbird'; then
-              break
-            fi
-            sleep 1
-          done
-
-          NETBIRD_IP=""
+          NETBIRD_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
           for iface in wt0 netbird0 nb0; do
             if ip addr show "$iface" 2>/dev/null | grep -q 'inet '; then
               NETBIRD_IP=$(ip -4 -o addr show "$iface" | awk '{print $4}' | cut -d/ -f1 | head -n1)
               break
             fi
           done
-
-          if [[ -z "$NETBIRD_IP" ]]; then
-            NETBIRD_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-          fi
-
           log INFO NETBIRD "NetBird ready ip=${NETBIRD_IP:-unknown}"
-
-          mapfile -t DRIME_KEYS < <(
-            jq -r 'to_entries[] | select(.key | test("^DRIME([0-9]+)?$")) | .key' <<<"$SECRETS_JSON" | sort -V
-          )
-
-          [[ ${#DRIME_KEYS[@]} -gt 0 ]] || fail STORAGE NO_DRIME_SECRETS "DRIME,DRIME1,DRIME2..."
-
-          mkdir -p "$DRIME_ROOT" "$(dirname "$RCLONE_CONFIG")"
 
           touch /etc/fuse.conf
           sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true
           grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
-          mount_drime() {
-            local idx="$1"
-            local key_name="$2"
-            local secret_value="$3"
+          mapfile -t DRIME_KEYS < <(jq -r 'to_entries[] | select(.key | test("^DRIME([0-9]+)?$")) | .key' <<<"$SECRETS_JSON" | sort -V)
+          [[ ${#DRIME_KEYS[@]} -gt 0 ]] || fail STORAGE NO_DRIME_SECRETS "DRIME,DRIME1..."
 
-            local mnt="$DRIME_ROOT/d$idx"
-            local remote="drime$idx"
-
-            local token="$secret_value"
-            
-            # If secret is JSON, extract token dynamically
-            if jq -e . >/dev/null 2>&1 <<<"$secret_value"; then
-              token=$(jq -r '.access_token // .token // .api_key // .pass // empty' <<<"$secret_value")
-            fi
-
-            [[ -n "$token" ]] || fail STORAGE MISSING_CREDENTIAL "$key_name"
-
-            mkdir -p "$mnt"
-
-            # Configure native Drime backend (Requires rclone >= 1.73)
-            rclone config create "$remote" drime \
-              access_token="$token" \
-              --config "$RCLONE_CONFIG" >/dev/null || fail STORAGE RCLONE_CONFIG_FAILED "$key_name"
-
-            local mount_src="$remote:"
-
-            # Optimized VFS for QEMU True Storage performance
-            rclone mount "$mount_src" "$mnt" \
-              --config "$RCLONE_CONFIG" \
-              --vfs-cache-mode writes \
-              --vfs-cache-max-age 5m \
-              --vfs-cache-max-size 1G \
-              --vfs-read-ahead 256M \
-              --allow-other \
-              --log-file "$ENGINE_LOG_DIR/rclone-$idx.log" \
-              --log-level INFO \
-              --daemon || fail STORAGE RCLONE_MOUNT_FAILED "$key_name"
-
-            local tries=0
-            for tries in {1..30}; do
-              if grep -q "$mnt" /proc/mounts; then
-                break
-              fi
-              sleep 1
-            done
-
-            if ! grep -q "$mnt" /proc/mounts; then
-              tail -n 40 "$ENGINE_LOG_DIR/rclone-$idx.log" || true
-              fail STORAGE MOUNT_NOT_VISIBLE "$key_name"
-            fi
-
-            local probe="$mnt/.drime_probe_$$_$RANDOM"
-            echo drime-probe > "$probe" || fail STORAGE WRITE_FAILED "$key_name"
-            cat "$probe" >/dev/null || fail STORAGE READ_FAILED "$key_name"
-            rm -f "$probe"
-
-            log INFO STORAGE "MOUNT_OK account=$key_name mount=$mnt type=drime_native"
-          }
-
+          MOUNTS=()
           idx=0
           for key in "${DRIME_KEYS[@]}"; do
             val=$(jq -r --arg k "$key" '.[$k]' <<<"$SECRETS_JSON")
-            mount_drime "$idx" "$key" "$val"
+            if jq -e . >/dev/null 2>&1 <<<"$val"; then
+              token=$(jq -r '.access_token // .token // .api_key // .pass // empty' <<<"$val")
+            else
+              token="$val"
+            fi
+            [[ -n "$token" ]] || fail STORAGE MISSING_CREDENTIAL "$key"
+
+            rclone config create "drime$idx" drime access_token="$token" --config "$RCLONE_CONFIG" >/dev/null
+            mkdir -p "/mnt/drime$idx"
+            
+            # Direct Mount with write-back cache required for block device emulation
+            rclone mount "drime$idx:" "/mnt/drime$idx" \
+              --config "$RCLONE_CONFIG" \
+              --vfs-cache-mode writes \
+              --vfs-cache-max-age 1m \
+              --vfs-cache-max-size 2G \
+              --allow-other \
+              --log-file "$ENGINE_LOG_DIR/rclone-$idx.log" \
+              --daemon || fail STORAGE MOUNT_FAILED "$key"
+              
+            MOUNTS+=("/mnt/drime$idx")
+            log INFO STORAGE "MOUNT_OK account=$key"
             idx=$((idx + 1))
           done
 
-          if ! command -v mergerfs >/dev/null; then
-            apt-get install -y mergerfs || log WARN STORAGE MERGERFS_INSTALL_FAILED "multi-mount-pool-unavailable"
-          fi
-
-          mkdir -p "$POOL"
-          shopt -s nullglob
-          mounts=("$DRIME_ROOT"/d*)
-
-          if [[ ${#mounts[@]} -eq 0 ]]; then
-            fail STORAGE NO_DRIME_MOUNTS "$DRIME_ROOT"
-          fi
-
-          if [[ ${#mounts[@]} -gt 1 ]]; then
-            command -v mergerfs >/dev/null || fail STORAGE MERGERFS_MISSING pool
-
-            mergerfs -o defaults,allow_other,use_ino,cache.files=off,direct_io,category.create=mfs \
-              "${mounts[@]}" "$POOL" || \
-            mergerfs -o defaults,allow_other,use_ino,category.create=mfs \
-              "${mounts[@]}" "$POOL" || \
-            fail STORAGE MERGERFS_MOUNT_FAILED pool
-
-            log INFO STORAGE "POOL_OK mode=mergerfs count=${#mounts[@]}"
+          mkdir -p "$DRIME_POOL"
+          if [[ ${#MOUNTS[@]} -gt 1 ]]; then
+            mergerfs -o defaults,allow_other,use_ino,cache.files=off,category.create=mfs "${MOUNTS[@]}" "$DRIME_POOL" || fail STORAGE MERGERFS_FAILED pool
           else
-            mount --bind "${mounts[0]}" "$POOL" || fail STORAGE BIND_FAILED pool
-            log INFO STORAGE "POOL_OK mode=bind count=1"
+            mount --bind "${MOUNTS[0]}" "$DRIME_POOL" || fail STORAGE BIND_FAILED pool
           fi
+          log INFO STORAGE "POOL_OK count=${#MOUNTS[@]} path=$DRIME_POOL"
 
-          mountpoint -q "$POOL" || fail STORAGE POOL_NOT_VISIBLE "$POOL"
-
-          REQUESTED_SIZE="${INPUT_DISK_SIZE:-auto}"
-          if [[ "$REQUESTED_SIZE" == "auto" || -z "$REQUESTED_SIZE" ]]; then
-            avail=$(df -B1 --output=avail "$POOL" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
-            if [[ "$avail" =~ ^[0-9]+$ && "$avail" -gt 4294967296 ]]; then
-              size_bytes=$((avail - 2147483648))
-              VM_DISK_SIZE="$size_bytes"
-            else
-              VM_DISK_SIZE="18G"
-            fi
-          else
-            VM_DISK_SIZE="$REQUESTED_SIZE"
+          # Download latest Ubuntu 26.04 LTS (Resolute Raccoon) directly to Drime
+          if [[ ! -f "$DISK_IMG" ]]; then
+            log INFO IMAGE "Downloading Ubuntu 26.04 LTS directly to Drime..."
+            curl -fL --retry 5 https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img -o /tmp/resolute.img || fail IMAGE DOWNLOAD_FAILED 26.04
+            qemu-img convert -p -f qcow2 -O raw /tmp/resolute.img "$DISK_IMG" || fail IMAGE CONVERT_FAILED "$DISK_IMG"
+            rm -f /tmp/resolute.img
+            log INFO IMAGE "Ubuntu 26.04 LTS ready on Drime"
           fi
-
-          log INFO STORAGE "DISK_SIZE_REQUESTED=$VM_DISK_SIZE"
-
-          if [[ -f "$DISK_IMG" ]] && qemu-img info "$DISK_IMG" >/dev/null 2>&1; then
-            log INFO STORAGE "EXISTING_DISK_OK path=$DISK_IMG"
-            qemu-img resize "$DISK_IMG" "$VM_DISK_SIZE" || log WARN STORAGE RESIZE_FAILED "$DISK_IMG"
-          else
-            BASE_URLS=(
-              "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-              "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
-            )
-
-            BASE_OK=false
-            for u in "${BASE_URLS[@]}"; do
-              if curl -fL --retry 3 --connect-timeout 20 -o /var/tmp/base.qcow2 "$u"; then
-                BASE_OK=true
-                log INFO IMAGE "DOWNLOAD_OK url=$u"
-                break
-              fi
-            done
-
-            $BASE_OK || fail IMAGE DOWNLOAD_FAILED ubuntu-cloud-image
-
-            qemu-img info /var/tmp/base.qcow2 >/dev/null 2>&1 || fail IMAGE INVALID_IMAGE /var/tmp/base.qcow2
-
-            qemu-img convert -p -f qcow2 -O raw /var/tmp/base.qcow2 "$DISK_IMG" || fail STORAGE DISK_CONVERT_FAILED "$DISK_IMG"
-            qemu-img resize "$DISK_IMG" "$VM_DISK_SIZE" || log WARN STORAGE RESIZE_FAILED "$DISK_IMG"
-
-            rm -f /var/tmp/base.qcow2
-            log INFO STORAGE "NEW_DISK_CREATED path=$DISK_IMG"
-          fi
-
-          VM_PASSWORD_INPUT="${INPUT_VM_PASSWORD:-}"
-          VM_PASSWORD_SECRET=$(jq -r '.VM_PASSWORD // empty' <<<"$SECRETS_JSON")
-
-          if [[ -n "$VM_PASSWORD_INPUT" ]]; then
-            VM_PASSWORD="$VM_PASSWORD_INPUT"
-          elif [[ -n "$VM_PASSWORD_SECRET" ]]; then
-            VM_PASSWORD="$VM_PASSWORD_SECRET"
-          else
-            VM_PASSWORD="Drime-$(openssl rand -hex 8)"
-          fi
-
-          umask 077
-          printf '%s\n' "$VM_PASSWORD" > "$ENGINE_LOG_DIR/vm-console-password.txt"
-          umask 022
-
-          {
-            printf '%s\n' '#cloud-config'
-            printf 'hostname: drime-vm\n'
-            printf 'manage_etc_hosts: true\n'
-            printf 'password: %s\n' "$VM_PASSWORD"
-            printf 'chpasswd:\n'
-            printf '  expire: false\n'
-            printf 'ssh_pwauth: true\n'
-            printf 'users:\n'
-            printf '  - name: ubuntu\n'
-            printf '    sudo: ALL=(ALL) NOPASSWD:ALL\n'
-            printf '    shell: /bin/bash\n'
-            printf 'runcmd:\n'
-            printf '  - [ sh, -c, "echo drime-vm-ready > /dev/kmsg || true" ]\n'
-          } > /var/tmp/user-data
-
-          printf 'instance-id: drime-vm\nlocal-hostname: drime-vm\n' > /var/tmp/meta-data
-
-          cloud-localds "$SEED_IMG" /var/tmp/user-data /var/tmp/meta-data || fail CLOUD_INIT SEED_CREATE_FAILED "$SEED_IMG"
 
           VM_CORES="${INPUT_VM_CORES:-2}"
           VM_THREADS="${INPUT_VM_THREADS:-2}"
           VM_RAM_GB="${INPUT_VM_RAM_GB:-16}"
           VNC_BIND="${INPUT_VNC_BIND:-0.0.0.0}"
-
-          [[ "$VM_CORES" =~ ^[0-9]+$ ]] || VM_CORES=2
-          [[ "$VM_THREADS" =~ ^[0-9]+$ ]] || VM_THREADS=2
-          [[ "$VM_RAM_GB" =~ ^[0-9]+$ ]] || VM_RAM_GB=16
-
           VM_CPUS=$((VM_CORES * VM_THREADS))
 
-          DRIVE_CACHE="none"
-
-          start_qemu() {
-            rm -f "$PID_FILE" "$MON_SOCK"
-
-            qemu-system-x86_64 \
-              -name drime-vm \
-              -machine q35,accel=kvm \
-              -cpu host \
-              -smp "$VM_CPUS,cores=$VM_CORES,threads=$VM_THREADS" \
-              -m "${VM_RAM_GB}G" \
-              -drive file="$DISK_IMG",format=raw,if=virtio,cache="$DRIVE_CACHE",discard=unmap \
-              -drive file="$SEED_IMG",format=raw,if=virtio,readonly=on \
-              -netdev user,id=net0 \
-              -device virtio-net-pci,netdev=net0 \
-              -vnc "${VNC_BIND}:0" \
-              -monitor unix:"$MON_SOCK",server,nowait \
-              -serial file:"$ENGINE_LOG_DIR/vm-serial.log" \
-              -pidfile "$PID_FILE" \
-              -daemonize
-          }
-
-          if ! start_qemu; then
-            DRIVE_CACHE="directsync"
-            log WARN VM "QEMU_START_FALLBACK cache=directsync"
-            start_qemu || fail VM QEMU_START_FAILED qemu
-          fi
+          log INFO VM "Booting QEMU directly from Drime (No Cloud-Init, No User/Pwd set)"
+          
+          # Boot directly from the Drime mount point. cache=writeback is mandatory for FUSE/Object storage
+          qemu-system-x86_64 \
+            -name drime-vm \
+            -machine q35,accel=kvm \
+            -cpu host \
+            -smp "$VM_CPUS,cores=$VM_CORES,threads=$VM_THREADS" \
+            -m "${VM_RAM_GB}G" \
+            -drive file="$DISK_IMG",format=raw,if=virtio,cache=writeback,discard=unmap \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -vnc "${VNC_BIND}:0" \
+            -pidfile "$PID_FILE" \
+            -daemonize || fail VM QEMU_START_FAILED qemu
 
           for i in {1..30}; do
-            if ss -ltn 2>/dev/null | grep -q ':5900 '; then
-              break
-            fi
+            ss -ltn 2>/dev/null | grep -q ':5900 ' && break
             sleep 1
           done
 
-          ss -ltn 2>/dev/null | grep -q ':5900 ' || fail VM VNC_PORT_NOT_LISTENING 5900
-
-          log INFO VM "VM_RUNNING vcpu=$VM_CPUS cores=$VM_CORES threads=$VM_THREADS ram=${VM_RAM_GB}G vnc=${VNC_BIND}:5900 netbird_ip=${NETBIRD_IP:-unknown} disk_cache=$DRIVE_CACHE"
-          log INFO ACCESS "VNC local: localhost:5900"
+          log INFO VM "VM_RUNNING vcpu=$VM_CPUS ram=${VM_RAM_GB}G vnc=${VNC_BIND}:5900 netbird=${NETBIRD_IP:-unknown}"
           log INFO ACCESS "VNC netbird: ${NETBIRD_IP:-unknown}:5900"
+          log INFO STORAGE "OS is reading/writing directly to $DISK_IMG on Drime"
 
           while true; do
-            if [[ ! -f "$PID_FILE" ]] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-              fail VM PROCESS_DIED "$PID_FILE"
-            fi
-
-            disk_use=$(df -h "$POOL" 2>/dev/null | tail -n1 | awk '{print $3"/"$2}' || echo unknown)
-            log INFO HEARTBEAT "vm=running disk=$disk_use netbird=${NETBIRD_IP:-unknown} vnc=5900"
-
+            [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null || fail VM PROCESS_DIED "$PID_FILE"
+            log INFO HEARTBEAT "vm=running storage=drime_direct netbird=${NETBIRD_IP:-unknown}"
             sleep 30
           done
 
@@ -483,6 +230,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: drime-logs-${{ github.run_id }}
-          path: |
-            /var/log/drime
+          path: /var/log/drime
           if-no-files-found: warn
