@@ -228,14 +228,16 @@ jobs:
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Rebuild ISO GRUB with anti-freeze flags (fallback to stock ISO)
+    - name: Rebuild ISO GRUB with anti-freeze flags (FIXED permissions)
       run: |
         set +e
         CACHE=$(cat /tmp/dlive_cache)
         ISO=$(cat /tmp/dlive_iso)
         FIXED="$CACHE/ubuntu-fixed.iso"
-        rm -rf /tmp/isowork; mkdir -p /tmp/isowork
-        xorriso -osirrox on -indev "$ISO" -extract / /tmp/isowork 2>/dev/null
+        sudo rm -rf /tmp/isowork; mkdir -p /tmp/isowork
+        sudo xorriso -osirrox on -indev "$ISO" -extract / /tmp/isowork 2>/dev/null
+        # FIX: give runner ownership so sed can edit grub.cfg
+        sudo chown -R runner:runner /tmp/isowork 2>/dev/null
         if [ -f /tmp/isowork/boot/grub/grub.cfg ]; then
           sed -i 's|quiet splash|quiet splash systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0|g' /tmp/isowork/boot/grub/grub.cfg
           sed -i 's|---|systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0 ---|g' /tmp/isowork/boot/grub/grub.cfg
@@ -261,8 +263,6 @@ jobs:
 
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         NBD_PID=$!
-        
-        # Poll for socket (fixes the race condition)
         for i in $(seq 1 10); do
           [ -S /tmp/dlive.sock ] && break
           sleep 1
