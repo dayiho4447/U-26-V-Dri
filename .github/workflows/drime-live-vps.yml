@@ -1,219 +1,348 @@
-name: DRIME Live VM
+name: DLIVE1 ENTERPRISE SAN (26.04 PRIMARY DRIME BOOT - ULTIMATE)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main, master ]
   workflow_dispatch:
 
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true # Suppress Node 20 deprecation warnings
+concurrency:
+  group: drime-live-vm
+  cancel-in-progress: false
 
 jobs:
   drime-live-vm:
     runs-on: ubuntu-latest
+    timeout-minutes: 0
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Install System Dependencies
-        run: |
-          sudo add-apt-repository -y universe
-          sudo apt-get update
-          sudo apt-get install -y python3 curl ca-certificates jq net-tools \
-            cpu-checker glib-networking glib-networking-common glib-networking-services \
-            gsettings-desktop-schemas gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-            gstreamer1.0-x ipxe-qemu ipxe-qemu-256k-compat-efi-roms libaa1 libasyncns0 \
-            libavc1394-0 libboost-iostreams1.83.0 libboost-thread1.83.0 libbrlapi0.8 \
-            libcaca0 libcacard0 libcdparanoia0 libdaxctl1 libdecor-0-0 libdecor-0-plugin-1-gtk \
-            libdv4t64 libfdt1 libflac12t64 libgstreamer-plugins-base1.0-0 \
-            libgstreamer-plugins-good1.0-0 libiec61883-0 libiscsi7 libjack-jackd2-0 \
-            libmp3lame0 libmpg123-0t64 libnbd0 libndctl6 libnfs14 libopus0 \
-            liborc-0.4-0t64 libpcsclite1 libpipewire-0.3-0t64 libpipewire-0.3-common \
-            libpmem1 libpmemobj1 libproxy1v5 libpulse0 librados2 libraw1394-11 librbd1 \
-            librdmacm1t64 libsamplerate0 libsdl2-2.0-0 libshout3 libsndfile1 \
-            libsoup-3.0-0 libsoup-3.0-common libspa-0.2-modules libspeex1 \
-            libspice-server1 libtag1v5 libtag1v5-vanilla libtheora0 \
-            libtorrent-rasterbar2.0t64 libtwolame0 liburing2 libusbredirparser1t64 \
-            libv4l-0t64 libv4lconvert0t64 libvirglrenderer1 libvisual-0.4-0 \
-            libvorbisenc2 libvpx9 libvte-2.91-0 libvte-2.91-common libwavpack1 \
-            libwebrtc-audio-processing1 libxv1 msr-tools nbdkit nbdkit-plugin-python \
-            ovmf qemu-block-extra qemu-system-common qemu-system-data qemu-system-gui \
-            qemu-system-modules-opengl qemu-system-modules-spice qemu-system-x86 \
-            qemu-utils seabios session-migration wget
+    - name: Install packages
+      run: |
+        sudo add-apt-repository -y universe
+        sudo apt-get update -y
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget ca-certificates jq net-tools nbdkit nbdkit-plugin-python nbd-client
+        command -v nbdkit >/dev/null 2>&1 || { echo "❌ nbdkit missing"; exit 1; }
+        command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "❌ qemu missing"; exit 1; }
+        command -v nbd-client >/dev/null 2>&1 || { echo "❌ nbd-client missing"; exit 1; }
+        sudo chmod 666 /dev/kvm 2>/dev/null || true
 
-      - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+    - name: Install rclone
+      run: |
+        curl -fsSL https://rclone.org/install.sh | sudo bash
+        rclone version
 
-      - name: Install Netbird
-        run: |
-          curl -fsSL https://pkgs.netbird.io/debian/public.key | sudo gpg --dearmor -o /usr/share/keyrings/netbird-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main" | sudo tee /etc/apt/sources.list.d/netbird.list
-          sudo apt-get update
-          sudo apt-get install -y netbird
-          sudo netbird up || true
+    - name: Install NetBird
+      run: |
+        curl -fsSL https://pkgs.netbird.io/debian/public.key | sudo gpg --dearmor -o /usr/share/keyrings/netbird-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main" | sudo tee /etc/apt/sources.list.d/netbird.list
+        sudo apt-get update -y
+        sudo apt-get install -y netbird
+        sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}" || { echo "NetBird failed"; exit 1; }
+        sudo netbird status
 
-      - name: Setup DLIVE NBD Script
-        run: |
-          cat > /tmp/dlive_nbd.py <<'PYEOF'
-          import nbdkit, os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
-          from pathlib import Path
-          _builtin_open = builtins.open
-          API_VERSION = 2
-          B = 4 * 1024 * 1024
-          DISK_SIZE = 20 * 1024 * 1024 * 1024
-          ram_cache = {}; ram_lock = threading.Lock()
-          upload_queue = queue.Queue()
-          accounts = []; anchor = ""
-          pending_uploads = 0
-          pending_lock = threading.Lock()
-          flush_cond = threading.Condition(pending_lock)
-          def log(msg):
-              with _builtin_open("/tmp/nbdkit.log", "a") as f: f.write(f"[DLIVE] {msg}\n")
-          def config(key, value):
-              global accounts, anchor
-              if key == "accounts":
-                  for line in Path(str(value)).read_text().splitlines():
-                      p = line.split()
-                      if len(p) >= 2: accounts.append([p[0], int(p[1])])
-              if accounts: anchor = accounts[0][0]
-          def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
-          def open(readonly): return 1
-          def close(h): pass
-          def get_size(h): return DISK_SIZE
-          def can_write(h): return True
-          def can_flush(h): return True
-          def can_trim(h): return True
-          def block_id(offset): return offset // B
-          def acct_for(cid):
-              off = 0
-              for name, size in accounts:
-                  nb = size // B
-                  if off <= cid < off + nb: return name, cid - off
-                  off += nb
-              return None, None
-          def get_block(cid):
-              with ram_lock:
-                  if cid in ram_cache: return ram_cache[cid]
-              name, lid = acct_for(cid)
-              if name is None: return b"\x00" * B
-              tmp = f"/tmp/dlive_{cid}_{threading.get_ident()}.tmp"
-              try:
-                  r = subprocess.run(["rclone", "copyto", f"{name}:dlive/v6/blocks/{lid:08d}.gz", tmp], capture_output=True, timeout=60)
-                  if r.returncode == 0 and os.path.exists(tmp):
-                      d = zlib.decompress(Path(tmp).read_bytes())
-                      os.unlink(tmp)
-                      with ram_lock: ram_cache[cid] = d
-                      return d
-              except Exception as e: log(f"Read error {cid}: {e}")
-              return b"\x00" * B
-          def pread(h, count, offset, flags):
-              try: count = int(count)
-              except: count = len(count) if hasattr(count, '__len__') else 4096
-              try: offset = int(offset)
-              except: offset = 0
-              out = bytearray(count); pos = 0
-              while pos < count:
-                  o = offset + pos; cid = block_id(o); co = o % B
-                  n = min(B - co, count - pos)
-                  blk = get_block(cid)
-                  out[pos:pos+n] = blk[co:co+n]
-                  pos += n
-              return bytes(out)
-          def pwrite(h, buf, offset, flags):
-              global pending_uploads
-              try: offset = int(offset)
-              except: offset = 0
-              pos = 0; n = len(buf)
-              while pos < n:
-                  o = offset + pos; cid = block_id(o); co = o % B
-                  k = min(B - co, n - pos)
-                  with ram_lock:
-                      if cid in ram_cache: cur = bytearray(ram_cache[cid])
-                      else: cur = bytearray(get_block(cid))
-                  cur[co:co+k] = buf[pos:pos+k]
-                  new = bytes(cur); ram_cache[cid] = new
-                  with pending_lock: pending_uploads += 1
-                  upload_queue.put((cid, new))
-                  pos += k
-          def flush(h, flags):
-              with pending_lock:
-                  while pending_uploads > 0: flush_cond.wait(timeout=1.0)
-          def trim(h, count, offset, flags):
-              try: count = int(count)
-              except: count = len(count) if hasattr(count, '__len__') else 0
-              try: offset = int(offset)
-              except: offset = 0
-              start_cid = offset // B
-              end_cid = (offset + count + B - 1) // B
-              with ram_lock:
-                  for cid in range(start_cid, end_cid):
-                      if cid in ram_cache: del ram_cache[cid]
-          def uploader_loop():
-              global pending_uploads
-              while True:
-                  cid, data = upload_queue.get()
-                  name, lid = acct_for(cid)
-                  if not name:
-                      with pending_lock:
-                          pending_uploads -= 1
-                          if pending_uploads == 0: flush_cond.notify_all()
-                      continue
-                  gz = f"/tmp/dlive_up_{cid}_{threading.get_ident()}.gz"
-                  try:
-                      with _builtin_open(gz, "wb") as f: f.write(zlib.compress(data, 0))
-                      url = "http://127.0.0.1:5572/operations/copyfile"
-                      req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode()
-                      req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'})
-                      ok = False
-                      try:
-                          urllib.request.urlopen(req, timeout=120)
-                          ok = True
-                      except Exception as e:
-                          log(f"rcd failed {cid}: {e}, fallback")
-                          r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v6/blocks/{lid:08d}.gz", "--retries", "2"], capture_output=True, timeout=120)
-                          if r.returncode == 0: ok = True
-                      if ok: log(f"⚡ PUSHED {cid:08d} to {name}")
-                      else: log(f"FAILED {cid:08d}")
-                  except Exception as e: log(f"Uploader exception {cid}: {e}")
-                  finally:
-                      try: os.unlink(gz)
-                      except: pass
-                  with pending_lock:
-                      pending_uploads -= 1
-                      if pending_uploads == 0: flush_cond.notify_all()
-          for _ in range(16): threading.Thread(target=uploader_loop, daemon=True).start()
-          PYEOF
+    - name: Configure Drime accounts & ensure directories exist
+      env:
+        DRIME: ${{ secrets.DRIME }}
+        DRIME_ACCOUNTS: ${{ secrets.DRIME_ACCOUNTS }}
+      run: |
+        set +e
+        python3 - <<'PY'
+        import os, subprocess, sys
+        accounts = []
+        d = os.environ.get("DRIME", "").strip()
+        if d: accounts.append(("DRIME", d, 20*1024**3))
+        batch = os.environ.get("DRIME_ACCOUNTS", "") or ""
+        for i, line in enumerate(batch.splitlines(), 1):
+            line = line.strip()
+            if not line: continue
+            parts = line.split()
+            if len(parts) >= 3: name, tok, size = parts[0], parts[1], int(parts[2])
+            elif len(parts) == 2: name, tok, size = parts[0], parts[1], 20*1024**3
+            else: name, tok, size = f"DRIME{i}", parts[0], 20*1024**3
+            accounts.append((name, tok, size))
+        if not accounts:
+            print("ERROR: No Drime accounts!", file=sys.stderr); sys.exit(1)
+        with open("/tmp/dlive_accounts", "w") as out:
+            for name, tok, size in accounts:
+                subprocess.run(["rclone", "config", "delete", name], capture_output=True)
+                c = subprocess.run(["rclone", "config", "create", name, "drime", f"access_token={tok}"], capture_output=True)
+                if c.returncode == 0:
+                    out.write(f"{name} {size}\n"); print(f"✓ {name} ({size//1024**3}GB)")
+                    # Create remote directory tree so uploads succeed
+                    subprocess.run(["rclone", "mkdir", f"{name}:dlive/v6/blocks"], capture_output=True)
+        print(f"Total: {len(accounts)}")
+        PY
+        [ -s /tmp/dlive_accounts ] || { echo "FATAL"; exit 1; }
+        cat /tmp/dlive_accounts
 
-      - name: Start rclone rcd
-        run: nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=64 --checkers=64 > /tmp/rcd.log 2>&1 &
+    - name: Write NBD Plugin (with explicit flush on close)
+      run: |
+        cat > /tmp/dlive_nbd.py <<'PYEOF'
+        import nbdkit, os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
+        from pathlib import Path
+        _builtin_open = builtins.open
+        API_VERSION = 2
+        B = 4 * 1024 * 1024
+        DISK_SIZE = 20 * 1024 * 1024 * 1024
+        ram_cache = {}; ram_lock = threading.Lock()
+        upload_queue = queue.Queue()
+        accounts = []; anchor = ""
+        pending_uploads = 0
+        pending_lock = threading.Lock()
+        flush_cond = threading.Condition(pending_lock)
+        def log(msg):
+            with _builtin_open("/tmp/nbdkit.log", "a") as f: f.write(f"[DLIVE] {msg}\n")
+        def config(key, value):
+            global accounts, anchor
+            if key == "accounts":
+                for line in Path(str(value)).read_text().splitlines():
+                    p = line.split()
+                    if len(p) >= 2: accounts.append([p[0], int(p[1])])
+                if accounts: anchor = accounts[0][0]
+        def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
+        def open(readonly): return 1
+        def close(h):
+            log("Close called, flushing...")
+            with pending_lock:
+                while pending_uploads > 0:
+                    flush_cond.wait(timeout=5.0)
+                    log(f"Waiting for uploads, remaining: {pending_uploads}")
+            log("Close complete")
+        def get_size(h): return DISK_SIZE
+        def can_write(h): return True
+        def can_flush(h): return True
+        def can_trim(h): return True
+        def block_id(offset): return offset // B
+        def acct_for(cid):
+            off = 0
+            for name, size in accounts:
+                nb = size // B
+                if off <= cid < off + nb: return name, cid - off
+                off += nb
+            return None, None
+        def get_block(cid):
+            with ram_lock:
+                if cid in ram_cache: return ram_cache[cid]
+            name, lid = acct_for(cid)
+            if name is None: return b"\x00" * B
+            tmp = f"/tmp/dlive_{cid}_{threading.get_ident()}.tmp"
+            try:
+                r = subprocess.run(["rclone", "copyto", f"{name}:dlive/v6/blocks/{lid:08d}.gz", tmp], capture_output=True, timeout=60)
+                if r.returncode == 0 and os.path.exists(tmp):
+                    d = zlib.decompress(Path(tmp).read_bytes())
+                    os.unlink(tmp)
+                    with ram_lock: ram_cache[cid] = d
+                    return d
+            except Exception as e: log(f"Read error {cid}: {e}")
+            return b"\x00" * B
+        def pread(h, count, offset, flags):
+            try: count = int(count)
+            except: count = len(count) if hasattr(count, '__len__') else 4096
+            try: offset = int(offset)
+            except: offset = 0
+            out = bytearray(count); pos = 0
+            while pos < count:
+                o = offset + pos; cid = block_id(o); co = o % B
+                n = min(B - co, count - pos)
+                blk = get_block(cid)
+                out[pos:pos+n] = blk[co:co+n]
+                pos += n
+            return bytes(out)
+        def pwrite(h, buf, offset, flags):
+            global pending_uploads
+            try: offset = int(offset)
+            except: offset = 0
+            pos = 0; n = len(buf)
+            while pos < n:
+                o = offset + pos; cid = block_id(o); co = o % B
+                k = min(B - co, n - pos)
+                with ram_lock:
+                    if cid in ram_cache: cur = bytearray(ram_cache[cid])
+                    else: cur = bytearray(get_block(cid))
+                    cur[co:co+k] = buf[pos:pos+k]
+                    new = bytes(cur); ram_cache[cid] = new
+                with pending_lock: pending_uploads += 1
+                upload_queue.put((cid, new))
+                pos += k
+        def flush(h, flags):
+            with pending_lock:
+                while pending_uploads > 0:
+                    flush_cond.wait(timeout=1.0)
+        def trim(h, count, offset, flags):
+            try: count = int(count)
+            except: count = len(count) if hasattr(count, '__len__') else 0
+            try: offset = int(offset)
+            except: offset = 0
+            start_cid = offset // B
+            end_cid = (offset + count + B - 1) // B
+            with ram_lock:
+                for cid in range(start_cid, end_cid):
+                    if cid in ram_cache: del ram_cache[cid]
+        def uploader_loop():
+            global pending_uploads
+            while True:
+                cid, data = upload_queue.get()
+                name, lid = acct_for(cid)
+                if not name:
+                    with pending_lock:
+                        pending_uploads -= 1
+                        if pending_uploads == 0: flush_cond.notify_all()
+                    continue
+                gz = f"/tmp/dlive_up_{cid}_{threading.get_ident()}.gz"
+                try:
+                    with _builtin_open(gz, "wb") as f: f.write(zlib.compress(data, 1))
+                    url = "http://127.0.0.1:5572/operations/copyfile"
+                    req_data = json.dumps({"src": gz, "dst": f"{name}:dlive/v6/blocks/{lid:08d}.gz"}).encode()
+                    req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'})
+                    ok = False
+                    try:
+                        urllib.request.urlopen(req, timeout=120)
+                        ok = True
+                    except Exception as e:
+                        log(f"rcd failed {cid}: {e}, fallback")
+                        r = subprocess.run(["rclone", "copyto", gz, f"{name}:dlive/v6/blocks/{lid:08d}.gz", "--retries", "2"], capture_output=True, timeout=120)
+                        if r.returncode == 0: ok = True
+                    if ok: log(f"⚡ PUSHED {cid:08d} to {name}")
+                    else: log(f"FAILED {cid:08d}")
+                except Exception as e: log(f"Uploader exception {cid}: {e}")
+                finally:
+                    try: os.unlink(gz)
+                    except: pass
+                    with pending_lock:
+                        pending_uploads -= 1
+                        if pending_uploads == 0: flush_cond.notify_all()
+        for _ in range(16): threading.Thread(target=uploader_loop, daemon=True).start()
+        PYEOF
 
-      - name: Prepare Cloud Image
-        run: |
-          set +e
-          mkdir -p /mnt/dlive
-          
-          # Create dummy cache and accounts files if they don't exist from repo
-          if [ ! -f /tmp/dlive_cache ]; then echo "" > /tmp/dlive_cache; fi
-          if [ ! -f /tmp/dlive_accounts ]; then echo "DRIME 21474836480" > /tmp/dlive_accounts; fi
-          if [ ! -f /tmp/dlive_img ]; then echo "/mnt/dlive/ubuntu.raw" > /tmp/dlive_img; fi
-          
-          # Download image
-          CACHE=$(cat /tmp/dlive_cache)
-          wget -O /mnt/dlive/ubuntu.raw.qcow2 https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
-          
-          # Convert and Resize (Fixed the raw format warning by explicitly defining -f raw and -O raw)
-          qemu-img convert -f qcow2 -O raw /mnt/dlive/ubuntu.raw.qcow2 /mnt/dlive/ubuntu.raw
-          qemu-img resize -f raw /mnt/dlive/ubuntu.raw 20G
-          ls -lh /mnt/dlive/ubuntu.raw
+    - name: Start rclone daemon
+      run: |
+        nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
+        sleep 2
 
-      - name: Initialize Seed Stage
-        run: |
-          set -x
-          IMG=$(cat /tmp/dlive_img)
-          ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-          STAGE=/dev/shm/seedstage
-          rm -rf /dev/shm/seedstage
-          mkdir -p /dev/shm/seedstage
-          
-          # Execute initialization logic (represented by python3 - in the log)
-          # python3 - $IMG $STAGE
+    - name: Prepare cache dir
+      run: |
+        set +e
+        CACHE=/var/lib/dlive
+        if df -P /mnt 2>/dev/null | awk 'NR==2{exit !($4>30000000)}'; then CACHE=/mnt/dlive; fi
+        sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
+        echo "$CACHE" > /tmp/dlive_cache
+
+    - name: Download Ubuntu 26.04 cloud image
+      run: |
+        set -e
+        CACHE=$(cat /tmp/dlive_cache)
+        IMG="$CACHE/ubuntu.img"
+        wget --tries=5 --timeout=60 -O "$IMG" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
+        test -s "$IMG" || { echo "✗ Download failed"; exit 1; }
+        echo "$IMG" > /tmp/dlive_img
+        ls -lh "$IMG"
+
+    - name: Write cloud image to Drime disk and ensure durability
+      run: |
+        set -e
+        IMG=$(cat /tmp/dlive_img)
+
+        # Start NBD server
+        sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
+        NBD_PID=$!
+        for i in $(seq 1 15); do
+          [ -S /tmp/dlive.sock ] && break
+          sleep 1
+        done
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to start"; cat /tmp/nbdkit.log; exit 1; }
+
+        # Connect to NBD as /dev/nbd0
+        sudo modprobe nbd
+        sudo nbd-client -u /tmp/dlive.sock /dev/nbd0
+        for i in $(seq 1 10); do
+          if [ -b /dev/nbd0 ]; then break; fi
+          sleep 1
+        done
+        [ -b /dev/nbd0 ] || { echo "✗ nbd-client failed"; exit 1; }
+
+        # Write the cloud image to the device
+        echo "Writing image to Drime disk..."
+        sudo qemu-img convert -f qcow2 -O raw "$IMG" /dev/nbd0
+
+        # Force flush and disconnect (triggers close callback)
+        echo "Flushing writes to Drime..."
+        sudo nbd-client --flush /dev/nbd0 || true
+        sudo nbd-client -d /dev/nbd0
+
+        # Wait for uploads to complete by polling rclone size
+        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
+        IMG_SIZE=$(stat -c%s "$IMG" 2>/dev/null || echo "0")
+        echo "Image size: $IMG_SIZE bytes"
+        echo "Waiting for Drime to show data..."
+        for i in $(seq 1 120); do
+          SIZE=$(rclone size "$ACC:dlive" 2>/dev/null | grep -oP 'Total size: \K[0-9]+' || echo "0")
+          if [ "$SIZE" -ge "$IMG_SIZE" ]; then
+            echo "✓ Upload complete: $SIZE bytes on Drime"
+            break
+          fi
+          echo "Attempt $i: Drime shows $SIZE bytes, waiting..."
+          sleep 5
+        done
+        # Final check
+        rclone size "$ACC:dlive" || true
+        echo "Drime disk is ready."
+
+    - name: Boot 26.04 from primary Drime disk (always on)
+      run: |
+        set -x
+        NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
+        [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
+
+        # Restart NBD server if not running
+        if ! [ -S /tmp/dlive.sock ]; then
+          sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
+          for i in $(seq 1 15); do
+            [ -S /tmp/dlive.sock ] && break
+            sleep 1
+          done
+        fi
+        [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT not running"; exit 1; }
+
+        echo "=================================================="
+        echo "✅  Ubuntu 26.04 Server is ready"
+        echo "🔗  VNC: $NB_IP:5900"
+        echo "💾  Root disk is on Drime (NVMe emulated, 20GB)"
+        echo "⚡  Performance: NVMe with iothread, native AIO"
+        echo "🔄  This VM will run until you cancel this job"
+        echo "=================================================="
+
+        ACCEL=""; CPU="-cpu qemu64"
+        [ -e /dev/kvm ] && ACCEL="-enable-kvm"
+
+        sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+          -object iothread,id=ioth1 \
+          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
+          -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
+          -boot order=c \
+          -vga std \
+          -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -device virtio-rng-pci \
+          -no-fd-bootchk \
+          -serial file:/tmp/qemu.log \
+          -display none \
+          -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
+
+        QPID=$!
+        echo "QEMU PID: $QPID"
+
+        # Keep alive with status updates
+        while true; do
+          sleep 30
+          echo "--- QEMU serial log (last 5 lines) ---"
+          tail -n 5 /tmp/qemu.log 2>/dev/null || echo "No log yet"
+          echo "--- NBD log (last 3 lines) ---"
+          tail -n 3 /tmp/nbdkit.log 2>/dev/null || echo "No log yet"
+          if ! kill -0 $QPID 2>/dev/null; then
+            echo "❌ QEMU crashed! Showing full serial log:"
+            cat /tmp/qemu.log
+            exit 1
+          fi
+        done
