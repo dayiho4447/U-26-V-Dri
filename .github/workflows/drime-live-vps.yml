@@ -136,13 +136,14 @@ jobs:
           log INFO INIT "DRIME VM engine started"
 
           apt-get update -y || fail PKG APT_UPDATE_FAILED ubuntu
+          
+          # Install core dependencies (Removed rclone from apt to avoid outdated v1.60)
           apt-get install -y \
             qemu-system-x86 \
             qemu-utils \
             cloud-image-utils \
             lvm2 \
             jq \
-            rclone \
             curl \
             ca-certificates \
             iproute2 \
@@ -151,6 +152,10 @@ jobs:
             socat \
             openssl \
             openssh-server || fail PKG INSTALL_FAILED core-packages
+
+          # Install latest rclone (v1.73+ REQUIRED for native Drime API support)
+          curl -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL_FAILED rclone
+          log INFO RCLONE "Installed version: $(rclone version | head -n1)"
 
           modprobe kvm || true
           modprobe kvm_intel || modprobe kvm_amd || true
@@ -212,33 +217,11 @@ jobs:
 
           [[ ${#DRIME_KEYS[@]} -gt 0 ]] || fail STORAGE NO_DRIME_SECRETS "DRIME,DRIME1,DRIME2..."
 
-          DRIME_API_BASE="$(get_secret_or_var DRIME_API_BASE)"
-          DRIME_API_BASE="${DRIME_API_BASE:-https://api.drime.cloud}"
-
-          DRIME_ENDPOINT_DEFAULT="$(get_secret_or_var DRIME_ENDPOINT)"
-          DRIME_ENDPOINT_DEFAULT="${DRIME_ENDPOINT_DEFAULT:-https://dav.drime.cloud}"
-
-          DRIME_TYPE_DEFAULT="$(get_secret_or_var DRIME_TYPE)"
-          DRIME_TYPE_DEFAULT="${DRIME_TYPE_DEFAULT:-webdav}"
-
-          DRIME_USER_DEFAULT="$(get_secret_or_var DRIME_USER)"
-          DRIME_USER_DEFAULT="${DRIME_USER_DEFAULT:-api}"
-
-          DRIME_BUCKET_DEFAULT="$(get_secret_or_var DRIME_BUCKET)"
-          DRIME_BUCKET_DEFAULT="${DRIME_BUCKET_DEFAULT:-drime}"
-
-          DRIME_REGION_DEFAULT="$(get_secret_or_var DRIME_REGION)"
-          DRIME_REGION_DEFAULT="${DRIME_REGION_DEFAULT:-us-east-1}"
-
-          BASE_IMAGE_URL="$(get_secret_or_var BASE_IMAGE_URL)"
-
           mkdir -p "$DRIME_ROOT" "$(dirname "$RCLONE_CONFIG")"
 
           touch /etc/fuse.conf
           sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true
           grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
-
-          DIRECT_OK=true
 
           mount_drime() {
             local idx="$1"
@@ -248,112 +231,35 @@ jobs:
             local mnt="$DRIME_ROOT/d$idx"
             local remote="drime$idx"
 
-            local stype=""
-            local endpoint=""
-            local user=""
-            local pass=""
-            local token=""
-            local bucket=""
-            local region=""
-
+            local token="$secret_value"
+            
+            # If secret is JSON, extract token dynamically
             if jq -e . >/dev/null 2>&1 <<<"$secret_value"; then
-              stype=$(jq -r '.type // "webdav"' <<<"$secret_value")
-              endpoint=$(jq -r '.endpoint // .url // empty' <<<"$secret_value")
-              user=$(jq -r '.user // "api"' <<<"$secret_value")
-              pass=$(jq -r '.pass // .password // .api_key // .apiKey // empty' <<<"$secret_value")
-              token=$(jq -r '.token // .bearer_token // empty' <<<"$secret_value")
-              bucket=$(jq -r '.bucket // .path // "/"' <<<"$secret_value")
-              region=$(jq -r '.region // "us-east-1"' <<<"$secret_value")
-            else
-              stype="$DRIME_TYPE_DEFAULT"
-              endpoint=""
-              user="$DRIME_USER_DEFAULT"
-              pass="$secret_value"
-              token=""
-              bucket="$DRIME_BUCKET_DEFAULT"
-              region="$DRIME_REGION_DEFAULT"
-
-              resolved=$(curl -fsS -m 20 \
-                -H "Authorization: Bearer $secret_value" \
-                "$DRIME_API_BASE/v1/mount" 2>/dev/null | jq -r '.url // .endpoint // empty' || true)
-
-              if [[ -n "$resolved" ]]; then
-                endpoint="$resolved"
-              else
-                payload=$(jq -n --arg k "$secret_value" '{api_key:$k}')
-                resolved=$(curl -fsS -m 20 -X POST \
-                  -H "Authorization: Bearer $secret_value" \
-                  -H 'Content-Type: application/json' \
-                  -d "$payload" \
-                  "$DRIME_API_BASE/v1/mount" 2>/dev/null | jq -r '.url // .endpoint // empty' || true)
-                endpoint="$resolved"
-              fi
-
-              endpoint="${endpoint:-$DRIME_ENDPOINT_DEFAULT}"
+              token=$(jq -r '.access_token // .token // .api_key // .pass // empty' <<<"$secret_value")
             fi
 
-            [[ -n "$endpoint" ]] || fail STORAGE MISSING_ENDPOINT "$key_name"
-            [[ -n "$pass" || -n "$token" ]] || fail STORAGE MISSING_CREDENTIAL "$key_name"
+            [[ -n "$token" ]] || fail STORAGE MISSING_CREDENTIAL "$key_name"
 
             mkdir -p "$mnt"
 
-            case "$stype" in
-              webdav)
-                if [[ -n "$token" ]]; then
-                  rclone config create "$remote" webdav \
-                    url="$endpoint" \
-                    vendor=other \
-                    bearer_token="$token" \
-                    --config "$RCLONE_CONFIG" >/dev/null || fail STORAGE RCLONE_CONFIG_FAILED "$key_name"
-                else
-                  obscured=$(rclone obscure "$pass") || fail STORAGE RCLONE_OBSCURE_FAILED "$key_name"
-                  rclone config create "$remote" webdav \
-                    url="$endpoint" \
-                    vendor=other \
-                    user="$user" \
-                    pass="$obscured" \
-                    --config "$RCLONE_CONFIG" >/dev/null || fail STORAGE RCLONE_CONFIG_FAILED "$key_name"
-                fi
-                ;;
-              s3)
-                [[ -n "$bucket" && "$bucket" != "/" ]] || bucket="$DRIME_BUCKET_DEFAULT"
-                rclone config create "$remote" s3 \
-                  provider=Other \
-                  access_key_id="$user" \
-                  secret_access_key="$pass" \
-                  endpoint="$endpoint" \
-                  region="$region" \
-                  --config "$RCLONE_CONFIG" >/dev/null || fail STORAGE RCLONE_CONFIG_FAILED "$key_name"
-                ;;
-              *)
-                fail STORAGE UNSUPPORTED_TYPE "$key_name:$stype"
-                ;;
-            esac
+            # Configure native Drime backend (Requires rclone >= 1.73)
+            rclone config create "$remote" drime \
+              access_token="$token" \
+              --config "$RCLONE_CONFIG" >/dev/null || fail STORAGE RCLONE_CONFIG_FAILED "$key_name"
 
             local mount_src="$remote:"
-            if [[ "$stype" == "s3" ]]; then
-              mount_src="$remote:$bucket"
-            else
-              if [[ -n "$bucket" && "$bucket" != "/" ]]; then
-                mount_src="$remote:$bucket"
-              fi
-            fi
 
-            local extra_flags=()
-            if rclone mount --help 2>/dev/null | grep -q -- '--direct-io'; then
-              extra_flags+=(--direct-io)
-            fi
-
+            # Optimized VFS for QEMU True Storage performance (Low latency, random write buffering)
             rclone mount "$mount_src" "$mnt" \
               --config "$RCLONE_CONFIG" \
               --vfs-cache-mode writes \
-              --vfs-cache-max-age 1m \
-              --vfs-cache-max-size 512M \
+              --vfs-cache-max-age 5m \
+              --vfs-cache-max-size 1G \
+              --vfs-read-ahead 256M \
               --allow-other \
               --log-file "$ENGINE_LOG_DIR/rclone-$idx.log" \
               --log-level INFO \
-              --daemon \
-              "${extra_flags[@]}" || fail STORAGE RCLONE_MOUNT_FAILED "$key_name"
+              --daemon || fail STORAGE RCLONE_MOUNT_FAILED "$key_name"
 
             local tries=0
             for tries in {1..30}; do
@@ -373,15 +279,7 @@ jobs:
             cat "$probe" >/dev/null || fail STORAGE READ_FAILED "$key_name"
             rm -f "$probe"
 
-            if dd if=/dev/zero of="$mnt/.drime_direct_probe" bs=4k count=1 oflag=direct status=none 2>/dev/null; then
-              rm -f "$mnt/.drime_direct_probe"
-              log INFO STORAGE "DIRECT_IO_OK account=$key_name mount=$mnt"
-            else
-              DIRECT_OK=false
-              log WARN STORAGE "DIRECT_IO_UNSUPPORTED account=$key_name mount=$mnt"
-            fi
-
-            log INFO STORAGE "MOUNT_OK account=$key_name mount=$mnt endpoint=$endpoint type=$stype"
+            log INFO STORAGE "MOUNT_OK account=$key_name mount=$mnt type=drime_native"
           }
 
           idx=0
@@ -439,14 +337,10 @@ jobs:
             log INFO STORAGE "EXISTING_DISK_OK path=$DISK_IMG"
             qemu-img resize "$DISK_IMG" "$VM_DISK_SIZE" || log WARN STORAGE RESIZE_FAILED "$DISK_IMG"
           else
-            if [[ -n "$BASE_IMAGE_URL" ]]; then
-              BASE_URLS=("$BASE_IMAGE_URL")
-            else
-              BASE_URLS=(
-                "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-                "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
-              )
-            fi
+            BASE_URLS=(
+              "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+              "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+            )
 
             BASE_OK=false
             for u in "${BASE_URLS[@]}"; do
@@ -514,11 +408,7 @@ jobs:
 
           VM_CPUS=$((VM_CORES * VM_THREADS))
 
-          if [[ "$DIRECT_OK" == true ]]; then
-            DRIVE_CACHE="none"
-          else
-            DRIVE_CACHE="directsync"
-          fi
+          DRIVE_CACHE="none"
 
           start_qemu() {
             rm -f "$PID_FILE" "$MON_SOCK"
@@ -541,13 +431,9 @@ jobs:
           }
 
           if ! start_qemu; then
-            if [[ "$DRIVE_CACHE" == "none" ]]; then
-              DRIVE_CACHE="directsync"
-              log WARN VM "QEMU_START_FALLBACK cache=directsync"
-              start_qemu || fail VM QEMU_START_FAILED qemu
-            else
-              fail VM QEMU_START_FAILED qemu
-            fi
+            DRIVE_CACHE="directsync"
+            log WARN VM "QEMU_START_FALLBACK cache=directsync"
+            start_qemu || fail VM QEMU_START_FAILED qemu
           fi
 
           for i in {1..30}; do
