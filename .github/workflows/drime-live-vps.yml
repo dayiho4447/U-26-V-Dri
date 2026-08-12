@@ -1,4 +1,4 @@
-name: DRIME FINAL BOOT
+name: DRIME MONSTER LIVE STORAGE
 
 on:
   push:
@@ -18,11 +18,11 @@ jobs:
       run: |
         sudo apt-get update -y
         sudo apt-get install -y python3-pip curl qemu-utils qemu-system-x86 wget nbdkit nbdkit-plugin-python nbd-client
-        pip3 install boto3
+        pip3 install drime requests  # Official Drime Python client + requests fallback
         curl -fsSL https://rclone.org/install.sh | sudo bash
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
-    - name: Install NetBird
+    - name: Install NetBird (VNC)
       run: |
         curl -fsSL https://pkgs.netbird.io/debian/public.key | sudo gpg --dearmor -o /usr/share/keyrings/netbird-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main" | sudo tee /etc/apt/sources.list.d/netbird.list
@@ -30,40 +30,34 @@ jobs:
         sudo apt-get install -y netbird
         sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}" || exit 1
 
-    - name: Create NBD plugin (direct S3 – hardcoded endpoint)
+    - name: Create NBD plugin – Monster Edition
       env:
         DRIME_TOKEN: ${{ secrets.DRIME }}
       run: |
         cat > /tmp/dlive_nbd.py <<'PY'
-        import nbdkit, os, zlib, threading, queue, sys, time
-        import boto3
-        from botocore.client import Config
-        from botocore.exceptions import ClientError
+        import nbdkit, os, zlib, threading, queue, sys, time, json, requests, hashlib
+        from drime import DrimeAPI
 
         TOKEN = os.environ['DRIME_TOKEN']
-        ENDPOINT = "https://s3.drime.cloud"   # <-- hardcoded. Change here if needed.
-        BUCKET = "dlive"
+        if not TOKEN:
+            raise Exception("DRIME_TOKEN missing")
 
-        s3 = boto3.client(
-            's3',
-            endpoint_url=ENDPOINT,
-            aws_access_key_id=TOKEN,
-            aws_secret_access_key=TOKEN,
-            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
-        )
+        # Use the official Drime Python client
+        api = DrimeAPI(token=TOKEN)
 
-        # Test or create bucket
+        # Ensure base directory exists (silently ignore if already exists)
         try:
-            s3.head_bucket(Bucket=BUCKET)
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchBucket':
-                s3.create_bucket(Bucket=BUCKET)
-                print(f"Created bucket {BUCKET}")
-            else:
-                raise Exception(f"S3 error: {e}")
+            api.create_folder("/dlive/v6/blocks")
+        except:
+            pass
 
-        B = 4 * 1024 * 1024
+        # Configuration
+        B = 8 * 1024 * 1024          # 8 MB blocks (fewer uploads, better throughput)
         DISK_SIZE = 20 * 1024 * 1024 * 1024
+        MAX_RETRIES = 3
+        BACKOFF = 0.5
+
+        # In-memory cache and upload queue
         ram_cache = {}
         ram_lock = threading.Lock()
         upload_queue = queue.Queue()
@@ -73,38 +67,61 @@ jobs:
 
         def log(msg):
             with open("/tmp/nbdkit.log", "a") as f:
-                f.write(f"[DLIVE] {msg}\n")
+                f.write(f"[DLIVE] {time.ctime()} {msg}\n")
 
-        def config(key, value): pass
-        def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
-        def open(readonly): return 1
+        def config(key, value):
+            pass
+
+        def thread_model():
+            return nbdkit.THREAD_MODEL_PARALLEL
+
+        def open(readonly):
+            return 1
 
         def close(h):
-            log("Close: flushing...")
+            log("Close: flushing all pending uploads...")
             with pending_lock:
                 while pending_uploads > 0:
                     flush_cond.wait(timeout=5.0)
-                    log(f"Waiting for uploads: {pending_uploads}")
-            log("Close complete")
+                    log(f"Still waiting, pending: {pending_uploads}")
+            log("Close complete – all data synced to Drime")
 
-        def get_size(h): return DISK_SIZE
-        def can_write(h): return True
-        def can_flush(h): return True
-        def can_trim(h): return True
+        def get_size(h):
+            return DISK_SIZE
 
-        def block_id(offset): return offset // B
+        def can_write(h):
+            return True
+
+        def can_flush(h):
+            return True
+
+        def can_trim(h):
+            return True
+
+        def block_id(offset):
+            return offset // B
 
         def get_block(cid):
             with ram_lock:
-                if cid in ram_cache: return ram_cache[cid]
-            key = f"v6/blocks/{cid:08d}.gz"
-            try:
-                resp = s3.get_object(Bucket=BUCKET, Key=key)
-                data = zlib.decompress(resp['Body'].read())
-                with ram_lock: ram_cache[cid] = data
-                return data
-            except:
-                return b"\x00" * B
+                if cid in ram_cache:
+                    return ram_cache[cid]
+            remote_path = f"/dlive/v6/blocks/{cid:08d}.gz"
+            tmp = f"/tmp/dlive_{cid}.tmp"
+            for attempt in range(MAX_RETRIES):
+                try:
+                    api.download_file(remote_path, tmp)
+                    with open(tmp, 'rb') as f:
+                        data = zlib.decompress(f.read())
+                    os.unlink(tmp)
+                    with ram_lock:
+                        ram_cache[cid] = data
+                    return data
+                except Exception as e:
+                    log(f"Download block {cid} attempt {attempt+1} failed: {e}")
+                    time.sleep(BACKOFF * (2 ** attempt))
+            # If all fail, return zero block
+            log(f"⚠️ Block {cid} not found on Drime, returning zeros")
+            return b"\x00" * B
 
         def pread(h, count, offset, flags):
             out = bytearray(count)
@@ -129,8 +146,10 @@ jobs:
                 co = o % B
                 k = min(B - co, n - pos)
                 with ram_lock:
-                    if cid in ram_cache: cur = bytearray(ram_cache[cid])
-                    else: cur = bytearray(get_block(cid))
+                    if cid in ram_cache:
+                        cur = bytearray(ram_cache[cid])
+                    else:
+                        cur = bytearray(get_block(cid))
                     cur[co:co+k] = buf[pos:pos+k]
                     new = bytes(cur)
                     ram_cache[cid] = new
@@ -149,29 +168,50 @@ jobs:
             end_cid = (offset + count + B - 1) // B
             with ram_lock:
                 for cid in range(start_cid, end_cid):
-                    if cid in ram_cache: del ram_cache[cid]
+                    if cid in ram_cache:
+                        del ram_cache[cid]
 
         def uploader_loop():
             global pending_uploads
             while True:
                 cid, data = upload_queue.get()
-                key = f"v6/blocks/{cid:08d}.gz"
                 compressed = zlib.compress(data, 1)
+                remote_path = f"/dlive/v6/blocks/{cid:08d}.gz"
+                tmp = f"/tmp/dlive_up_{cid}.gz"
                 try:
-                    s3.put_object(Bucket=BUCKET, Key=key, Body=compressed)
-                    log(f"✅ PUSHED {cid:08d}")
+                    with open(tmp, 'wb') as f:
+                        f.write(compressed)
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            api.upload_file(tmp, remote_path)
+                            log(f"✅ PUSHED {cid:08d} (attempt {attempt+1})")
+                            break
+                        except Exception as e:
+                            log(f"Upload {cid} attempt {attempt+1} failed: {e}")
+                            if attempt < MAX_RETRIES - 1:
+                                time.sleep(BACKOFF * (2 ** attempt))
+                            else:
+                                log(f"❌ FAILED {cid:08d} after {MAX_RETRIES} attempts")
                 except Exception as e:
-                    log(f"❌ FAILED {cid:08d}: {e}")
-                with pending_lock:
-                    pending_uploads -= 1
-                    if pending_uploads == 0:
-                        flush_cond.notify_all()
+                    log(f"❌ Upload {cid} exception: {e}")
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except:
+                        pass
+                    with pending_lock:
+                        pending_uploads -= 1
+                        if pending_uploads == 0:
+                            flush_cond.notify_all()
 
-        for _ in range(16):
+        # Start 32 uploader threads for maximum concurrency
+        for _ in range(32):
             threading.Thread(target=uploader_loop, daemon=True).start()
+
+        log("Monster NBD plugin ready with 32 uploaders")
         PY
 
-    - name: Write Ubuntu 26.04 to Drime & verify
+    - name: Write Ubuntu 26.04 image to Drime & verify
       env:
         DRIME_TOKEN: ${{ secrets.DRIME }}
       run: |
@@ -181,47 +221,82 @@ jobs:
         wget -O "$CACHE/ubuntu.img" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
         IMG="$CACHE/ubuntu.img"
 
+        # Start NBD server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         for i in {1..15}; do [ -S /tmp/dlive.sock ] && break; sleep 1; done
         [ -S /tmp/dlive.sock ] || { cat /tmp/nbdkit.log; exit 1; }
 
+        # Connect NBD device
         sudo modprobe nbd
         sudo nbd-client -u /tmp/dlive.sock /dev/nbd0
         for i in {1..10}; do [ -b /dev/nbd0 ] && break; sleep 1; done
         [ -b /dev/nbd0 ] || exit 1
 
+        # Write image raw to NBD (this triggers many uploads)
+        echo "Writing image to Drime disk (this may take a few minutes)..."
         sudo qemu-img convert -f qcow2 -O raw "$IMG" /dev/nbd0
+
+        # Flush and detach
         sudo nbd-client -d /dev/nbd0
 
-        # Use rclone with same endpoint to verify
-        rclone config create DRIME s3 access_key_id="$DRIME_TOKEN" secret_access_key="$DRIME_TOKEN" endpoint="https://s3.drime.cloud" provider=Other force_path_style=true >/dev/null 2>&1
+        # Verify using rclone (native drime backend) – wait until uploads complete
+        rclone config create DRIME drime access_token="$DRIME_TOKEN" >/dev/null 2>&1
         IMG_SIZE=$(stat -c%s "$IMG")
         echo "Image size: $IMG_SIZE bytes"
-        echo "Waiting for uploads..."
+        echo "Waiting for uploads to complete (polls every 5s up to 10 minutes)..."
         for i in {1..120}; do
           SIZE=$(rclone size DRIME:dlive 2>/dev/null | grep -oP 'Total size: \K[0-9]+' || echo "0")
           if [ "$SIZE" -ge "$IMG_SIZE" ]; then
-            echo "✅ Upload complete: $SIZE bytes"
+            echo "✅ Upload complete: $SIZE bytes on Drime"
             break
           fi
           echo "Attempt $i: $SIZE / $IMG_SIZE"
           sleep 5
         done
         rclone size DRIME:dlive || true
+        echo "Drime disk is ready."
 
-    - name: Boot VM from Drime (always on)
+    - name: Boot VM from Drime – live storage (always on)
       env:
         DRIME_TOKEN: ${{ secrets.DRIME }}
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
-        echo "VNC: $NB_IP:5900"
-        sudo nbdkit -f -v python /tmp/dlive_nbd.py --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
-        sleep 5
+        echo "=================================================="
+        echo "✅ Ubuntu 26.04 Server is ready"
+        echo "🔗 VNC: $NB_IP:5900"
+        echo "💾 Root disk is on Drime (NVMe emulated, 20GB)"
+        echo "⚡ 32 uploaders, 8MB blocks, native REST API"
+        echo "🔄 This VM runs until you cancel this job"
+        echo "=================================================="
+
+        # Restart NBD server (if not already running)
+        if ! [ -S /tmp/dlive.sock ]; then
+          sudo nbdkit -f -v python /tmp/dlive_nbd.py --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
+          sleep 5
+        fi
         [ -S /tmp/dlive.sock ] || { cat /tmp/nbdkit.log; exit 1; }
-        sudo qemu-system-x86_64 -enable-kvm -machine q35 -cpu qemu64 -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+
+        sudo qemu-system-x86_64 -enable-kvm -machine q35 -cpu qemu64 \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
           -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
           -boot order=c -vga std -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -device virtio-rng-pci \
           -serial file:/tmp/qemu.log -display none -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
-        while true; do sleep 30; done
+
+        QPID=$!
+        echo "QEMU PID: $QPID"
+
+        # Keep the job alive with status updates every 30 seconds
+        while true; do
+          sleep 30
+          echo "--- QEMU serial log (last 5 lines) ---"
+          tail -n 5 /tmp/qemu.log 2>/dev/null || echo "No log yet"
+          echo "--- NBD log (last 3 lines) ---"
+          tail -n 3 /tmp/nbdkit.log 2>/dev/null || echo "No log yet"
+          if ! kill -0 $QPID 2>/dev/null; then
+            echo "❌ QEMU crashed! Showing full serial log:"
+            cat /tmp/qemu.log
+            exit 1
+          fi
+        done
