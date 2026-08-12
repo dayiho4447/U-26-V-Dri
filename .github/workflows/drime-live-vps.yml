@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (FULL DIAGNOSTIC)
+name: DLIVE1 ENTERPRISE SAN (26.04 ISO - FORCED BOOT)
 
 on:
   push:
@@ -74,7 +74,7 @@ jobs:
         [ -s /tmp/dlive_accounts ] || { echo "FATAL"; exit 1; }
         cat /tmp/dlive_accounts
 
-    - name: Write NBD Plugin (with logging)
+    - name: Write NBD Plugin
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
         import nbdkit, os, zlib, subprocess, threading, queue, urllib.request, json, sys, time, builtins
@@ -126,8 +126,7 @@ jobs:
                     os.unlink(tmp)
                     with ram_lock: ram_cache[cid] = d
                     return d
-            except Exception as e:
-                log(f"Read error {cid}: {e}")
+            except Exception as e: log(f"Read error {cid}: {e}")
             return b"\x00" * B
         def pread(h, count, offset, flags):
             try: count = int(count)
@@ -197,8 +196,7 @@ jobs:
                         if r.returncode == 0: ok = True
                     if ok: log(f"⚡ PUSHED {cid:08d} to {name}")
                     else: log(f"FAILED {cid:08d}")
-                except Exception as e:
-                    log(f"Uploader exception {cid}: {e}")
+                except Exception as e: log(f"Uploader exception {cid}: {e}")
                 finally:
                     try: os.unlink(gz)
                     except: pass
@@ -207,13 +205,11 @@ jobs:
                         if pending_uploads == 0: flush_cond.notify_all()
         for _ in range(16): threading.Thread(target=uploader_loop, daemon=True).start()
         PYEOF
-        echo "✓ NBD plugin written"
 
     - name: Start rclone daemon
       run: |
         nohup rclone rcd --rc-addr=127.0.0.1:5572 --rc-no-auth --transfers=32 --checkers=32 > /tmp/rcd.log 2>&1 &
         sleep 2
-        curl -s http://127.0.0.1:5572/rc/noop && echo "✓ rclone rcd ready"
 
     - name: Prepare cache dir
       run: |
@@ -222,96 +218,144 @@ jobs:
         if df -P /mnt 2>/dev/null | awk 'NR==2{exit !($4>30000000)}'; then CACHE=/mnt/dlive; fi
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
-        df -h "$CACHE" | tail -1
 
-    - name: Download + convert 26.04 cloud image
+    - name: Download 26.04 ISO (try multiple) & extract kernel/initrd
+      run: |
+        set -e
+        CACHE=$(cat /tmp/dlive_cache)
+        ISO="$CACHE/ubuntu.iso"
+
+        # Try live-server first (most common)
+        wget --tries=3 --timeout=60 -O "$ISO" "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || true
+        # If that fails, try legacy server (non-live)
+        if [ ! -s "$ISO" ]; then
+          wget --tries=3 --timeout=60 -O "$ISO" "https://releases.ubuntu.com/resolute/ubuntu-26.04-server-amd64.iso" || true
+        fi
+        # If still no ISO, fallback to cloud image (guaranteed to exist)
+        if [ ! -s "$ISO" ]; then
+          wget --tries=5 --timeout=60 -O "$ISO" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
+        fi
+
+        test -s "$ISO" || { echo "✗ No image could be downloaded"; exit 1; }
+        echo "$ISO" > /tmp/dlive_iso
+        ls -lh "$ISO"
+
+        # Try to extract kernel/initrd if it's an ISO
+        if file "$ISO" | grep -q "ISO 9660"; then
+          sudo mkdir -p /mnt/iso
+          sudo mount -o loop,ro "$ISO" /mnt/iso
+          if [ -f /mnt/iso/casper/vmlinuz ] && [ -f /mnt/iso/casper/initrd ]; then
+            cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
+            cp /mnt/iso/casper/initrd "$CACHE/initrd"
+            echo "live" > /tmp/dlive_type
+          elif [ -f /mnt/iso/install/vmlinuz ] && [ -f /mnt/iso/install/initrd.gz ]; then
+            cp /mnt/iso/install/vmlinuz "$CACHE/vmlinuz"
+            cp /mnt/iso/install/initrd.gz "$CACHE/initrd.gz"
+            echo "server" > /tmp/dlive_type
+          else
+            echo "unknown" > /tmp/dlive_type
+          fi
+          sudo umount /mnt/iso
+        else
+          # cloud image – no extraction needed
+          echo "cloud" > /tmp/dlive_type
+        fi
+
+        # Verify extracted files if they exist
+        if [ -f "$CACHE/vmlinuz" ]; then
+          test -s "$CACHE/vmlinuz" || exit 1
+          if [ -f "$CACHE/initrd" ]; then test -s "$CACHE/initrd" || exit 1; fi
+          if [ -f "$CACHE/initrd.gz" ]; then test -s "$CACHE/initrd.gz" || exit 1; fi
+        fi
+        echo "Image type: $(cat /tmp/dlive_type)"
+
+    - name: Boot 26.04 (ISO or cloud) with maximum anti‑freeze + fallback
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
-        IMG="$CACHE/ubuntu.raw"
-        rm -f "$IMG" "$IMG.qcow2"
-        wget -q --tries=3 -O "$IMG.qcow2" "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img" || { echo "✗ img failed"; exit 1; }
-        qemu-img convert -f qcow2 -O raw "$IMG.qcow2" "$IMG"
-        qemu-img resize "$IMG" 20G
-        echo "$IMG" > /tmp/dlive_img
-        ls -lh "$IMG"
-
-    - name: Seed Drime (FULL DIAGNOSTIC LOGS)
-      run: |
-        set -x
-        IMG=$(cat /tmp/dlive_img)
-        ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        STAGE=/dev/shm/seedstage
-        rm -rf "$STAGE"; mkdir -p "$STAGE"
-        echo "--- /dev/shm space ---"; df -h /dev/shm
-        # Stage blocks with progress
-        python3 - "$IMG" "$STAGE" <<'PY'
-        import sys, zlib
-        B=4*1024*1024
-        img, stage = sys.argv[1], sys.argv[2]
-        n=0; gzbytes=0
-        with open(img,'rb') as f:
-            cid=0
-            while True:
-                d=f.read(B)
-                if not d: break
-                if len(d)<B: d=d+b'\x00'*(B-len(d))
-                if any(d):
-                    gz=zlib.compress(d,1)
-                    with open(f"{stage}/{cid:08d}.gz","wb") as g: g.write(gz)
-                    n+=1; gzbytes+=len(gz)
-                    if n%50==0: print(f"staged {n} blocks ({gzbytes//1024//1024}MB gz)", flush=True)
-                cid+=1
-        print(f"STAGED TOTAL {n} blocks, {gzbytes//1024//1024}MB gz", flush=True)
-        PY
-        echo "--- staged file count / size ---"
-        ls "$STAGE" | wc -l; du -sh "$STAGE"
-        # FULL verbose upload: stats every 5s to stdout + DEBUG log file
-        rclone copy "$STAGE" "$ACC:dlive/v6/blocks/" \
-          --transfers=16 --checkers=16 \
-          --retries=3 --low-level-retries=3 \
-          --contimeout=30s --timeout=300s \
-          --stats=5s --stats-log-level=NOTICE \
-          --log-file=/tmp/seed_rclone.log --log-level=DEBUG \
-          -v || echo "⚠ rclone copy returned non-zero (see log)"
-        echo "--- last 150 lines of rclone DEBUG log ---"
-        tail -n 150 /tmp/seed_rclone.log || true
-        echo "--- rclone about (quota/limits) ---"
-        rclone about "$ACC:" || true
-        echo "--- rclone size after seed ---"
-        rclone size "$ACC:dlive" || true
-
-    - name: Boot VM from Drime (VNC)
-      run: |
-        set -x
+        ISO=$(cat /tmp/dlive_iso)
+        TYPE=$(cat /tmp/dlive_type)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
-        ACCEL=""; CPU="-cpu qemu64"
-        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
+
+        # Start NBD server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         NBD_PID=$!
-        for i in $(seq 1 10); do [ -S /tmp/dlive.sock ] && break; sleep 1; done
+        for i in $(seq 1 15); do
+          [ -S /tmp/dlive.sock ] && break
+          sleep 1
+        done
         [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed"; cat /tmp/nbdkit.log; exit 1; }
+
         echo "=================================================="
-        echo "VNC: $NB_IP:5900"
+        echo "VNC: $NB_IP:5900  (install manually)"
+        echo "Image type: $TYPE"
         echo "=================================================="
-        sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
-          -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
-          -object iothread,id=ioth1 \
-          -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
-          -device virtio-blk-pci,drive=d0,iothread=ioth1 \
-          -vga std \
-          -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-          -device virtio-rng-pci \
-          -no-fd-bootchk \
-          -serial stdio \
-          -display none \
-          -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
+
+        # KVM acceleration if available, else TCG (slow but may bypass bug)
+        ACCEL=""
+        if [ -e /dev/kvm ]; then
+          ACCEL="-enable-kvm"
+        else
+          ACCEL="-accel tcg"
+        fi
+        CPU="-cpu qemu64"
+
+        # Build QEMU command for ISO (live or server) with aggressive anti‑freeze
+        if [ "$TYPE" = "live" ] || [ "$TYPE" = "server" ]; then
+          # Determine initrd file
+          INITRD=""
+          if [ -f "$CACHE/initrd.gz" ]; then
+            INITRD="$CACHE/initrd.gz"
+          elif [ -f "$CACHE/initrd" ]; then
+            INITRD="$CACHE/initrd"
+          else
+            echo "✗ No initrd found for ISO boot"; exit 1
+          fi
+
+          # Extra kernel parameters to avoid systemd freeze
+          KERNEL_CMD="boot=casper quiet splash systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0 systemd.machine_id= nohpet tsc=reliable no_timer_check systemd.log_level=debug systemd.log_target=console"
+          # If it still freezes, try disabling ACPI/APIC (may break some features but might boot)
+          # KERNEL_CMD="$KERNEL_CMD acpi=off noapic"
+
+          QEMU_CMD="sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
+            -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+            -object iothread,id=ioth1 \
+            -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
+            -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
+            -drive file=\"$ISO\",media=cdrom,if=ide,id=cd0 \
+            -kernel \"$CACHE/vmlinuz\" -initrd \"$INITRD\" \
+            -append \"$KERNEL_CMD\" \
+            -vga std -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -device virtio-rng-pci -no-fd-bootchk \
+            -serial file:/tmp/qemu.log -display none \
+            -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive"
+        else
+          # Cloud image – boot directly as NVMe disk (no ISO)
+          QEMU_CMD="sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
+            -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+            -object iothread,id=ioth1 \
+            -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
+            -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
+            -drive file=\"$ISO\",format=qcow2,if=none,id=d1 \
+            -device nvme,serial=deadbeef2,drive=d1,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
+            -boot order=c \
+            -vga std -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -device virtio-rng-pci -no-fd-bootchk \
+            -serial file:/tmp/qemu.log -display none \
+            -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive"
+        fi
+
+        echo "QEMU command: $QEMU_CMD"
+        timeout 600 bash -c "$QEMU_CMD" &
         QPID=$!
-        wait $QPID
-        echo "--- NBDKIT log ---"
-        tail -n 100 /tmp/nbdkit.log || true
-        echo "--- FINAL DRIME ---"
+        wait $QPID || true
+
+        echo "--- QEMU serial log ---"
+        cat /tmp/qemu.log 2>/dev/null || true
+        echo "--- NBD LOG ---"
+        tail -n 50 /tmp/nbdkit.log 2>/dev/null || true
+        echo "--- DRIME stats ---"
         ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        rclone size "$ACC:dlive" || true
+        rclone size "$ACC:dlive" 2>/dev/null || true
         echo "✓ Done."
