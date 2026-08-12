@@ -1,4 +1,4 @@
-name: DRIME-TRUE-STORAGE-1000MBPS
+name: DRIME-LIVE-VPS
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
         default: "0.0.0.0"
 
 concurrency:
-  group: drime-1000mbps
+  group: drime-live-vps
   cancel-in-progress: false
 
 jobs:
@@ -24,8 +24,114 @@ jobs:
       PLUGIN: /opt/drime-nbd.py
       RCLONE_CFG: /root/.config/rclone/drime.conf
       NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
-      SECRETS_JSON: ${{ toJSON(secrets) }}
+      DRIME_TOKEN: ${{ secrets.DRIME }}
     steps:
+      - name: Write NBD plugin
+        shell: bash
+        run: |
+          sudo mkdir -p /opt
+          sudo tee /opt/drime-nbd.py > /dev/null << 'PYEOF'
+          import nbdkit
+          import subprocess
+          import threading
+
+          CHUNK = 4 * 1024 * 1024
+          DISK_SIZE = 20 * 1024 * 1024 * 1024
+          REMOTE = "drime0"
+          PREFIX = "vm-disk/chunk"
+          CFG = "/root/.config/rclone/drime.conf"
+          lock = threading.Lock()
+
+          def open(readonly):
+              return {}
+
+          def close(h):
+              pass
+
+          def get_size(h):
+              return DISK_SIZE
+
+          def _chunk(ci):
+              return f"{PREFIX}-{ci:08d}.bin"
+
+          def _tmp(ci):
+              return f"{PREFIX}-{ci:08d}.bin.tmp"
+
+          def pread(h, count, offset, flags):
+              sc = offset // CHUNK
+              ec = (offset + count - 1) // CHUNK
+              out = bytearray()
+              for ci in range(sc, ec + 1):
+                  proc = subprocess.Popen(
+                      ["rclone", "--config", CFG, "cat", f"{REMOTE}:{_chunk(ci)}"],
+                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                  )
+                  data, _ = proc.communicate()
+                  if proc.returncode != 0 or not data:
+                      data = b"\x00" * CHUNK
+                  elif len(data) < CHUNK:
+                      data += b"\x00" * (CHUNK - len(data))
+                  s = max(0, offset - ci * CHUNK)
+                  e = min(CHUNK, offset + count - ci * CHUNK)
+                  out.extend(data[s:e])
+              return bytes(out[:count])
+
+          def pwrite(h, buf, offset, flags):
+              count = len(buf)
+              sc = offset // CHUNK
+              ec = (offset + count - 1) // CHUNK
+              for ci in range(sc, ec + 1):
+                  try:
+                      with lock:
+                          pr = subprocess.Popen(
+                              ["rclone", "--config", CFG, "cat", f"{REMOTE}:{_chunk(ci)}"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                          )
+                          data, _ = pr.communicate()
+                          if pr.returncode != 0 or not data:
+                              data = bytearray(CHUNK)
+                          else:
+                              data = bytearray(data)
+                              if len(data) < CHUNK:
+                                  data += b"\x00" * (CHUNK - len(data))
+                          ws = max(0, offset - ci * CHUNK)
+                          bs = max(0, ci * CHUNK - offset)
+                          be = min(count, (ci + 1) * CHUNK - offset)
+                          wl = be - bs
+                          if wl > 0:
+                              data[ws:ws + wl] = buf[bs:be]
+                          pw = subprocess.Popen(
+                              ["rclone", "--config", CFG, "rcat", f"{REMOTE}:{_tmp(ci)}"],
+                              stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                          )
+                          pw.communicate(input=bytes(data))
+                          subprocess.run(
+                              ["rclone", "--config", CFG, "copyto",
+                               f"{REMOTE}:{_tmp(ci)}", f"{REMOTE}:{_chunk(ci)}"],
+                              stderr=subprocess.DEVNULL
+                          )
+                          subprocess.run(
+                              ["rclone", "--config", CFG, "delete", f"{REMOTE}:{_tmp(ci)}"],
+                              stderr=subprocess.DEVNULL
+                          )
+                  except Exception as e:
+                      nbdkit.debug(f"pwrite chunk {ci}: {e}")
+                      raise
+
+          def flush(h, flags):
+              pass
+
+          def trim(h, count, offset, flags):
+              sc = offset // CHUNK
+              ec = (offset + count - 1) // CHUNK
+              for ci in range(sc, ec + 1):
+                  subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{_chunk(ci)}"], stderr=subprocess.DEVNULL)
+                  subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{_tmp(ci)}"], stderr=subprocess.DEVNULL)
+
+          def can_fua(h):
+              return nbdkit.FUA_NATIVE
+          PYEOF
+
       - name: Engine
         shell: bash
         run: |
@@ -39,9 +145,9 @@ jobs:
           NBD_SOCK="${NBD_SOCK:-/tmp/drime-nbd.sock}"
           PLUGIN="${PLUGIN:-/opt/drime-nbd.py}"
           RCLONE_CFG="${RCLONE_CFG:-/root/.config/rclone/drime.conf}"
-          SECRETS_JSON="${SECRETS_JSON:-{}}"
+          DRIME_TOKEN="${DRIME_TOKEN:-}"
 
-          mkdir -p "$LOG" /opt "$(dirname "$RCLONE_CFG")"
+          mkdir -p "$LOG" "$(dirname "$RCLONE_CFG")"
           exec > >(tee -a "$LOG/engine.log") 2>&1
 
           log(){ printf '[%s] [%s] %s\n' "$(date -u +%FT%TZ)" "$1" "$2"; }
@@ -50,19 +156,18 @@ jobs:
 
           NBD_SUPERVISOR_PID=""
           cleanup() {
-            log SHUTDOWN "Graceful shutdown initiated"
+            log SHUTDOWN "Graceful shutdown"
             [[ -f /run/drime-vm.pid ]] && kill "$(cat /run/drime-vm.pid)" 2>/dev/null || true
             sleep 3
             [[ -n "$NBD_SUPERVISOR_PID" ]] && kill "$NBD_SUPERVISOR_PID" 2>/dev/null || true
             pkill -f "nbdkit python3" 2>/dev/null || true
             rclone delete drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null || true
-            log SHUTDOWN "All data safe on Drime. Zero loss."
+            log SHUTDOWN "All data safe on Drime"
           }
           trap cleanup EXIT TERM INT
 
-          log INIT "DRIME TRUE STORAGE 1000MBPS CRASH-PROOF ENGINE"
+          log INIT "DRIME LIVE VPS ENGINE"
 
-          # ========== INSTALL DEPENDENCIES ==========
           apt-get update -y || fail PKG apt-update
           apt-get install -y \
             qemu-system-x86 qemu-utils \
@@ -77,10 +182,9 @@ jobs:
           modprobe nbd 2>/dev/null || true
           [[ -e /dev/kvm ]] || fail KVM no-device
           chmod 666 /dev/kvm
-          log KVM "KVM device ready"
+          log KVM "ready"
 
-          # ========== NETBIRD ==========
-          [[ -n "${NETBIRD_SETUP_KEY:-}" ]] || fail NETBIRD no-key
+          [[ -n "$NETBIRD_SETUP_KEY" ]] || fail NETBIRD no-key
           curl --retry 5 -fsSL https://pkgs.netbird.io/install.sh | sh || fail NETBIRD install
           for i in 1 2 3; do
             netbird up --setup-key "$NETBIRD_SETUP_KEY" --log-file "$LOG/netbird.log" && break
@@ -88,49 +192,48 @@ jobs:
           done
           NB_IP=$(hostname -I | awk '{print $1}')
           for ifc in wt0 netbird0 nb0; do
-            ip addr show "$ifc" 2>/dev/null | grep -q inet && \
-              NB_IP=$(ip -4 -o addr show "$ifc" | awk '{print $4}' | cut -d/ -f1) && break
+            if ip addr show "$ifc" 2>/dev/null | grep -q inet; then
+              NB_IP=$(ip -4 -o addr show "$ifc" | awk '{print $4}' | cut -d/ -f1)
+              break
+            fi
           done
           log NETBIRD "ip=$NB_IP"
 
-          # ========== DRIME RCLONE CONFIG ==========
-          TOKEN=$(jq -r '.DRIME // empty' <<<"$SECRETS_JSON")
-          [[ -n "$TOKEN" ]] || fail DRIME no-token
+          [[ -n "$DRIME_TOKEN" ]] || fail DRIME no-token
           export RCLONE_CONFIG="$RCLONE_CFG"
-          rclone config create drime0 drime access_token="$TOKEN" --config "$RCLONE_CFG" >/dev/null
-          log DRIME "rclone configured"
+          rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null
+          log DRIME "configured"
 
-          # ========== STARTUP RECOVERY ==========
           ORPHANS=$(rclone ls drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null | wc -l || echo 0)
           if [[ "$ORPHANS" -gt 0 ]]; then
-            log RECOVERY "Cleaning $ORPHANS orphaned temp chunks from previous crash"
+            log RECOVERY "Cleaning $ORPHANS orphaned temps"
             rclone delete drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" || true
           fi
-          log RECOVERY "Clean state verified"
+          log RECOVERY "clean state"
 
-          # ========== DOWNLOAD UBUNTU 26.04 LTS ==========
           IMG_URL="https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
           if [[ ! -f /tmp/resolute.raw ]]; then
-            log IMAGE "Downloading Ubuntu 26.04 LTS (Resolute Raccoon)..."
+            log IMAGE "Downloading Ubuntu 26.04 LTS"
             curl -fL --retry 5 "$IMG_URL" -o /tmp/resolute.qcow2 || fail IMAGE download
             qemu-img convert -f qcow2 -O raw /tmp/resolute.qcow2 /tmp/resolute.raw || fail IMAGE convert
             rm -f /tmp/resolute.qcow2
-            log IMAGE "Raw image ready: $(du -h /tmp/resolute.raw | cut -f1)"
+            log IMAGE "ready: $(du -h /tmp/resolute.raw | cut -f1)"
           fi
 
-          # ========== UPLOAD CHUNKS TO DRIME (RESUMABLE) ==========
           CHUNK_SIZE=$((4*1024*1024))
           IMG_SIZE=$(stat -c%s /tmp/resolute.raw)
           TOTAL_CHUNKS=$(( (IMG_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE ))
-          log DRIME "Preparing $TOTAL_CHUNKS chunks..."
+          log DRIME "Preparing $TOTAL_CHUNKS chunks"
 
           cd /tmp
           split -b ${CHUNK_SIZE} -d -a 8 resolute.raw chunk- || fail DRIME split
-          UPLOADED=0; SKIPPED=0
+          UPLOADED=0
+          SKIPPED=0
           for f in chunk-*; do
             if [[ -s "$f" ]] && [[ -n "$(tr -d '\0' < "$f" | head -c 1)" ]]; then
               if rclone ls "drime0:vm-disk/${f}.bin" --config "$RCLONE_CFG" >/dev/null 2>&1; then
-                SKIPPED=$((SKIPPED+1)); continue
+                SKIPPED=$((SKIPPED+1))
+                continue
               fi
               rclone copyto "$f" "drime0:vm-disk/${f}.bin.tmp" --config "$RCLONE_CFG" || fail DRIME upload-tmp
               rclone copyto "drime0:vm-disk/${f}.bin.tmp" "drime0:vm-disk/${f}.bin" --config "$RCLONE_CFG" || fail DRIME upload-copy
@@ -139,139 +242,25 @@ jobs:
             fi
           done
           rm -f chunk-* resolute.raw
-          log DRIME "Upload complete: $UPLOADED new, $SKIPPED existing"
+          log DRIME "Upload done: $UPLOADED new, $SKIPPED existing"
 
-          # ========== 1000 MBPS RAM-PIPE NBD PLUGIN ==========
-          cat > "$PLUGIN" << 'PYEOF'
-import nbdkit
-import subprocess
-import threading
-
-CHUNK = 4 * 1024 * 1024
-DISK_SIZE = 20 * 1024 * 1024 * 1024
-REMOTE = "drime0"
-PREFIX = "vm-disk/chunk"
-CFG = "/root/.config/rclone/drime.conf"
-lock = threading.Lock()
-
-def open(readonly):
-    return {}
-
-def close(h):
-    pass
-
-def get_size(h):
-    return DISK_SIZE
-
-def _chunk(ci):
-    return f"{PREFIX}-{ci:08d}.bin"
-
-def _tmp(ci):
-    return f"{PREFIX}-{ci:08d}.bin.tmp"
-
-# ZERO-DISK READ: Drime API -> RAM -> NBD
-def pread(h, count, offset, flags):
-    sc = offset // CHUNK
-    ec = (offset + count - 1) // CHUNK
-    out = bytearray()
-    for ci in range(sc, ec + 1):
-        proc = subprocess.Popen(
-            ["rclone", "--config", CFG, "cat", f"{REMOTE}:{_chunk(ci)}"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        data, _ = proc.communicate()
-        if proc.returncode != 0 or not data:
-            data = b"\x00" * CHUNK
-        elif len(data) < CHUNK:
-            data += b"\x00" * (CHUNK - len(data))
-        s = max(0, offset - ci * CHUNK)
-        e = min(CHUNK, offset + count - ci * CHUNK)
-        out.extend(data[s:e])
-    return bytes(out[:count])
-
-# ZERO-DISK WRITE: NBD -> RAM -> Drime API (ATOMIC)
-def pwrite(h, buf, offset, flags):
-    count = len(buf)
-    sc = offset // CHUNK
-    ec = (offset + count - 1) // CHUNK
-    for ci in range(sc, ec + 1):
-        try:
-            with lock:
-                # 1. Fetch existing chunk to RAM
-                pr = subprocess.Popen(
-                    ["rclone", "--config", CFG, "cat", f"{REMOTE}:{_chunk(ci)}"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                data, _ = pr.communicate()
-                if pr.returncode != 0 or not data:
-                    data = bytearray(CHUNK)
-                else:
-                    data = bytearray(data)
-                    if len(data) < CHUNK:
-                        data += b"\x00" * (CHUNK - len(data))
-
-                # 2. Modify in RAM
-                ws = max(0, offset - ci * CHUNK)
-                bs = max(0, ci * CHUNK - offset)
-                be = min(count, (ci + 1) * CHUNK - offset)
-                wl = be - bs
-                if wl > 0:
-                    data[ws:ws + wl] = buf[bs:be]
-
-                # 3. ATOMIC: Stream RAM -> Drime temp
-                pw = subprocess.Popen(
-                    ["rclone", "--config", CFG, "rcat", f"{REMOTE}:{_tmp(ci)}"],
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                pw.communicate(input=bytes(data))
-
-                # 4. ATOMIC: Server-side copy temp -> final
-                subprocess.run(
-                    ["rclone", "--config", CFG, "copyto",
-                     f"{REMOTE}:{_tmp(ci)}", f"{REMOTE}:{_chunk(ci)}"],
-                    stderr=subprocess.DEVNULL
-                )
-
-                # 5. ATOMIC: Delete temp
-                subprocess.run(
-                    ["rclone", "--config", CFG, "delete", f"{REMOTE}:{_tmp(ci)}"],
-                    stderr=subprocess.DEVNULL
-                )
-        except Exception as e:
-            nbdkit.debug(f"pwrite chunk {ci}: {e}")
-            raise
-
-def flush(h, flags):
-    pass
-
-def trim(h, count, offset, flags):
-    sc = offset // CHUNK
-    ec = (offset + count - 1) // CHUNK
-    for ci in range(sc, ec + 1):
-        subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{_chunk(ci)}"], stderr=subprocess.DEVNULL)
-        subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{_tmp(ci)}"], stderr=subprocess.DEVNULL)
-
-def can_fua(h):
-    return nbdkit.FUA_NATIVE
-PYEOF
-          log NBD "1000 Mbps RAM-Pipe NBD plugin deployed"
-
-          # ========== START NBDKIT (16-THREAD SUPERVISOR) ==========
           rm -f "$NBD_SOCK"
           (
             while true; do
               nbdkit python3 "$PLUGIN" --unix "$NBD_SOCK" --threads 16 --foreground 2>>"$LOG/nbdkit.log"
-              log WARN "nbdkit CRASHED - auto-restarting in 2s"
+              log WARN "nbdkit crashed, restarting in 2s"
               sleep 2
             done
           ) &
           NBD_SUPERVISOR_PID=$!
 
-          for i in {1..30}; do [[ -S "$NBD_SOCK" ]] && break; sleep 1; done
+          for i in $(seq 1 30); do
+            [[ -S "$NBD_SOCK" ]] && break
+            sleep 1
+          done
           [[ -S "$NBD_SOCK" ]] || fail NBD "socket not created"
-          log NBD "nbdkit running pid=$NBD_SUPERVISOR_PID threads=16"
+          log NBD "nbdkit running threads=16"
 
-          # ========== START QEMU (NBD RECONNECT) ==========
           VM_RAM="${{ github.event.inputs.vm_ram_gb || '16' }}"
           VNC_BIND="${{ github.event.inputs.vnc_bind || '0.0.0.0' }}"
 
@@ -293,16 +282,13 @@ PYEOF
           ss -ltn | grep -q ':5900' || fail VM vnc-not-listening
 
           log VM "RUNNING ram=${VM_RAM}G vnc=${VNC_BIND}:5900 netbird=$NB_IP"
-          log CRASH-PROOF "Atomic writes: ON | Auto-restart: ON | Reconnect: ON | Recovery: ON"
-          log SPEED "RAM-Pipe zero-disk I/O | 16 threads | 1000+ Mbps capable"
           log ACCESS "VNC -> $NB_IP:5900"
 
-          # ========== KEEP ALIVE ==========
           while true; do
             kill -0 "$(cat /run/drime-vm.pid)" 2>/dev/null || fail VM died
             kill -0 "$NBD_SUPERVISOR_PID" 2>/dev/null || fail NBD supervisor-died
             DRIME_USED=$(rclone size drime0:vm-disk/ --config "$RCLONE_CFG" 2>/dev/null | head -1 || echo "unknown")
-            log HEARTBEAT "vm=running drime=$DRIME_USED crashproof=active"
+            log HEARTBEAT "vm=running drime=$DRIME_USED"
             sleep 30
           done
 
