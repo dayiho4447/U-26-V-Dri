@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (KERNEL-EXTRACT + APPARMOR FIX)
+name: DLIVE1 ENTERPRISE SAN (24.04 LTS SERVER - STABLE)
 
 on:
   push:
@@ -286,29 +286,16 @@ jobs:
         echo "$CACHE" > /tmp/dlive_cache
         df -h "$CACHE" | tail -1
 
-    - name: Download Ubuntu 26.04 LTS Server ISO
+    - name: Download Ubuntu 24.04 LTS SERVER (Force Fresh)
       run: |
         CACHE=$(cat /tmp/dlive_cache)
         ISO="$CACHE/ubuntu.iso"
-        if [ ! -f "$ISO" ]; then
-          wget -q --tries=3 -O "$ISO" "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
-        fi
+        rm -f "$ISO" # FORCE DELETE OLD CACHED (broken 26.04) ISO
+        wget -q --show-progress -O "$ISO" "https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso" || { echo "✗ ISO failed"; exit 1; }
         echo "$ISO" > /tmp/dlive_iso
         ls -lh "$ISO"
 
-    - name: Extract kernel + initrd (to inject apparmor=0 cmdline)
-      run: |
-        set -x
-        CACHE=$(cat /tmp/dlive_cache)
-        ISO=$(cat /tmp/dlive_iso)
-        sudo mkdir -p /mnt/iso
-        sudo mount -o loop,ro "$ISO" /mnt/iso
-        cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
-        cp /mnt/iso/casper/initrd "$CACHE/initrd"
-        sudo umount /mnt/iso
-        ls -lh "$CACHE/vmlinuz" "$CACHE/initrd"
-
-    - name: Boot VM (KERNEL-EXTRACT + APPARMOR FIX) + NATIVE VNC
+    - name: Boot VM ENTERPRISE + NATIVE VNC
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
@@ -318,7 +305,6 @@ jobs:
         ACCEL=""; CPU="-cpu qemu64"
         [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
-        # Start NBDKIT Server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock &
         NBD_PID=$!
         sleep 2
@@ -326,20 +312,17 @@ jobs:
 
         echo "=================================================="
         echo "NATIVE VNC CLIENT: $NB_IP:5900"
-        echo "MODE: ENTERPRISE (kernel-extract + apparmor=0)"
+        echo "MODE: ENTERPRISE (Ubuntu 24.04 LTS SERVER - stable)"
         echo "Install: entire disk, NO LVM."
         echo "=================================================="
 
-        # PHASE 1 (INSTALL): Boot extracted kernel/initrd with apparmor=0 to bypass the
-        # systemd 259 live-CD sandboxing "Protocol error" freeze.
         sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
           -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
           -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
-          -kernel "$CACHE/vmlinuz" -initrd "$CACHE/initrd" \
-          -append "boot=casper quiet splash apparmor=0 selinux=0 ---" \
+          -boot order=c,once=d \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
