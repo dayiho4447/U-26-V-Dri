@@ -1,4 +1,4 @@
-name: DRIME REST-ONLY BOOT
+name: DRIME ADAPTIVE SYNC BOOT
 
 on:
   push:
@@ -14,15 +14,14 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install dependencies (including requests for REST)
+    - name: Install dependencies
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y python3-pip curl qemu-utils qemu-system-x86 wget nbdkit nbdkit-plugin-python nbd-client
-        pip3 install requests
-        curl -fsSL https://rclone.org/install.sh | sudo bash   # only for final verification, not for uploads
+        sudo apt-get install -y python3 curl qemu-utils qemu-system-x86 wget nbdkit nbdkit-plugin-python nbd-client
+        curl -fsSL https://rclone.org/install.sh | sudo bash
         sudo chmod 666 /dev/kvm 2>/dev/null || true
 
-    - name: Install NetBird (VNC)
+    - name: Install NetBird
       run: |
         curl -fsSL https://pkgs.netbird.io/debian/public.key | sudo gpg --dearmor -o /usr/share/keyrings/netbird-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main" | sudo tee /etc/apt/sources.list.d/netbird.list
@@ -30,46 +29,35 @@ jobs:
         sudo apt-get install -y netbird
         sudo netbird up --setup-key "${{ secrets.NETBIRD_SETUP_KEY }}" || exit 1
 
-    - name: Create NBD plugin – REST API (requests)
+    - name: Configure rclone
       env:
         DRIME_TOKEN: ${{ secrets.DRIME }}
-        DRIME_ENDPOINT: ${{ secrets.DRIME_ENDPOINT || 'https://drime.cloud/api' }}
+      run: |
+        rclone config create DRIME drime access_token="$DRIME_TOKEN"
+        rclone mkdir DRIME:dlive/v6/blocks || true
+
+    - name: Create NBD plugin – adaptive (async + sync on flush)
       run: |
         cat > /tmp/dlive_nbd.py <<'PYEOF'
-        import nbdkit, os, zlib, threading, queue, sys, time, requests, json
+        import nbdkit, os, zlib, subprocess, threading, queue, sys, time
 
-        TOKEN = os.environ['DRIME_TOKEN']
-        BASE_URL = os.environ['DRIME_ENDPOINT']
-        if not TOKEN or not BASE_URL:
-            raise Exception("Missing DRIME_TOKEN or DRIME_ENDPOINT")
-
-        HEADERS = {
-            "Authorization": f"Bearer {TOKEN}",
-            "Content-Type": "application/octet-stream"
-        }
-
-        B = 4 * 1024 * 1024
+        # ========== CONFIG ==========
+        BLOCK_SIZE = 8 * 1024 * 1024   # 8 MB – good balance
         DISK_SIZE = 20 * 1024 * 1024 * 1024
-        # Drime storage path: /dlive/v6/blocks/
-        # We'll use REST endpoints: PUT /file/... and GET /file/...
-        # You may need to adjust the endpoint paths if Drime uses a different structure.
-        # Common pattern: /api/file/upload?path=...
-        # We'll construct URLs accordingly.
+        UPLOADER_THREADS = 64
+        AUTO_FLUSH_INTERVAL = 5        # seconds
+        RCLONE_FLAGS = [
+            "--transfers=64",
+            "--checkers=64",
+            "--buffer-size=256M",
+            "--drime-upload-concurrency=16",
+            "--drime-chunk-size=64M",
+            "--retries=3",
+            "--no-traverse"
+        ]
+        REMOTE_BASE = "DRIME:dlive/v6/blocks"
+        # =============================
 
-        def upload_block(cid, data):
-            remote_path = f"/dlive/v6/blocks/{cid:08d}.gz"
-            url = f"{BASE_URL}/file/upload?path={remote_path}"
-            resp = requests.put(url, headers=HEADERS, data=data, timeout=120)
-            resp.raise_for_status()
-
-        def download_block(cid):
-            remote_path = f"/dlive/v6/blocks/{cid:08d}.gz"
-            url = f"{BASE_URL}/file/download?path={remote_path}"
-            resp = requests.get(url, headers=HEADERS, timeout=60)
-            resp.raise_for_status()
-            return resp.content
-
-        # Cache and upload queue (same as before)
         ram_cache = {}
         ram_lock = threading.Lock()
         upload_queue = queue.Queue()
@@ -79,16 +67,11 @@ jobs:
 
         def log(msg):
             with open("/tmp/nbdkit.log", "a") as f:
-                f.write(f"[DLIVE] {msg}\n")
+                f.write(f"[DLIVE] {time.ctime()} {msg}\n")
 
-        def config(key, value):
-            pass
-
-        def thread_model():
-            return nbdkit.THREAD_MODEL_PARALLEL
-
-        def open(readonly):
-            return 1
+        def config(key, value): pass
+        def thread_model(): return nbdkit.THREAD_MODEL_PARALLEL
+        def open(readonly): return 1
 
         def close(h):
             log("Close: flushing...")
@@ -98,34 +81,31 @@ jobs:
                     log(f"Waiting for uploads: {pending_uploads}")
             log("Close complete")
 
-        def get_size(h):
-            return DISK_SIZE
+        def get_size(h): return DISK_SIZE
+        def can_write(h): return True
+        def can_flush(h): return True
+        def can_trim(h): return True
 
-        def can_write(h):
-            return True
-
-        def can_flush(h):
-            return True
-
-        def can_trim(h):
-            return True
-
-        def block_id(offset):
-            return offset // B
+        def block_id(offset): return offset // BLOCK_SIZE
 
         def get_block(cid):
             with ram_lock:
                 if cid in ram_cache:
                     return ram_cache[cid]
+            remote_path = f"{REMOTE_BASE}/{cid:08d}.gz"
+            tmp = f"/tmp/dlive_{cid}.tmp"
             try:
-                data = download_block(cid)
-                decompressed = zlib.decompress(data)
+                cmd = ["rclone", "copyto"] + RCLONE_FLAGS + [remote_path, tmp]
+                subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+                with open(tmp, 'rb') as f:
+                    data = zlib.decompress(f.read())
+                os.unlink(tmp)
                 with ram_lock:
-                    ram_cache[cid] = decompressed
-                return decompressed
+                    ram_cache[cid] = data
+                return data
             except Exception as e:
                 log(f"Download block {cid} failed: {e}")
-                return b"\x00" * B
+                return b"\x00" * BLOCK_SIZE
 
         def pread(h, count, offset, flags):
             out = bytearray(count)
@@ -133,13 +113,14 @@ jobs:
             while pos < count:
                 o = offset + pos
                 cid = block_id(o)
-                co = o % B
-                n = min(B - co, count - pos)
+                co = o % BLOCK_SIZE
+                n = min(BLOCK_SIZE - co, count - pos)
                 blk = get_block(cid)
                 out[pos:pos+n] = blk[co:co+n]
                 pos += n
             return bytes(out)
 
+        # ========== ASYNC WRITE (queued) ==========
         def pwrite(h, buf, offset, flags):
             global pending_uploads
             pos = 0
@@ -147,8 +128,9 @@ jobs:
             while pos < n:
                 o = offset + pos
                 cid = block_id(o)
-                co = o % B
-                k = min(B - co, n - pos)
+                co = o % BLOCK_SIZE
+                k = min(BLOCK_SIZE - co, n - pos)
+
                 with ram_lock:
                     if cid in ram_cache:
                         cur = bytearray(ram_cache[cid])
@@ -157,19 +139,21 @@ jobs:
                     cur[co:co+k] = buf[pos:pos+k]
                     new = bytes(cur)
                     ram_cache[cid] = new
+
                 with pending_lock:
                     pending_uploads += 1
                 upload_queue.put((cid, new))
                 pos += k
 
+        # ========== FLUSH – waits for all uploads ==========
         def flush(h, flags):
             with pending_lock:
                 while pending_uploads > 0:
                     flush_cond.wait(timeout=1.0)
 
         def trim(h, count, offset, flags):
-            start_cid = offset // B
-            end_cid = (offset + count + B - 1) // B
+            start_cid = offset // BLOCK_SIZE
+            end_cid = (offset + count + BLOCK_SIZE - 1) // BLOCK_SIZE
             with ram_lock:
                 for cid in range(start_cid, end_cid):
                     if cid in ram_cache:
@@ -180,18 +164,40 @@ jobs:
             while True:
                 cid, data = upload_queue.get()
                 compressed = zlib.compress(data, 1)
+                remote_path = f"{REMOTE_BASE}/{cid:08d}.gz"
+                tmp = f"/tmp/dlive_up_{cid}.gz"
                 try:
-                    upload_block(cid, compressed)
+                    with open(tmp, 'wb') as f:
+                        f.write(compressed)
+                    cmd = ["rclone", "copyto"] + RCLONE_FLAGS + [tmp, remote_path]
+                    subprocess.run(cmd, check=True, capture_output=True, timeout=60)
                     log(f"✅ PUSHED {cid:08d}")
                 except Exception as e:
                     log(f"❌ FAILED {cid:08d}: {e}")
-                with pending_lock:
-                    pending_uploads -= 1
-                    if pending_uploads == 0:
-                        flush_cond.notify_all()
+                finally:
+                    try: os.unlink(tmp)
+                    except: pass
+                    with pending_lock:
+                        pending_uploads -= 1
+                        if pending_uploads == 0:
+                            flush_cond.notify_all()
 
-        for _ in range(16):
+        # Background auto‑flusher
+        def auto_flusher():
+            while True:
+                time.sleep(AUTO_FLUSH_INTERVAL)
+                log("Auto-flush triggered")
+                flush(None, None)
+                log("Auto-flush complete")
+
+        # Start uploaders
+        for _ in range(UPLOADER_THREADS):
             threading.Thread(target=uploader_loop, daemon=True).start()
+
+        # Start auto‑flusher
+        threading.Thread(target=auto_flusher, daemon=True).start()
+
+        log("Adaptive plugin ready: async writes + flush on sync + auto-flush")
         PYEOF
 
     - name: Prepare cache dir
@@ -206,10 +212,7 @@ jobs:
         wget -O "$CACHE/ubuntu.img" "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
         echo "$CACHE/ubuntu.img" > /tmp/dlive_img
 
-    - name: Write cloud image to Drime via REST NBD
-      env:
-        DRIME_TOKEN: ${{ secrets.DRIME }}
-        DRIME_ENDPOINT: ${{ secrets.DRIME_ENDPOINT || 'https://drime.cloud/api' }}
+    - name: Write image via NBD
       run: |
         IMG=$(cat /tmp/dlive_img)
 
@@ -222,14 +225,13 @@ jobs:
         for i in {1..10}; do [ -b /dev/nbd0 ] && break; sleep 1; done
         [ -b /dev/nbd0 ] || exit 1
 
+        # This will trigger many async writes, but we flush at the end (nbd-client -d triggers close)
         sudo qemu-img convert -f qcow2 -O raw "$IMG" /dev/nbd0
         sudo nbd-client -d /dev/nbd0
 
-        # Verify using rclone (only for size check, not for uploads)
-        rclone config create DRIME drime access_token="$DRIME_TOKEN" >/dev/null 2>&1
+        echo "Waiting for uploads to complete..."
         IMG_SIZE=$(stat -c%s "$IMG")
-        echo "Waiting for uploads to complete (REST)..."
-        for i in {1..120}; do
+        for i in {1..300}; do
           SIZE=$(rclone size DRIME:dlive 2>/dev/null | grep -oP 'Total size: \K[0-9]+' || echo "0")
           if [ "$SIZE" -ge "$IMG_SIZE" ]; then
             echo "✅ Upload complete: $SIZE bytes"
@@ -240,23 +242,24 @@ jobs:
         done
         rclone size DRIME:dlive || true
 
-    - name: Boot VM from Drime (always on)
-      env:
-        DRIME_TOKEN: ${{ secrets.DRIME }}
-        DRIME_ENDPOINT: ${{ secrets.DRIME_ENDPOINT || 'https://drime.cloud/api' }}
+    - name: Boot VM from Drime (adaptive)
       run: |
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         echo "VNC: $NB_IP:5900"
+        echo "⚡ Adaptive mode: async writes, flush on sync, auto-flush every 5s"
 
         sudo nbdkit -f -v python /tmp/dlive_nbd.py --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         for i in {1..15}; do [ -S /tmp/dlive.sock ] && break; sleep 1; done
         [ -S /tmp/dlive.sock ] || { cat /tmp/nbdkit.log; exit 1; }
 
-        sudo qemu-system-x86_64 -enable-kvm -machine q35 -cpu qemu64 -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
+        sudo qemu-system-x86_64 -enable-kvm -machine q35 -cpu qemu64 \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=none,aio=native,discard=unmap \
-          -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=8 \
-          -boot order=c -vga std -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -device virtio-rng-pci \
+          -device nvme,serial=deadbeef,drive=d0,iothread=ioth1,namespaces=1,queue_size=1024,msix_qsize=16 \
+          -boot order=c -vga std \
+          -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+          -device virtio-rng-pci \
           -serial file:/tmp/qemu.log -display none -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
 
         while true; do sleep 30; done
