@@ -1,4 +1,4 @@
-name: DLIVE1 ENTERPRISE SAN (26.04 CLOUD IMAGE - BOOTS)
+name: DLIVE1 ENTERPRISE SAN (26.04 ISO - FIXED)
 
 on:
   push:
@@ -219,59 +219,77 @@ jobs:
         sudo mkdir -p "$CACHE"; sudo chown -R runner:runner "$CACHE"
         echo "$CACHE" > /tmp/dlive_cache
 
-    - name: Download 26.04 CLOUD IMAGE (boots, real ext4 root)
+    - name: Download Ubuntu 26.04 daily ISO & extract kernel/initrd
       run: |
+        set -e  # stop on any error
         CACHE=$(cat /tmp/dlive_cache)
-        IMG="$CACHE/ubuntu.raw"
-        rm -f "$IMG" "$IMG.qcow2"
-        wget --tries=5 --timeout=60 --continue -O "$IMG.qcow2" "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img" || { echo "✗ img failed"; exit 1; }
-        qemu-img convert -f qcow2 -O raw "$IMG.qcow2" "$IMG"
-        qemu-img resize "$IMG" 20G
-        echo "$IMG" > /tmp/dlive_img
-        ls -lh "$IMG"
+        ISO="$CACHE/ubuntu.iso"
+        # Correct daily live server ISO for development (26.04)
+        wget --tries=5 --timeout=60 -O "$ISO" "https://cdimage.ubuntu.com/ubuntu-server/daily-live/current/devel-live-server-amd64.iso"
+        test -f "$ISO" || { echo "✗ ISO download failed"; exit 1; }
+        echo "$ISO" > /tmp/dlive_iso
+        ls -lh "$ISO"
 
-    - name: Boot 26.04 CLOUD IMAGE (VNC + Drime sync)
+        # Mount and extract kernel+initrd
+        sudo mkdir -p /mnt/iso
+        sudo mount -o loop,ro "$ISO" /mnt/iso
+        cp /mnt/iso/casper/vmlinuz "$CACHE/vmlinuz"
+        cp /mnt/iso/casper/initrd "$CACHE/initrd"
+        sudo umount /mnt/iso
+        # Verify they are non-empty
+        test -s "$CACHE/vmlinuz" || { echo "✗ vmlinuz empty"; exit 1; }
+        test -s "$CACHE/initrd" || { echo "✗ initrd empty"; exit 1; }
+        echo "✓ Kernel and initrd extracted successfully"
+
+    - name: Boot 26.04 ISO (2 cores, 4 threads, 16GB, KVM, anti‑freeze)
       run: |
         set -x
         CACHE=$(cat /tmp/dlive_cache)
-        IMG=$(cat /tmp/dlive_img)
+        ISO=$(cat /tmp/dlive_iso)
         NB_IP=$(sudo netbird status | grep 'NetBird IP:' | awk '{print $3}' | cut -d'/' -f1)
         [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
-        ACCEL=""; CPU="-cpu qemu64"
-        [ -e /dev/kvm ] && { ACCEL="-enable-kvm"; CPU="-cpu host"; }
 
+        # Start NBD server
         sudo nbdkit -f -v python /tmp/dlive_nbd.py accounts=/tmp/dlive_accounts --unix /tmp/dlive.sock > /tmp/nbdkit.log 2>&1 &
         NBD_PID=$!
-        for i in $(seq 1 10); do
+        for i in $(seq 1 15); do
           [ -S /tmp/dlive.sock ] && break
           sleep 1
         done
         [ -S /tmp/dlive.sock ] || { echo "✗ NBDKIT failed to bind socket"; cat /tmp/nbdkit.log; exit 1; }
 
         echo "=================================================="
-        echo "VNC: $NB_IP:5900  (login: ubuntu / ubuntu)"
-        echo "26.04 LTS SERVER - boots to login prompt"
+        echo "VNC: $NB_IP:5900  (install manually)"
         echo "=================================================="
 
-        sudo -E qemu-system-x86_64 $ACCEL -machine pc $CPU \
-          -smp 4,sockets=1,cores=4,threads=1 -m 16384 \
+        # KVM if available, CPU = qemu64 to avoid host features that trigger the freeze
+        ACCEL=""; CPU="-cpu qemu64"
+        [ -e /dev/kvm ] && ACCEL="-enable-kvm"
+
+        sudo -E qemu-system-x86_64 $ACCEL -machine q35 $CPU \
+          -smp 4,sockets=1,cores=2,threads=2 -m 16384 \
           -object iothread,id=ioth1 \
           -drive file=nbd:unix:/tmp/dlive.sock,format=raw,if=none,id=d0,cache=writeback,aio=threads,discard=unmap \
           -device virtio-blk-pci,drive=d0,iothread=ioth1 \
+          -drive file="$ISO",media=cdrom,if=ide,id=cd0 \
+          -kernel "$CACHE/vmlinuz" -initrd "$CACHE/initrd" \
+          -append "boot=casper quiet splash systemd.unified_cgroup_hierarchy=0 apparmor=0 selinux=0 systemd.machine_id= nohpet" \
           -vga std \
           -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
           -device virtio-rng-pci \
           -no-fd-bootchk \
-          -serial stdio \
+          -serial file:/tmp/qemu.log \
           -display none \
           -vnc 0.0.0.0:0,lossy=on,share=allow-exclusive &
         QPID=$!
 
         wait $QPID
 
+        echo "--- QEMU serial log ---"
+        cat /tmp/qemu.log 2>/dev/null || true
         echo "--- NBD LOG ---"
         tail -n 50 /tmp/nbdkit.log 2>/dev/null || true
         echo "--- DRIME ---"
         ACC=$(head -1 /tmp/dlive_accounts | awk '{print $1}')
-        rclone size "$ACC:dlive"
+        rclone size "$ACC:dlive" 2>/dev/null || true
         echo "✓ Done."
