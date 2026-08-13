@@ -204,8 +204,13 @@ jobs:
           rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null
           log DRIME "configured"
 
+          # FIX: Disable pipefail temporarily. rclone exits with code 3 (Directory not found) 
+          # on the very first run because vm-disk/ doesn't exist yet. pipefail would kill the script.
+          set +o pipefail
           ORPHANS=$(rclone lsf drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null | wc -l | tr -d '[:space:]')
+          set -o pipefail
           ORPHANS=${ORPHANS:-0}
+          
           if [[ "$ORPHANS" =~ ^[0-9]+$ ]] && [[ "$ORPHANS" -gt 0 ]]; then
             log RECOVERY "Cleaning $ORPHANS orphaned temps"
             rclone delete drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" || true
@@ -288,7 +293,13 @@ jobs:
           while true; do
             kill -0 "$(cat /run/drime-vm.pid)" 2>/dev/null || fail VM died
             kill -0 "$NBD_SUPERVISOR_PID" 2>/dev/null || fail NBD supervisor-died
+            
+            # FIX: Shield heartbeat rclone size from pipefail crashes
+            set +o pipefail
             DRIME_USED=$(rclone size drime0:vm-disk/ --config "$RCLONE_CFG" 2>/dev/null | head -1 || echo "unknown")
+            set -o pipefail
+            DRIME_USED=${DRIME_USED:-unknown}
+            
             log HEARTBEAT "vm=running drime=$DRIME_USED"
             sleep 30
           done
