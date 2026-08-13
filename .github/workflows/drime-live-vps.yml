@@ -169,7 +169,6 @@ jobs:
           log INIT "DRIME LIVE VPS ENGINE"
 
           apt-get update -y || fail PKG apt-update
-          # CRITICAL FIX: Correct package name is 'nbdkit-plugin-python' NOT 'nbdkit-plugin-python3'
           apt-get install -y \
             qemu-system-x86 qemu-utils \
             nbdkit nbdkit-plugin-python python3 \
@@ -205,8 +204,9 @@ jobs:
           rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null
           log DRIME "configured"
 
-          ORPHANS=$(rclone ls drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null | wc -l || echo 0)
-          if [[ "$ORPHANS" -gt 0 ]]; then
+          ORPHANS=$(rclone lsf drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null | wc -l | tr -d '[:space:]')
+          ORPHANS=${ORPHANS:-0}
+          if [[ "$ORPHANS" =~ ^[0-9]+$ ]] && [[ "$ORPHANS" -gt 0 ]]; then
             log RECOVERY "Cleaning $ORPHANS orphaned temps"
             rclone delete drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" || true
           fi
@@ -231,7 +231,7 @@ jobs:
           UPLOADED=0
           SKIPPED=0
           for f in chunk-*; do
-            if [[ -s "$f" ]] && [[ -n "$(tr -d '\0' < "$f" | head -c 1)" ]]; then
+            if [[ -s "$f" ]]; then
               if rclone ls "drime0:vm-disk/${f}.bin" --config "$RCLONE_CFG" >/dev/null 2>&1; then
                 SKIPPED=$((SKIPPED+1))
                 continue
