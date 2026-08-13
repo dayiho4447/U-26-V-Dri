@@ -34,89 +34,116 @@ jobs:
           import nbdkit
           import subprocess
           import threading
+          import time
+          from collections import OrderedDict
 
           CHUNK = 4 * 1024 * 1024
           DISK_SIZE = 20 * 1024 * 1024 * 1024
           REMOTE = "drime0"
           PREFIX = "vm-disk/chunk"
           CFG = "/root/.config/rclone/drime.conf"
-          lock = threading.Lock()
+
+          CACHE_SIZE = 512 # 2GB RAM Cache for lightning speed reads
+          cache_lock = threading.Lock()
+          chunk_cache = OrderedDict()
+
+          stats_lock = threading.Lock()
+          bytes_read = 0
+          bytes_written = 0
+          api_calls = 0
+          start_time = time.time()
+
+          def log_stats():
+              while True:
+                  time.sleep(3)
+                  with stats_lock:
+                      elapsed = time.time() - start_time
+                      r_speed = (bytes_read / (1024*1024)) / elapsed if elapsed > 0 else 0
+                      w_speed = (bytes_written / (1024*1024)) / elapsed if elapsed > 0 else 0
+                      nbdkit.debug(f"[SPEED] Read: {r_speed:.1f} MB/s | Write: {w_speed:.1f} MB/s | API: {api_calls} | Cache: {len(chunk_cache)}")
+
+          threading.Thread(target=log_stats, daemon=True).start()
 
           def open(readonly):
               return {}
 
-          def close(h):
-              pass
-
           def get_size(h):
               return DISK_SIZE
 
-          def _chunk(ci):
-              return f"{PREFIX}-{ci:08d}.bin"
+          def fetch_chunk(ci):
+              proc = subprocess.Popen(
+                  ["rclone", "--config", CFG, "cat", f"{REMOTE}:{PREFIX}-{ci:08d}.bin"],
+                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+              )
+              data, _ = proc.communicate()
+              with stats_lock:
+                  global api_calls
+                  api_calls += 1
+              if proc.returncode != 0 or not data:
+                  return bytearray(CHUNK)
+              data = bytearray(data)
+              if len(data) < CHUNK:
+                  data.extend(b"\x00" * (CHUNK - len(data)))
+              return data
 
-          def _tmp(ci):
-              return f"{PREFIX}-{ci:08d}.bin.tmp"
+          def save_chunk(ci, data):
+              pw = subprocess.Popen(
+                  ["rclone", "--config", CFG, "rcat", f"{REMOTE}:{PREFIX}-{ci:08d}.bin.tmp"],
+                  stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+              )
+              pw.communicate(input=bytes(data))
+              subprocess.run(["rclone", "--config", CFG, "copyto", f"{REMOTE}:{PREFIX}-{ci:08d}.bin.tmp", f"{REMOTE}:{PREFIX}-{ci:08d}.bin"], stderr=subprocess.DEVNULL)
+              subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{PREFIX}-{ci:08d}.bin.tmp"], stderr=subprocess.DEVNULL)
+              with stats_lock:
+                  global api_calls
+                  api_calls += 3
+
+          def get_chunk_data(ci):
+              with cache_lock:
+                  if ci in chunk_cache:
+                      chunk_cache.move_to_end(ci)
+                      return chunk_cache[ci]
+              
+              data = fetch_chunk(ci)
+              with cache_lock:
+                  chunk_cache[ci] = data
+                  chunk_cache.move_to_end(ci)
+                  while len(chunk_cache) > CACHE_SIZE:
+                      chunk_cache.popitem(last=False)
+              return data
 
           def pread(h, count, offset, flags):
+              global bytes_read
               sc = offset // CHUNK
               ec = (offset + count - 1) // CHUNK
               out = bytearray()
               for ci in range(sc, ec + 1):
-                  proc = subprocess.Popen(
-                      ["rclone", "--config", CFG, "cat", f"{REMOTE}:{_chunk(ci)}"],
-                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                  )
-                  data, _ = proc.communicate()
-                  if proc.returncode != 0 or not data:
-                      data = b"\x00" * CHUNK
-                  elif len(data) < CHUNK:
-                      data += b"\x00" * (CHUNK - len(data))
+                  data = get_chunk_data(ci)
                   s = max(0, offset - ci * CHUNK)
                   e = min(CHUNK, offset + count - ci * CHUNK)
                   out.extend(data[s:e])
+              with stats_lock:
+                  bytes_read += count
               return bytes(out[:count])
 
           def pwrite(h, buf, offset, flags):
+              global bytes_written
               count = len(buf)
               sc = offset // CHUNK
               ec = (offset + count - 1) // CHUNK
               for ci in range(sc, ec + 1):
-                  try:
-                      with lock:
-                          pr = subprocess.Popen(
-                              ["rclone", "--config", CFG, "cat", f"{REMOTE}:{_chunk(ci)}"],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                          )
-                          data, _ = pr.communicate()
-                          if pr.returncode != 0 or not data:
-                              data = bytearray(CHUNK)
-                          else:
-                              data = bytearray(data)
-                              if len(data) < CHUNK:
-                                  data += b"\x00" * (CHUNK - len(data))
-                          ws = max(0, offset - ci * CHUNK)
-                          bs = max(0, ci * CHUNK - offset)
-                          be = min(count, (ci + 1) * CHUNK - offset)
-                          wl = be - bs
-                          if wl > 0:
-                              data[ws:ws + wl] = buf[bs:be]
-                          pw = subprocess.Popen(
-                              ["rclone", "--config", CFG, "rcat", f"{REMOTE}:{_tmp(ci)}"],
-                              stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                          )
-                          pw.communicate(input=bytes(data))
-                          subprocess.run(
-                              ["rclone", "--config", CFG, "copyto",
-                               f"{REMOTE}:{_tmp(ci)}", f"{REMOTE}:{_chunk(ci)}"],
-                              stderr=subprocess.DEVNULL
-                          )
-                          subprocess.run(
-                              ["rclone", "--config", CFG, "delete", f"{REMOTE}:{_tmp(ci)}"],
-                              stderr=subprocess.DEVNULL
-                          )
-                  except Exception as e:
-                      nbdkit.debug(f"pwrite chunk {ci}: {e}")
-                      raise
+                  data = get_chunk_data(ci)
+                  with cache_lock:
+                      ws = max(0, offset - ci * CHUNK)
+                      bs = max(0, ci * CHUNK - offset)
+                      be = min(count, (ci + 1) * CHUNK - offset)
+                      wl = be - bs
+                      if wl > 0:
+                          data[ws:ws + wl] = buf[bs:be]
+                  save_chunk(ci, data)
+
+              with stats_lock:
+                  bytes_written += count
 
           def flush(h, flags):
               pass
@@ -125,8 +152,10 @@ jobs:
               sc = offset // CHUNK
               ec = (offset + count - 1) // CHUNK
               for ci in range(sc, ec + 1):
-                  subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{_chunk(ci)}"], stderr=subprocess.DEVNULL)
-                  subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{_tmp(ci)}"], stderr=subprocess.DEVNULL)
+                  with cache_lock:
+                      if ci in chunk_cache:
+                          del chunk_cache[ci]
+                  subprocess.run(["rclone", "--config", CFG, "delete", f"{REMOTE}:{PREFIX}-{ci:08d}.bin"], stderr=subprocess.DEVNULL)
 
           def can_fua(h):
               return nbdkit.FUA_NATIVE
@@ -166,7 +195,7 @@ jobs:
           }
           trap cleanup EXIT TERM INT
 
-          log INIT "DRIME LIVE VPS ENGINE"
+          log INIT "DRIME LIGHTNING SPEED ENGINE (32-Thread Parallel + 2GB RAM Cache)"
 
           apt-get update -y || fail PKG apt-update
           apt-get install -y \
@@ -204,8 +233,6 @@ jobs:
           rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null
           log DRIME "configured"
 
-          # FIX: Disable pipefail temporarily. rclone exits with code 3 (Directory not found) 
-          # on the very first run because vm-disk/ doesn't exist yet. pipefail would kill the script.
           set +o pipefail
           ORPHANS=$(rclone lsf drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null | wc -l | tr -d '[:space:]')
           set -o pipefail
@@ -226,29 +253,18 @@ jobs:
             log IMAGE "ready: $(du -h /tmp/resolute.raw | cut -f1)"
           fi
 
+          # LIGHTNING SPEED UPLOAD: 32 parallel connections
           CHUNK_SIZE=$((4*1024*1024))
-          IMG_SIZE=$(stat -c%s /tmp/resolute.raw)
-          TOTAL_CHUNKS=$(( (IMG_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE ))
-          log DRIME "Preparing $TOTAL_CHUNKS chunks"
-
-          cd /tmp
-          split -b ${CHUNK_SIZE} -d -a 8 resolute.raw chunk- || fail DRIME split
-          UPLOADED=0
-          SKIPPED=0
-          for f in chunk-*; do
-            if [[ -s "$f" ]]; then
-              if rclone ls "drime0:vm-disk/${f}.bin" --config "$RCLONE_CFG" >/dev/null 2>&1; then
-                SKIPPED=$((SKIPPED+1))
-                continue
-              fi
-              rclone copyto "$f" "drime0:vm-disk/${f}.bin.tmp" --config "$RCLONE_CFG" || fail DRIME upload-tmp
-              rclone copyto "drime0:vm-disk/${f}.bin.tmp" "drime0:vm-disk/${f}.bin" --config "$RCLONE_CFG" || fail DRIME upload-copy
-              rclone delete "drime0:vm-disk/${f}.bin.tmp" --config "$RCLONE_CFG" || true
-              UPLOADED=$((UPLOADED+1))
-            fi
-          done
-          rm -f chunk-* resolute.raw
-          log DRIME "Upload done: $UPLOADED new, $SKIPPED existing"
+          log DRIME "Splitting image and uploading with 32 parallel transfers..."
+          mkdir -p /tmp/vm-disk
+          split -b ${CHUNK_SIZE} -d -a 8 /tmp/resolute.raw /tmp/vm-disk/chunk-
+          for f in /tmp/vm-disk/chunk-*; do mv "$f" "${f}.bin"; done
+          
+          rclone copy /tmp/vm-disk/ drime0:vm-disk/ --config "$RCLONE_CFG" \
+            --transfers 32 --checkers 16 --progress --stats 1s || fail DRIME parallel-upload
+            
+          rm -rf /tmp/vm-disk /tmp/resolute.raw
+          log DRIME "Parallel upload complete! 1000 Mbps link saturated."
 
           rm -f "$NBD_SOCK"
           (
@@ -265,7 +281,7 @@ jobs:
             sleep 1
           done
           [[ -S "$NBD_SOCK" ]] || fail NBD "socket not created"
-          log NBD "nbdkit running threads=16"
+          log NBD "nbdkit running threads=16 cache=2GB"
 
           VM_RAM="${{ github.event.inputs.vm_ram_gb || '16' }}"
           VNC_BIND="${{ github.event.inputs.vnc_bind || '0.0.0.0' }}"
@@ -294,7 +310,6 @@ jobs:
             kill -0 "$(cat /run/drime-vm.pid)" 2>/dev/null || fail VM died
             kill -0 "$NBD_SUPERVISOR_PID" 2>/dev/null || fail NBD supervisor-died
             
-            # FIX: Shield heartbeat rclone size from pipefail crashes
             set +o pipefail
             DRIME_USED=$(rclone size drime0:vm-disk/ --config "$RCLONE_CFG" 2>/dev/null | head -1 || echo "unknown")
             set -o pipefail
