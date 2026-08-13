@@ -27,7 +27,6 @@ jobs:
     env:
       LOG: /var/log/drime
       NBD_SOCK: /tmp/drime-nbd.sock
-      PLUGIN: /opt/drime-nbd.py
       RCLONE_CFG: /root/.config/rclone/drime.conf
       NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
       DRIME_TOKEN: ${{ secrets.DRIME }}
@@ -35,95 +34,64 @@ jobs:
       INPUT_VM_THREADS: ${{ github.event.inputs.vm_threads }}
       INPUT_VM_RAM_GB: ${{ github.event.inputs.vm_ram_gb }}
       INPUT_VNC_BIND: ${{ github.event.inputs.vnc_bind }}
+
     steps:
       - name: Write NBD plugin
         shell: bash
         run: |
           sudo mkdir -p /opt
           sudo tee /opt/drime-nbd.py > /dev/null << 'PYEOF'
-          import nbdkit
-          import subprocess
-          import threading
-          import io
+          import nbdkit, subprocess, os, threading
           from collections import OrderedDict
-
           CHUNK = 4 * 1024 * 1024
           DISK_SIZE = 20 * 1024 * 1024 * 1024
           REMOTE = "drime0"
           PREFIX = "vm-disk/chunk-"
           CFG = "/root/.config/rclone/drime.conf"
-
           lock = threading.Lock()
           cache = OrderedDict()
           CACHE_MAX = 512
-
-          def open(readonly):
-              return {}
-
-          def get_size(h):
-              return DISK_SIZE
-
+          def open(readonly): return {}
+          def get_size(h): return DISK_SIZE
           def _fetch(ci):
-              p = subprocess.run(
-                  ["rclone", "--config", CFG, "cat", "%s%08d.bin" % (PREFIX, ci)],
-                  capture_output=True, timeout=120)
-              if p.returncode != 0 or not p.stdout:
-                  return bytearray(CHUNK)
-              data = bytearray(p.stdout)
-              if len(data) < CHUNK:
-                  data += b"\x00" * (CHUNK - len(data))
-              return data
-
+              p = subprocess.run(["rclone","--config",CFG,"cat",f"{PREFIX}{ci:08d}.bin"], capture_output=True, timeout=120)
+              if p.returncode != 0 or not p.stdout: return bytearray(CHUNK)
+              d = bytearray(p.stdout)
+              if len(d) < CHUNK: d += b"\x00" * (CHUNK - len(d))
+              return d
           def _get(ci):
               with lock:
                   if ci in cache:
-                      cache.move_to_end(ci)
-                      return cache[ci]
-              data = _fetch(ci)
+                      cache.move_to_end(ci); return cache[ci]
+              d = _fetch(ci)
               with lock:
-                  cache[ci] = data
-                  cache.move_to_end(ci)
-                  while len(cache) > CACHE_MAX:
-                      cache.popitem(last=False)
-              return data
-
-          def _put(ci, data):
-              tmp = "/tmp/wb-%d.bin" % ci
-              with io.open(tmp, "wb") as f:
-                  f.write(bytes(data))
-              subprocess.run(
-                  ["rclone", "--config", CFG, "copyto", tmp, "%s%08d.bin" % (PREFIX, ci)],
-                  capture_output=True)
+                  cache[ci] = d; cache.move_to_end(ci)
+                  while len(cache) > CACHE_MAX: cache.popitem(last=False)
+              return d
+          def _put(ci, d):
+              tmp = f"/tmp/wb-{ci}.bin"
+              with open(tmp,"wb") as f: f.write(bytes(d))
+              subprocess.run(["rclone","--config",CFG,"copyto",tmp,f"{PREFIX}{ci:08d}.bin"], capture_output=True)
               os.unlink(tmp)
               with lock:
-                  cache[ci] = bytearray(data)
-                  cache.move_to_end(ci)
-
+                  cache[ci] = bytearray(d); cache.move_to_end(ci)
           def pread(h, count, offset, flags):
+              c0 = offset // CHUNK; c1 = (offset + count - 1) // CHUNK
               out = bytearray()
-              c0 = offset // CHUNK
-              c1 = (offset + count - 1) // CHUNK
               for ci in range(c0, c1 + 1):
                   d = _get(ci)
-                  s = max(0, offset - ci * CHUNK)
-                  e = min(CHUNK, offset + count - ci * CHUNK)
+                  s = max(0, offset - ci * CHUNK); e = min(CHUNK, offset + count - ci * CHUNK)
                   out += d[s:e]
               return bytes(out[:count])
-
           def pwrite(h, buf, offset, flags):
-              count = len(buf)
-              c0 = offset // CHUNK
-              c1 = (offset + count - 1) // CHUNK
+              count = len(buf); c0 = offset // CHUNK; c1 = (offset + count - 1) // CHUNK
               for ci in range(c0, c1 + 1):
                   d = bytearray(_get(ci))
-                  s = max(0, offset - ci * CHUNK)
-                  bs = max(0, ci * CHUNK - offset)
-                  e = min(CHUNK, offset + count - ci * CHUNK)
-                  d[s:e] = buf[bs:bs + (e - s)]
+                  s = max(0, offset - ci * CHUNK); bs = max(0, ci * CHUNK - offset)
+                  e = min(CHUNK, offset + count - ci * CHUNK); wl = e - s
+                  if wl > 0: d[s:s+wl] = buf[bs:bs+wl]
                   _put(ci, d)
-
-          def flush(h, flags):
-              pass
+          def flush(h, flags): pass
           PYEOF
 
       - name: Engine
@@ -134,55 +102,45 @@ jobs:
           fi
           set -Eeuo pipefail
           export DEBIAN_FRONTEND=noninteractive
-
           LOG="${LOG:-/var/log/drime}"
           NBD_SOCK="${NBD_SOCK:-/tmp/drime-nbd.sock}"
-          PLUGIN="${PLUGIN:-/opt/drime-nbd.py}"
           RCLONE_CFG="${RCLONE_CFG:-/root/.config/rclone/drime.conf}"
-
-          mkdir -p "$LOG" "$(dirname "$RCLONE_CFG")" /tmp/chunks
+          mkdir -p "$LOG" "$(dirname "$RCLONE_CFG")"
           exec > >(tee -a "$LOG/engine.log") 2>&1
-
-          log() { printf '[%s] [%s] %s\n' "$(date -u +%FT%TZ)" "$1" "$2"; }
-          fail() { trap - ERR; log ERROR "FAILED [$1] $2"; exit 1; }
-          trap 'log ERROR "TRAP line=$LINENO cmd=$BASH_COMMAND rc=$?"' ERR
-
-          cleanup() {
+          log(){ printf '[%s] [%s] [%s] %s\n' "$(date -u +%FT%TZ)" "$1" "$2" "${3:-}"; }
+          fail(){ trap - ERR; log ERROR "$1" "FAILED reason=$2 which=${3:-}"; exit 1; }
+          trap 'log ERROR TRAP "line=$LINENO cmd=$BASH_COMMAND rc=$?"' ERR
+          CLEANUP_DONE=0
+          cleanup(){
+            [[ "$CLEANUP_DONE" == 1 ]] && return 0; CLEANUP_DONE=1
             [[ -f /run/drime-vm.pid ]] && kill "$(cat /run/drime-vm.pid)" 2>/dev/null || true
-            pkill -f "nbdkit python" 2>/dev/null || true
+            pkill -f nbdkit 2>/dev/null || true
             chmod -R 777 "$LOG" 2>/dev/null || true
             log SHUTDOWN "All data safe on Drime"
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' TERM INT
-
-          log INIT "DRIME LIVE VPS ENGINE (Ubuntu 26.04 LTS resolute)"
+          log INIT "DRIME LIVE VPS ENGINE (UEFI boot, Drime-backed disk)"
 
           apt-get update -y || fail PKG APT_UPDATE
-          apt-get install -y \
-            qemu-system-x86 qemu-utils cloud-image-utils \
+          apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf \
             nbdkit nbdkit-plugin-python python3 jq curl ca-certificates \
             iproute2 kmod fuse3 socat || fail PKG INSTALL
-
           curl --retry 5 -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL
           log RCLONE "$(rclone version | head -n1)"
-
           modprobe kvm 2>/dev/null || true
-          modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
           [[ -e /dev/kvm ]] || fail KVM NO_DEVICE
-          chmod 666 /dev/kvm || fail KVM PERMISSION
-          log KVM "KVM ready"
+          chmod 666 /dev/kvm
+          log KVM "ready"
 
-          [[ -n "${NETBIRD_SETUP_KEY:-}" ]] || fail NETBIRD MISSING_SETUP_KEY
+          [[ -n "${NETBIRD_SETUP_KEY:-}" ]] || fail NETBIRD NO_KEY
           curl --retry 5 -fsSL https://pkgs.netbird.io/install.sh | sh || fail NETBIRD INSTALL
           netbird up --setup-key "$NETBIRD_SETUP_KEY" || netbird up --setup-key "$NETBIRD_SETUP_KEY" || fail NETBIRD UP
           NB_IP=$(hostname -I | awk '{print $1}')
           log NETBIRD "connected ip=$NB_IP"
 
-          [[ -n "${DRIME_TOKEN:-}" ]] || fail DRIME MISSING_TOKEN
           rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null || fail DRIME CONFIG
           log DRIME "rclone configured"
-
           rclone delete drime0:vm-disk/ --include "*.tmp" --config "$RCLONE_CFG" 2>/dev/null || true
           log DRIME "orphan cleanup done"
 
@@ -190,59 +148,39 @@ jobs:
             https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img \
             || fail IMAGE DOWNLOAD
           log IMAGE "resolute 26.04 LTS downloaded"
-
           qemu-img convert -f qcow2 -O raw /tmp/base.qcow2 /tmp/disk.raw || fail IMAGE CONVERT
           log IMAGE "raw size=$(stat -c%s /tmp/disk.raw)"
-
+          rm -rf /tmp/chunks && mkdir -p /tmp/chunks
           split -b 4M -d -a 8 /tmp/disk.raw /tmp/chunks/chunk- || fail IMAGE SPLIT
-          rm -f /tmp/disk.raw /tmp/base.qcow2
-
+          rm -f /tmp/disk.raw
           Z=0
           shopt -s nullglob
           for f in /tmp/chunks/chunk-*; do
             if cmp -s -n 4194304 /dev/zero "$f"; then rm -f "$f"; Z=$((Z+1)); fi
           done
           log IMAGE "chunks ready skipped_zero=$Z"
-
-          EXISTING_LIST=$(rclone lsf drime0:vm-disk/ --files-only --config "$RCLONE_CFG" 2>/dev/null || true)
-          declare -A HAVE_CHUNK
-          while IFS= read -r n; do
-            if [[ -n "$n" ]]; then HAVE_CHUNK["${n%.bin}"]=1; fi
-          done <<<"$EXISTING_LIST"
-          SKIP_EXIST=0
-          for f in /tmp/chunks/chunk-*; do
-            b=$(basename "$f" .bin)
-            if [[ -n "${HAVE_CHUNK[$b]:-}" ]]; then rm -f "$f"; SKIP_EXIST=$((SKIP_EXIST+1)); fi
-          done
-          log DRIME "resume-skip=$SKIP_EXIST remaining=$(ls /tmp/chunks 2>/dev/null | wc -l)"
-
           rclone copy /tmp/chunks/ drime0:vm-disk/ --config "$RCLONE_CFG" \
-            --transfers 64 --checkers 64 \
-            --multi-thread-streams 4 --multi-thread-cutoff 1M \
-            --low-level-retries 10 --retries 5 \
-            --no-update-modtime --fast-list \
-            --stats 15s --stats-one-line || fail DRIME UPLOAD_FAILED
+            --transfers 32 --checkers 32 --stats 30s --stats-one-line || fail DRIME UPLOAD
           rm -rf /tmp/chunks
           log DRIME "Parallel upload complete"
 
-          nbdkit python "$PLUGIN" --unix "$NBD_SOCK" --foreground --threads=16 \
+          nbdkit python /opt/drime-nbd.py --unix "$NBD_SOCK" --threads 16 \
             >>"$LOG/nbdkit.log" 2>&1 &
-          NBD_PID=$!
           for i in $(seq 1 30); do [[ -S "$NBD_SOCK" ]] && break; sleep 1; done
           [[ -S "$NBD_SOCK" ]] || fail NBD NO_SOCKET
           log NBD "nbdkit running threads=16 cache=2GB"
 
-          SIG=$( set +o pipefail; rclone --config "$RCLONE_CFG" cat drime0:vm-disk/chunk-00000000.bin 2>/dev/null | head -c 512 | od -An -tx1 | tr -d ' \n' | tail -c 4 ) || SIG=""
-          if [[ "$SIG" == "55aa" ]]; then
-            log MBR "valid 0x55AA"
-          else
-            log WARN MBR "signature=$SIG (non-fatal, continuing)"
-          fi
+          # UEFI firmware (resolute is UEFI-only)
+          OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd
+          OVMF_VARS=/usr/share/OVMF/OVMF_VARS.fd
+          [[ -f "$OVMF_CODE" ]] || OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+          [[ -f "$OVMF_VARS" ]] || OVMF_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd
+          [[ -f "$OVMF_CODE" && -f "$OVMF_VARS" ]] || fail UEFI NO_FIRMWARE
+          cp -f "$OVMF_VARS" /tmp/OVMF_VARS.fd
+          log UEFI "firmware=$OVMF_CODE"
 
-          VM_CORES="${INPUT_VM_CORES:-2}"
-          VM_THREADS="${INPUT_VM_THREADS:-2}"
-          VM_RAM="${INPUT_VM_RAM_GB:-16}"
-          VNC_BIND="${INPUT_VNC_BIND:-0.0.0.0}"
+          VM_CORES="${INPUT_VM_CORES:-2}"; VM_THREADS="${INPUT_VM_THREADS:-2}"
+          VM_RAM="${INPUT_VM_RAM_GB:-16}"; VNC_BIND="${INPUT_VNC_BIND:-0.0.0.0}"
           [[ "$VM_CORES" =~ ^[0-9]+$ ]] || VM_CORES=2
           [[ "$VM_THREADS" =~ ^[0-9]+$ ]] || VM_THREADS=2
           [[ "$VM_RAM" =~ ^[0-9]+$ ]] || VM_RAM=16
@@ -254,17 +192,28 @@ jobs:
             -cpu host \
             -smp "$VM_CPUS,cores=$VM_CORES,threads=$VM_THREADS" \
             -m "${VM_RAM}G" \
+            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
             -blockdev node-name=drime0,driver=raw,file.driver=nbd,file.server.type=unix,file.server.path="$NBD_SOCK",file.reconnect-delay=5 \
             -device virtio-blk-pci,drive=drime0,bootindex=1 \
             -netdev user,id=net0 \
-            -device virtio-net-pci,netdev=net0,rombar=0 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial file:"$LOG/vm-serial.log" \
             -vnc "${VNC_BIND}:0" \
             -pidfile /run/drime-vm.pid \
             -daemonize || fail VM QEMU_START
-
-          for i in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ':5900 ' && break; sleep 1; done
-          ss -ltn 2>/dev/null | grep -q ':5900 ' || fail VM VNC_NOT_LISTENING
           log VM "VM running vcpu=$VM_CPUS ram=${VM_RAM}G vnc=${VNC_BIND}:5900 netbird=$NB_IP"
+
+          BOOT_OK=0
+          for i in $(seq 1 36); do
+            if grep -qiE "ubuntu|login:|cloud-init.*Running" "$LOG/vm-serial.log" 2>/dev/null; then BOOT_OK=1; break; fi
+            sleep 5
+          done
+          if [[ "$BOOT_OK" == 1 ]]; then
+            log BOOT "OS BOOTED - console active on serial + VNC"
+          else
+            log WARN BOOT "no console banner yet - check VNC $NB_IP:5900"
+          fi
 
           while true; do
             [[ -f /run/drime-vm.pid ]] && kill -0 "$(cat /run/drime-vm.pid)" 2>/dev/null || fail VM DIED
