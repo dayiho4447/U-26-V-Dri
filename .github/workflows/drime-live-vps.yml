@@ -21,9 +21,6 @@ jobs:
     env:
       LOG: /var/log/drime
       NBD_SOCK: /tmp/drime-nbd.sock
-      PLUGIN: /opt/drime-nbd.py
-      TURBO: /opt/drime-turbo.py
-      SIZE_FILE: /opt/drime-size
       RCLONE_CFG: /root/.config/rclone/drime.conf
       NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
       DRIME_TOKEN: ${{ secrets.DRIME }}
@@ -43,18 +40,15 @@ jobs:
               with io.open("/opt/drime-size") as f:
                   DISK_SIZE = int(f.read().strip())
           except Exception:
-              DISK_SIZE = 20 * 1024 * 1024 * 1024
+              DISK_SIZE = 3758096384
           lock = threading.Lock()
           cache = OrderedDict()
           CACHE_MAX = 512
           def open(readonly): return {}
           def get_size(h): return DISK_SIZE
-          def _rc(*a):
-              return subprocess.run(["rclone","--config",CFG]+list(a), capture_output=True)
           def fetch(ci):
-              p = _rc("cat", "%s%08d.bin" % (PREFIX, ci))
-              if p.returncode != 0 or not p.stdout:
-                  return bytearray(CHUNK)
+              p = subprocess.run(["rclone","--config",CFG,"cat",f"{PREFIX}{ci:08d}.bin"], capture_output=True, timeout=120)
+              if p.returncode != 0 or not p.stdout: return bytearray(CHUNK)
               d = bytearray(p.stdout)
               if len(d) < CHUNK: d += b"\x00" * (CHUNK - len(d))
               return d
@@ -82,73 +76,109 @@ jobs:
                   s = max(0, offset - ci * CHUNK); bs = max(0, ci * CHUNK - offset)
                   e = min(CHUNK, offset + count - ci * CHUNK)
                   d[s:e] = buf[bs:bs + (e - s)]
-                  tmp = "/tmp/wb-%08d.bin" % ci
+                  tmp = f"/tmp/wb-{ci}.bin"
                   with io.open(tmp, "wb") as f: f.write(bytes(d))
-                  _rc("copyto", tmp, "%s%08d.bin" % (PREFIX, ci))
+                  subprocess.run(["rclone","--config",CFG,"copyto",tmp,f"{PREFIX}{ci:08d}.bin"], capture_output=True)
                   os.unlink(tmp)
           def flush(h, flags): pass
+          def prewarm():
+              from concurrent.futures import ThreadPoolExecutor
+              total = (DISK_SIZE + CHUNK - 1) // CHUNK
+              with ThreadPoolExecutor(max_workers=16) as ex:
+                  list(ex.map(fetch, range(min(128, total))))
+          threading.Thread(target=prewarm, daemon=True).start()
           PYEOF
 
       - name: Write turbo uploader
         shell: bash
         run: |
-          sudo tee /opt/drime-turbo.py > /dev/null << 'PYEOF2'
-          import os, sys, subprocess, threading, time, json
-          SRC = "/tmp/chunks"
-          REMOTE = "drime0:vm-disk"
+          sudo tee /opt/drime-turbo.py > /dev/null << 'PYEOF'
+          import os, sys, subprocess, threading, time, queue
+          CHUNK_DIR = "/tmp/chunks"
+          REMOTE = "drime0:vm-disk/"
           CFG = "/root/.config/rclone/drime.conf"
-          SHARDS = 4
-          TRANSFERS = 64
-          files = sorted(os.listdir(SRC))
-          shard_dirs = []
-          for s in range(SHARDS):
-              d = "/tmp/shard%d" % s
-              os.makedirs(d, exist_ok=True)
-              shard_dirs.append(d)
-          for i, f in enumerate(files):
-              os.rename(os.path.join(SRC, f), os.path.join(shard_dirs[i % SHARDS], f))
-          start = time.time()
-          procs = []
-          for s in range(SHARDS):
-              p = subprocess.Popen(
-                  ["rclone", "copy", shard_dirs[s], REMOTE, "--config", CFG,
-                   "--transfers", str(TRANSFERS), "--checkers", "64",
-                   "--retries", "5", "--low-level-retries", "5",
-                   "--timeout", "120s", "--contimeout", "30s",
-                   "--no-update-modtime", "--stats", "15s", "--stats-one-line"],
-                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              procs.append(p)
-          def monitor():
-              last = 0
-              while any(p.poll() is None for p in procs):
-                  time.sleep(10)
-                  r = subprocess.run(["rclone", "size", REMOTE, "--config", CFG, "--json"],
-                                     capture_output=True, text=True)
-                  try:
-                      b = json.loads(r.stdout).get("bytes", 0)
-                  except Exception:
-                      continue
-                  print("[TURBO] t=%ds drime_received=%dMiB rate=%.1f MiB/s"
-                        % (int(time.time() - start), b // 1048576, (b - last) / 10 / 1048576), flush=True)
-                  last = b
-          threading.Thread(target=monitor, daemon=True).start()
-          rc = 0
-          for p in procs:
-              out, _ = p.communicate()
-              if p.returncode != 0:
-                  rc = p.returncode
-                  print((out or "")[-3000:], flush=True)
-          dt = time.time() - start
-          r = subprocess.run(["rclone", "size", REMOTE, "--config", CFG, "--json"],
-                             capture_output=True, text=True)
+          MIN_W, MAX_W = 8, 128
+          files = sorted(f for f in os.listdir(CHUNK_DIR) if f.endswith(".bin"))
+          sizes = {f: os.path.getsize(os.path.join(CHUNK_DIR, f)) for f in files}
+          total_bytes = sum(sizes.values())
           try:
-              total = json.loads(r.stdout).get("bytes", 0)
+              r = subprocess.run(["rclone","--config",CFG,"lsf","--files-only",REMOTE],
+                                 capture_output=True, text=True, timeout=300)
+              existing = set(l.strip() for l in r.stdout.splitlines() if l.strip().endswith(".bin"))
           except Exception:
-              total = 0
-          print("[TURBO] DONE %dMiB in %ds = %.1f MiB/s aggregate"
-                % (total // 1048576, int(dt), total / 1048576 / max(dt, 1)), flush=True)
-          sys.exit(rc)
-          PYEOF2
+              existing = set()
+          todo = [f for f in files if f not in existing]
+          lock = threading.Lock()
+          S = {"done_bytes": sum(sizes[f] for f in files if f in existing),
+               "done_count": len(existing), "errors": 0, "workers": 16, "failed": ""}
+          sem = threading.Semaphore(16)
+          def set_workers(n):
+              n = max(MIN_W, min(MAX_W, n))
+              with lock:
+                  delta = n - S["workers"]; S["workers"] = n
+              for _ in range(max(0, delta)): sem.release()
+              for _ in range(max(0, -delta)): sem.acquire(timeout=0.05)
+          def upload_one(f):
+              path = os.path.join(CHUNK_DIR, f)
+              deadline = time.time() + 900
+              backoff = 0.5
+              while time.time() < deadline:
+                  sem.acquire(); ok = False
+                  try:
+                      r = subprocess.run(["rclone","--config",CFG,"copyto",
+                                          "--retries","1","--contimeout","30s","--timeout","300s",
+                                          path, REMOTE + f], capture_output=True, timeout=320)
+                      ok = (r.returncode == 0)
+                  except Exception:
+                      ok = False
+                  finally:
+                      sem.release()
+                  if ok:
+                      with lock:
+                          S["done_bytes"] += sizes[f]; S["done_count"] += 1
+                      return True
+                  with lock: S["errors"] += 1
+                  time.sleep(backoff); backoff = min(backoff * 2, 20)
+              with lock: S["failed"] = f
+              return False
+          def adapter():
+              lb, le = 0, 0
+              while True:
+                  time.sleep(5)
+                  with lock: b, e, w = S["done_bytes"], S["errors"], S["workers"]
+                  if e - le > 4: set_workers(w // 2)
+                  elif e - le == 0 and b > lb: set_workers(w + 16)
+                  lb, le = b, e
+          def monitor():
+              t0 = time.time(); lb = S["done_bytes"]; lt = t0
+              while True:
+                  time.sleep(1)
+                  now = time.time()
+                  with lock: b, c, w, e = S["done_bytes"], S["done_count"], S["workers"], S["errors"]
+                  inst = (b - lb) / max(now - lt, 0.1) / 1048576.0
+                  lb, lt = b, now
+                  pct = 100.0 * b / total_bytes if total_bytes else 100.0
+                  print("[TURBO] t=%ds drime_received=%dMiB rate=%.1f MiB/s workers=%d done=%d/%d err=%d pct=%.0f%%"
+                        % (now - t0, b // 1048576, inst, w, c, len(files), e, pct), flush=True)
+          threading.Thread(target=adapter, daemon=True).start()
+          threading.Thread(target=monitor, daemon=True).start()
+          q = queue.Queue()
+          for f in todo: q.put(f)
+          def worker_loop():
+              while True:
+                  try: f = q.get_nowait()
+                  except queue.Empty: return
+                  upload_one(f)
+                  q.task_done()
+          threads = [threading.Thread(target=worker_loop) for _ in range(MAX_W)]
+          for t in threads: t.start()
+          for t in threads: t.join()
+          with lock: failed = S["failed"]; b = S["done_bytes"]
+          if failed:
+              print("[TURBO] FATAL chunk %s never uploaded" % failed, flush=True)
+              sys.exit(1)
+          print("[TURBO] ALL DONE %d chunks %dMiB" % (len(files), b // 1048576), flush=True)
+          PYEOF
 
       - name: Engine
         shell: bash
@@ -161,14 +191,13 @@ jobs:
           LOG="${LOG:-/var/log/drime}"
           NBD_SOCK="${NBD_SOCK:-/tmp/drime-nbd.sock}"
           RCLONE_CFG="${RCLONE_CFG:-/root/.config/rclone/drime.conf}"
-          SIZE_FILE="${SIZE_FILE:-/opt/drime-size}"
           mkdir -p "$LOG" "$(dirname "$RCLONE_CFG")" /tmp/chunks
           exec > >(tee -a "$LOG/engine.log") 2>&1
           log(){ printf '[%s] [%s] %s\n' "$(date -u +%FT%TZ)" "$1" "$2"; }
           fail(){ trap - ERR; log ERROR "FAILED [$1] $2"; exit 1; }
           trap 'log ERROR "TRAP line=$LINENO cmd=$BASH_COMMAND rc=$?"' ERR
           trap 'log SHUTDOWN "graceful"; [[ -f /run/drime-vm.pid ]] && kill "$(cat /run/drime-vm.pid)" 2>/dev/null || true; pkill -f nbdkit 2>/dev/null || true' EXIT
-          log INIT "DRIME LIVE VPS - TURBO UPLOAD EDITION"
+          log INIT "DRIME LIVE VPS - adaptive turbo engine"
 
           apt-get update -y || fail PKG APT_UPDATE
           apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf \
@@ -190,16 +219,16 @@ jobs:
           [[ -n "${DRIME_TOKEN:-}" ]] || fail DRIME NO_KEY
           rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null || fail DRIME CONFIG
           log DRIME "rclone configured"
-          rclone purge drime0:vm-disk/ --config "$RCLONE_CFG" 2>/dev/null || true
 
           curl -fL --retry 5 -o /tmp/base.qcow2 \
             https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img \
             || fail IMAGE DOWNLOAD
           qemu-img convert -f qcow2 -O raw /tmp/base.qcow2 /tmp/base.raw || fail IMAGE CONVERT
-          stat -c%s /tmp/base.raw > "$SIZE_FILE"
-          log IMAGE "raw size=$(cat "$SIZE_FILE")"
+          stat -c%s /tmp/base.raw > /opt/drime-size
+          rm -f /tmp/base.qcow2
+          log IMAGE "raw size=$(cat /opt/drime-size)"
           split -b 4M -d -a 8 --additional-suffix=.bin /tmp/base.raw /tmp/chunks/chunk- || fail IMAGE SPLIT
-          rm -f /tmp/base.raw /tmp/base.qcow2
+          rm -f /tmp/base.raw
           Z=0
           shopt -s nullglob
           for f in /tmp/chunks/chunk-*.bin; do
@@ -207,28 +236,31 @@ jobs:
           done
           log IMAGE "zero chunks skipped=$Z (never sent to Drime)"
 
-          log TURBO "injecting 4-shard x 64-transfer turbo uploader (256 streams)"
-          python3 /opt/drime-turbo.py || \
-            rclone copy /tmp/shard0/ drime0:vm-disk/ --config "$RCLONE_CFG" --transfers 128 --checkers 64 || fail DRIME UPLOAD
-          rm -rf /tmp/shard0 /tmp/shard1 /tmp/shard2 /tmp/shard3
-          GOT=$(rclone lsf drime0:vm-disk/ --files-only --config "$RCLONE_CFG" | wc -l)
-          log DRIME "verified objects on Drime=$GOT"
-          [[ "$GOT" -ge 500 ]] || fail DRIME VERIFY_TOO_FEW
+          log TURBO "adaptive turbo uploader: 16->128 workers, 1s receive log"
+          python3 /opt/drime-turbo.py || fail DRIME TURBO_UPLOAD
+          HAVE=$(rclone lsf drime0:vm-disk/ --files-only --config "$RCLONE_CFG" | grep -c '\.bin$' || true)
+          log DRIME "verified objects on drime=$HAVE"
+          rm -rf /tmp/chunks
 
-          nbdkit python /opt/drime-nbd.py --unix "$NBD_SOCK" --foreground --threads=32 \
+          nbdkit python /opt/drime-nbd.py --unix "$NBD_SOCK" --threads 16 \
             >>"$LOG/nbdkit.log" 2>&1 &
           for i in $(seq 1 30); do [[ -S "$NBD_SOCK" ]] && break; sleep 1; done
           [[ -S "$NBD_SOCK" ]] || fail NBD NO_SOCKET
-          log NBD "nbdkit running threads=32"
+          log NBD "nbdkit running threads=16 cache=2GB"
 
-          cp -f /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd 2>/dev/null || true
+          OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd
+          [[ -f "$OVMF_CODE" ]] || OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+          OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS.fd
+          [[ -f "$OVMF_VARS_SRC" ]] || OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS_4M.fd
+          cp -f "$OVMF_VARS_SRC" /tmp/OVMF_VARS.fd
+
           qemu-system-x86_64 \
             -name drime-vm \
             -machine q35,accel=kvm \
             -cpu host \
             -smp 4,cores=2,threads=2 \
             -m "${{ github.event.inputs.vm_ram_gb || '16' }}G" \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
             -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
             -blockdev node-name=drime0,driver=raw,file.driver=nbd,file.server.type=unix,file.server.path=$NBD_SOCK,file.reconnect-delay=5 \
             -device virtio-blk-pci,drive=drime0,bootindex=1 \
@@ -239,6 +271,7 @@ jobs:
             -pidfile /run/drime-vm.pid \
             -daemonize || fail VM QEMU_START
           log VM "VM running vnc=$NB_IP:5900"
+          log ACCESS "connect VNC $NB_IP:5900"
 
           while true; do
             [[ -f /run/drime-vm.pid ]] && kill -0 "$(cat /run/drime-vm.pid)" 2>/dev/null || fail VM DIED
