@@ -1,109 +1,306 @@
 name: DRIME-LIVE-VPS
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      vm_ram_gb:
+        description: "RAM in GB"
+        default: "16"
+      vnc_bind:
+        description: "VNC bind"
+        default: "0.0.0.0"
 
-env:
-  DRIME_USER: pyypl2005+vm@gmail.com
-  DRIME_PASS: Ed16019a@
-  DRIME_URL: https://dav.drime.cloud/drime
+concurrency:
+  group: drime-live-vps
+  cancel-in-progress: false
 
 jobs:
-  drime-live-vps:
+  engine:
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      LOG: /var/log/drime
+      NBD_SOCK: /tmp/drime-nbd.sock
+      RCLONE_CFG: /root/.config/rclone/drime.conf
+      NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: System Update & Dependency Installation
+      - name: Write NBD plugin
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 jq curl ca-certificates iproute2 kmod fuse3 \
-            cpu-checker genisoimage glib-networking glib-networking-common \
-            glib-networking-services gsettings-desktop-schemas gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good gstreamer1.0-x ipxe-qemu \
-            ipxe-qemu-256k-compat-efi-roms libaa1 libasyncns0 libavc1394-0 \
-            libboost-iostreams1.83.0 libboost-thread1.83.0 libbrlapi0.8 libcaca0 \
-            libcacard0 libcdparanoia0 libdaxctl1 libdecor-0-0 libdecor-0-plugin-1-gtk \
-            libdv4t64 libfdt1 libflac12t64 libgstreamer-plugins-base1.0-0 \
-            libgstreamer-plugins-good1.0-0 libiec61883-0 libiscsi7 libjack-jackd2-0 \
-            libmp3lame0 libmpg123-0t64 libnbd0 libndctl6 libnfs14 libopus0 \
-            liborc-0.4-0t64 libpcsclite1 libpipewire-0.3-0t64 libpipewire-0.3-common \
-            libpmem1 libpmemobj1 libproxy1v5 libpulse0 librados2 libraw1394-11 librbd1 \
-            librdmacm1t64 libsamplerate0 libsdl2-2.0-0 libshout3 libslirp0 libsndfile1 \
-            libsoup-3.0-0 libsoup-3.0-common libspa-0.2-modules libspeex1 \
-            libspice-server1 libtag1v5 libtag1v5-vanilla libtheora0 \
-            libtorrent-rasterbar2.0t64 libtwolame0 liburing2 libusbredirparser1t64 \
-            libv4l-0t64 libv4lconvert0t64 libvirglrenderer1 libvisual-0.4-0 \
-            libvorbisenc2 libvpx9 libvte-2.91-0 libvte-2.91-common libwavpack1 \
-            libwebrtc-audio-processing1 libxv1 msr-tools qemu-block-extra \
-            qemu-system-common qemu-system-data qemu-system-gui \
-            qemu-system-modules-opengl qemu-system-modules-spice seabios \
-            session-migration cloud-image-utils nbdkit nbdkit-plugin-python \
-            ovmf qemu-system-x86 qemu-utils socat
+          sudo mkdir -p /opt
+          sudo tee /opt/drime-nbd.py > /dev/null << 'PYEOF'
+          import nbdkit, subprocess, os, io, threading
+          from collections import OrderedDict
+          CHUNK = 4 * 1024 * 1024
+          REMOTE = "drime0"
+          PREFIX = "vm-disk/chunk-"
+          CFG = "/root/.config/rclone/drime.conf"
+          try:
+              with io.open("/opt/drime-size") as f:
+                  DISK_SIZE = int(f.read().strip())
+          except Exception:
+              DISK_SIZE = 3758096384
+          lock = threading.Lock()
+          cache = OrderedDict()
+          CACHE_MAX = 512
+          def open(readonly): return {}
+          def get_size(h): return DISK_SIZE
+          def fetch(ci):
+              p = subprocess.run(["rclone","--config",CFG,"cat",
+                                  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                  f"{PREFIX}{ci:08d}.bin"], capture_output=True, timeout=30)
+              if p.returncode != 0 or not p.stdout: return bytearray(CHUNK)
+              d = bytearray(p.stdout)
+              if len(d) < CHUNK: d += b"\x00" * (CHUNK - len(d))
+              return d
+          def get_chunk(ci):
+              with lock:
+                  if ci in cache:
+                      cache.move_to_end(ci); return cache[ci]
+              d = fetch(ci)
+              with lock:
+                  cache[ci] = d; cache.move_to_end(ci)
+                  while len(cache) > CACHE_MAX: cache.popitem(last=False)
+              return d
+          def pread(h, count, offset, flags):
+              c0 = offset // CHUNK; c1 = (offset + count - 1) // CHUNK
+              out = bytearray()
+              for ci in range(c0, c1 + 1):
+                  d = get_chunk(ci)
+                  s = max(0, offset - ci * CHUNK); e = min(CHUNK, offset + count - ci * CHUNK)
+                  out += d[s:e]
+              return bytes(out[:count])
+          def pwrite(h, buf, offset, flags):
+              count = len(buf); c0 = offset // CHUNK; c1 = (offset + count - 1) // CHUNK
+              for ci in range(c0, c1 + 1):
+                  d = bytearray(get_chunk(ci))
+                  s = max(0, offset - ci * CHUNK); bs = max(0, ci * CHUNK - offset)
+                  e = min(CHUNK, offset + count - ci * CHUNK)
+                  d[s:e] = buf[bs:bs + (e - s)]
+                  tmp = f"/tmp/wb-{ci}.bin"
+                  with io.open(tmp, "wb") as f: f.write(bytes(d))
+                  subprocess.run(["rclone","--config",CFG,"copyto",
+                                  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                  tmp, f"{PREFIX}{ci:08d}.bin"], capture_output=True, timeout=45)
+                  os.unlink(tmp)
+          def flush(h, flags): pass
+          def prewarm():
+              from concurrent.futures import ThreadPoolExecutor
+              total = (DISK_SIZE + CHUNK - 1) // CHUNK
+              with ThreadPoolExecutor(max_workers=16) as ex:
+                  list(ex.map(fetch, range(min(128, total))))
+          threading.Thread(target=prewarm, daemon=True).start()
+          PYEOF
 
-      - name: Install Rclone
+      - name: Write turbo uploader
+        shell: bash
         run: |
-          wget -q https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip -q rclone-current-linux-amd64.zip
-          sudo cp rclone-*-linux-amd64/rclone /usr/bin/
-          sudo chown root:root /usr/bin/rclone
-          sudo chmod 755 /usr/bin/rclone
+          sudo tee /opt/drime-turbo.py > /dev/null << 'PYEOF'
+          import os, sys, subprocess, threading, time, queue
+          CHUNK_DIR = "/tmp/chunks"
+          REMOTE = "drime0:vm-disk/"
+          CFG = "/root/.config/rclone/drime.conf"
+          MIN_W, MAX_W = 8, 32
+          files = sorted(f for f in os.listdir(CHUNK_DIR) if f.endswith(".bin"))
+          sizes = {f: os.path.getsize(os.path.join(CHUNK_DIR, f)) for f in files}
+          total_bytes = sum(sizes.values())
+          try:
+              r = subprocess.run(["rclone","--config",CFG,"lsf","--files-only",REMOTE],
+                                 capture_output=True, text=True, timeout=300)
+              existing = set(l.strip() for l in r.stdout.splitlines() if l.strip().endswith(".bin"))
+          except Exception:
+              existing = set()
+          todo = [f for f in files if f not in existing]
+          lock = threading.Lock()
+          S = {"done_bytes": sum(sizes[f] for f in files if f in existing),
+               "done_count": len(existing), "errors": 0, "workers": 16, "failed": ""}
+          sem = threading.Semaphore(16)
+          def set_workers(n):
+              n = max(MIN_W, min(MAX_W, n))
+              with lock:
+                  delta = n - S["workers"]; S["workers"] = n
+              for _ in range(max(0, delta)): sem.release()
+              for _ in range(max(0, -delta)): sem.acquire(timeout=0.05)
+          def upload_one(f):
+              path = os.path.join(CHUNK_DIR, f)
+              deadline = time.time() + 900
+              backoff = 0.5
+              while time.time() < deadline:
+                  sem.acquire(); ok = False
+                  try:
+                      r = subprocess.run(["rclone","--config",CFG,"copyto",
+                                          "--retries","1","--contimeout","10s","--timeout","30s", "--low-level-retries", "1",
+                                          "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                          path, REMOTE + f], capture_output=True, timeout=45)
+                      ok = (r.returncode == 0)
+                  except Exception:
+                      ok = False
+                  finally:
+                      sem.release()
+                  if ok:
+                      with lock:
+                          S["done_bytes"] += sizes[f]; S["done_count"] += 1
+                      return True
+                  with lock: S["errors"] += 1
+                  time.sleep(backoff); backoff = min(backoff * 2, 10)
+              with lock: S["failed"] = f
+              return False
+          def adapter():
+              lb, le = 0, 0
+              while True:
+                  time.sleep(5)
+                  with lock: b, e, w = S["done_bytes"], S["errors"], S["workers"]
+                  if e - le > 2: set_workers(max(MIN_W, w // 2))
+                  elif e - le == 0 and b > lb: set_workers(min(MAX_W, w + 4))
+                  lb, le = b, e
+          def monitor():
+              t0 = time.time(); lb = S["done_bytes"]; lt = t0
+              while True:
+                  time.sleep(1)
+                  now = time.time()
+                  with lock: b, c, w, e = S["done_bytes"], S["done_count"], S["workers"], S["errors"]
+                  inst = (b - lb) / max(now - lt, 0.1) / 1048576.0
+                  lb, lt = b, now
+                  pct = 100.0 * b / total_bytes if total_bytes else 100.0
+                  print("[TURBO] t=%ds drime_received=%dMiB rate=%.1f MiB/s workers=%d done=%d/%d err=%d pct=%.0f%%"
+                        % (now - t0, b // 1048576, inst, w, c, len(files), e, pct), flush=True)
+          threading.Thread(target=adapter, daemon=True).start()
+          threading.Thread(target=monitor, daemon=True).start()
+          q = queue.Queue()
+          for f in todo: q.put(f)
+          def worker_loop():
+              while True:
+                  try: f = q.get_nowait()
+                  except queue.Empty: return
+                  upload_one(f)
+                  q.task_done()
+          threads = [threading.Thread(target=worker_loop) for _ in range(MAX_W)]
+          for t in threads: t.start()
+          for t in threads: t.join()
+          with lock: failed = S["failed"]; b = S["done_bytes"]
+          if failed:
+              print("[TURBO] FATAL chunk %s never uploaded" % failed, flush=True)
+              sys.exit(1)
+          print("[TURBO] ALL DONE %d chunks %dMiB" % (len(files), b // 1048576), flush=True)
+          PYEOF
 
-      - name: Configure Rclone (Drime WebDAV)
+      - name: Engine
+        shell: bash
         run: |
-          mkdir -p ~/.config/rclone
-          PASS_OBSCURED=$(rclone obscure "${{ env.DRIME_PASS }}")
+          if [[ "$(id -u)" != "0" ]]; then
+            exec sudo -E env PATH="$PATH" HOME="/root" bash "$0"
+          fi
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          LOG="${LOG:-/var/log/drime}"
+          NBD_SOCK="${NBD_SOCK:-/tmp/drime-nbd.sock}"
+          RCLONE_CFG="${RCLONE_CFG:-/root/.config/rclone/drime.conf}"
+          mkdir -p "$LOG" "$(dirname "$RCLONE_CFG")" /tmp/chunks
+          exec > >(tee -a "$LOG/engine.log") 2>&1
+          log(){ printf '[%s] [%s] %s\n' "$(date -u +%FT%TZ)" "$1" "$2"; }
+          fail(){ trap - ERR; log ERROR "FAILED [$1] $2"; exit 1; }
+          trap 'log ERROR "TRAP line=$LINENO cmd=$BASH_COMMAND rc=$?"' ERR
+          trap 'log SHUTDOWN "graceful"; [[ -f /run/drime-vm.pid ]] && kill "$(cat /run/drime-vm.pid)" 2>/dev/null || true; pkill -f nbdkit 2>/dev/null || true' EXIT
+          log INIT "DRIME LIVE VPS - adaptive turbo engine"
+
+          apt-get update -y || fail PKG APT_UPDATE
+          apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf \
+            nbdkit nbdkit-plugin-python python3 jq curl ca-certificates \
+            iproute2 kmod fuse3 socat || fail PKG INSTALL
+          curl --retry 5 -fsSL https://rclone.org/install.sh | bash || fail RCLONE INSTALL
+          log RCLONE "$(rclone version | head -n1)"
+          modprobe kvm 2>/dev/null || true
+          [[ -e /dev/kvm ]] || fail KVM NO_DEVICE
+          chmod 666 /dev/kvm
+          log KVM "ready"
+
+          [[ -n "${NETBIRD_SETUP_KEY:-}" ]] || fail NETBIRD NO_KEY
+          curl --retry 5 -fsSL https://pkgs.netbird.io/install.sh | sh || fail NETBIRD INSTALL
+          netbird up --setup-key "$NETBIRD_SETUP_KEY" || netbird up --setup-key "$NETBIRD_SETUP_KEY" || fail NETBIRD UP
+          NB_IP=$(hostname -I | awk '{print $1}')
+          log NETBIRD "connected ip=$NB_IP"
+
+          DRIME_EMAIL="pyypl2005+vm@gmail.com"
+          DRIME_PASS="Ed16019a@"
+          log DRIME "Attempting to fetch API token for $DRIME_EMAIL..."
+          DRIME_TOKEN=$(curl -s -X POST https://app.drime.cloud/api/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "{\"email\": \"$DRIME_EMAIL\", \"password\": \"$DRIME_PASS\", \"token_name\": \"github-actions\"}" \
+            | jq -r '.access_token // .token // empty')
           
-          cat <<EOF > ~/.config/rclone/rclone.conf
-          [drime0]
-          type = webdav
-          url = ${{ env.DRIME_URL }}
-          vendor = other
-          user = ${{ env.DRIME_USER }}
-          pass = ${PASS_OBSCURED}
-          EOF
-          
-          # Also write to drime.conf as expected by some custom scripts in your logs
-          cp ~/.config/rclone/rclone.conf ~/.config/rclone/drime.conf
+          if [[ -n "$DRIME_TOKEN" && "$DRIME_TOKEN" != "null" ]]; then
+            log DRIME "Token fetched successfully"
+            rclone config create drime0 drime access_token="$DRIME_TOKEN" --config "$RCLONE_CFG" >/dev/null || fail DRIME CONFIG
+          else
+            log DRIME "API login failed or no token returned. Falling back to user/pass config..."
+            rclone config create drime0 drime user="$DRIME_EMAIL" pass="$(rclone obscure "$DRIME_PASS")" --config "$RCLONE_CFG" >/dev/null || fail DRIME CONFIG
+          fi
+          log DRIME "rclone configured"
 
-      - name: Install & Start NetBird
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates curl gnupg
-          curl -sSL https://pkgs.netbird.io/debian/public.key | sudo gpg --dearmor -o /usr/share/keyrings/netbird-archive-keyring.gpg
-          echo 'deb [signed-by=/usr/share/keyrings/netbird-archive-keyring.gpg] https://pkgs.netbird.io/debian stable main' | sudo tee /etc/apt/sources.list.d/netbird.list
-          sudo apt-get update
-          sudo apt-get install -y netbird
-          sudo systemctl enable netbird
-          sudo systemctl start netbird
+          curl -fL --retry 5 -o /tmp/base.qcow2 \
+            https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img \
+            || fail IMAGE DOWNLOAD
+          qemu-img convert -f qcow2 -O raw /tmp/base.qcow2 /tmp/base.raw || fail IMAGE CONVERT
+          stat -c%s /tmp/base.raw > /opt/drime-size
+          rm -f /tmp/base.qcow2
+          log IMAGE "raw size=$(cat /opt/drime-size)"
+          split -b 4M -d -a 8 --additional-suffix=.bin /tmp/base.raw /tmp/chunks/chunk- || fail IMAGE SPLIT
+          rm -f /tmp/base.raw
+          Z=0
+          shopt -s nullglob
+          for f in /tmp/chunks/chunk-*.bin; do
+            if cmp -s -n 4194304 /dev/zero "$f"; then rm -f "$f"; Z=$((Z+1)); fi
+          done
+          log IMAGE "zero chunks skipped=$Z (never sent to Drime)"
 
-      - name: Download Ubuntu Image
-        run: |
-          echo "Downloading Ubuntu Image..."
-          # Replace with your actual image download logic
-          dd if=/dev/zero of=ubuntu.img bs=1M count=3500 
+          log TURBO "adaptive turbo uploader: 8->32 workers, 1s receive log"
+          python3 /opt/drime-turbo.py || fail DRIME TURBO_UPLOAD
+          HAVE=$(rclone lsf drime0:vm-disk/ --files-only --config "$RCLONE_CFG" | grep -c '\.bin$' || true)
+          log DRIME "verified objects on drime=$HAVE"
+          rm -rf /tmp/chunks
 
-      - name: Turbo Upload to Drime
-        run: |
-          echo "Starting adaptive turbo uploader..."
-          # Add your custom python/bash turbo uploader script here
-          # rclone copy ubuntu.img drime0: --transfers 128 --checkers 128
-          
-      - name: Start NBD Server
-        run: |
-          # Start nbdkit in background
-          nbdkit --threads=16 --filter=cache cache=2G --unix /tmp/drime-nbd.sock --pidfile /tmp/nbdkit.pid memory 3500M &
-          sleep 2
+          nbdkit python /opt/drime-nbd.py --unix "$NBD_SOCK" --threads 16 \
+            >>"$LOG/nbdkit.log" 2>&1 &
+          for i in $(seq 1 30); do [[ -S "$NBD_SOCK" ]] && break; sleep 1; done
+          [[ -S "$NBD_SOCK" ]] || fail NBD NO_SOCKET
+          log NBD "nbdkit running threads=16 cache=2GB"
 
-      - name: Start QEMU (Fixed Blockdev Syntax)
-        run: |
-          # FIX APPLIED HERE: 
-          # Changed invalid 'file.socket.type' and 'file.socket.path' 
-          # to correct QEMU blockdev syntax: 'file.server.type' and 'file.server.path'
+          OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd
+          [[ -f "$OVMF_CODE" ]] || OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+          OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS.fd
+          [[ -f "$OVMF_VARS_SRC" ]] || OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS_4M.fd
+          cp -f "$OVMF_VARS_SRC" /tmp/OVMF_VARS.fd
+
           qemu-system-x86_64 \
-            -blockdev node-name=drime0,driver=raw,file.driver=nbd,file.server.type=unix,file.server.path=/tmp/drime-nbd.sock,file.reconnect-delay=5 \
-            -m 2048 -smp 2 -nographic \
-            -serial mon:stdio
+            -name drime-vm \
+            -machine q35,accel=kvm \
+            -cpu host \
+            -smp 4,cores=2,threads=2 \
+            -m "${{ github.event.inputs.vm_ram_gb || '16' }}G" \
+            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
+            -blockdev node-name=drime0,driver=raw,file.driver=nbd,file.server.type=unix,file.server.path=$NBD_SOCK,file.reconnect-delay=5 \
+            -device virtio-blk-pci,drive=drime0,bootindex=1 \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial file:"$LOG/vm-serial.log" \
+            -vnc "${{ github.event.inputs.vnc_bind || '0.0.0.0' }}:0" \
+            -pidfile /run/drime-vm.pid \
+            -daemonize || fail VM QEMU_START
+          log VM "VM running vnc=$NB_IP:5900"
+          log ACCESS "connect VNC $NB_IP:5900"
+
+          while true; do
+            [[ -f /run/drime-vm.pid ]] && kill -0 "$(cat /run/drime-vm.pid)" 2>/dev/null || fail VM DIED
+            log HEARTBEAT "vm=running netbird=$NB_IP vnc=5900"
+            sleep 30
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drime-logs-${{ github.run_id }}
+          path: /var/log/drime
+          if-no-files-found: warn
